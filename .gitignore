@@ -1,0 +1,22 @@
+/target/
+
+# Local runtime configuration and credentials.
+/config/config.toml
+/config/config.local.toml
+/config/secrets.toml
+*.local.toml
+.env
+.env.*
+!.env.example
+
+# Private extensions and generated runtime data.
+/scripts/local/
+/plugins/local/
+*.log
+*.tmp
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+.DS_Store

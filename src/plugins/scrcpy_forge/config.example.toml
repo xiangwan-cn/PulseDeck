@@ -1,0 +1,55 @@
+# Append this page to ~/.config/pulsedeck/config.toml and build PulseDeck with:
+# cargo build --release --features scrcpy-forge
+
+[[pages]]
+id = "scrcpy-forge"
+title = "设备"
+icon = "phone-symbolic"
+order = 25
+kind = "scrcpy-forge"
+
+[pages.scrcpy_forge]
+api_url = "http://127.0.0.1:27180/api/v1"
+daemon_program = "scrcpy-forge-daemon"
+daemon_args = []
+preview_interval_seconds = 5
+metadata_interval_seconds = 10
+health_interval_seconds = 3
+columns = 3
+card_width = 180
+card_height = 252
+preview_height = 180
+
+[pages.scrcpy_forge.endpoints]
+health = "health"
+shutdown = "shutdown"
+devices = "devices"
+connect = "devices/connect"
+device_preview = "devices/{serial}/screenshot"
+session_preview = "sessions/{serial}/frame.jpg"
+session_metrics = "sessions/{serial}/metrics"
+tasks = "scripts"
+task_runs = "scripts/runs"
+sessions = "sessions"
+session_start = "sessions/{serial}/start"
+task_run = "scripts/run-named"
+task_stop = "scripts/devices/{serial}/stop"
+profile = "sessions/{serial}/{kind}"
+
+[[pages.scrcpy_forge.cards]]
+role = "backend"
+title = "ScrcpyForge"
+description = "后端运行状态与启停开关"
+order = 10
+
+[[pages.scrcpy_forge.cards]]
+role = "devices"
+title = "设备预览"
+description = "每台设备生成一张独立预览卡"
+order = 20
+
+[[pages.scrcpy_forge.cards]]
+role = "scripts"
+title = "设备脚本"
+description = "每台设备生成一张对应脚本卡"
+order = 30

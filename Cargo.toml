@@ -1,0 +1,52 @@
+[package]
+name = "pulsedeck"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight, extensible card dashboard for Linux"
+license = "MIT"
+
+[workspace]
+
+[features]
+default = []
+# Optional built-in page for the independently distributed ScrcpyForge service.
+scrcpy-forge = ["dep:bytes"]
+
+[[bin]]
+name = "pulsedeck"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
+glib = "0.20"
+gio = "0.20"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+bytesize = "1"
+bytes = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+async-channel = "2"
+futures-util = "0.3"
+
+zbus = "5"
+
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

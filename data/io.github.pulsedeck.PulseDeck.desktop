@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=PulseDeck
+Name[zh_CN]=设备监控
+Comment=Lightweight system monitor for Phosh
+Comment[zh_CN]=适用于 Phosh 的轻量系统监控器
+Exec=pulsedeck
+Icon=io.github.pulsedeck.PulseDeck
+Terminal=false
+Type=Application
+Categories=System;Utility;
+StartupNotify=true
