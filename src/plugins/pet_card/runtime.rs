@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -257,7 +258,7 @@ impl Runtime {
         }
         self.current_state.replace(state.to_string());
         if should_play_completion_sound(&previous_state, state, self.config.completion_sound) {
-            self.root.error_bell();
+            self.play_completion_sound();
         }
         if state == "offline" {
             self.schedule_presentation_reset();
@@ -292,6 +293,28 @@ impl Runtime {
         }
         if self.frames.borrow().len() > 1 {
             self.start_animation(animation.expect("animation exists when frames loaded"));
+        }
+    }
+
+    fn play_completion_sound(&self) {
+        let argv = completion_sound_argv(self.config.completion_sound_file.as_deref());
+        let argv = argv.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+        let flags = gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE;
+        match gio::Subprocess::newv(&argv, flags) {
+            Ok(process) => {
+                let completed = process.clone();
+                process.wait_async(None::<&gio::Cancellable>, move |result| {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "completion sound process wait failed");
+                    } else if !completed.is_successful() {
+                        tracing::debug!("completion sound player exited unsuccessfully");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::debug!(%error, "completion sound player unavailable");
+                self.root.error_bell();
+            }
         }
     }
 
@@ -491,7 +514,12 @@ fn state_emoji(state: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_presentation, presentation_name, should_play_completion_sound};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::{
+        completion_sound_argv, parse_presentation, presentation_name, should_play_completion_sound,
+    };
     use crate::plugins::CardPresentation;
 
     #[test]
@@ -520,8 +548,35 @@ mod tests {
         assert!(!should_play_completion_sound("done", "done", true));
         assert!(!should_play_completion_sound("working", "done", false));
     }
+
+    #[test]
+    fn completion_sound_uses_theme_event_or_custom_file() {
+        assert_eq!(
+            completion_sound_argv(None),
+            ["canberra-gtk-play", "--id=complete"]
+        );
+        assert_eq!(
+            completion_sound_argv(Some(Path::new("/tmp/custom sound.oga"))),
+            [
+                OsString::from("canberra-gtk-play"),
+                OsString::from("--file"),
+                OsString::from("/tmp/custom sound.oga"),
+            ]
+        );
+    }
 }
 
 fn should_play_completion_sound(previous: &str, next: &str, enabled: bool) -> bool {
     enabled && next == "done" && previous != "done"
+}
+
+fn completion_sound_argv(file: Option<&Path>) -> Vec<OsString> {
+    let mut argv = vec![OsString::from("canberra-gtk-play")];
+    if let Some(file) = file {
+        argv.push(OsString::from("--file"));
+        argv.push(file.as_os_str().to_owned());
+    } else {
+        argv.push(OsString::from("--id=complete"));
+    }
+    argv
 }

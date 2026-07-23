@@ -22,6 +22,8 @@ offline_normal_after_seconds = 300
 pause_when_unmapped = true
 show_status = true
 completion_sound = false
+# Optional custom audio file. Omit it to use the desktop theme's "complete" event.
+# completion_sound_file = "/home/you/.local/share/sounds/codex-done.oga"
 
 [cards.plugin.animations.offline]
 frames = ["offline/00.png"]

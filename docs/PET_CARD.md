@@ -22,9 +22,15 @@ uses an emoji fallback, so the event path can be tested before artwork is
 installed.
 
 Set `completion_sound = true` in `[cards.plugin]` to play the desktop theme's
-single system bell when the state first changes to `done`. It is disabled by
+single `complete` event when the state first changes to `done`. It is disabled by
 default. Every later transition from an active state to `done` plays once;
 repeated reads of the same `done` event do not replay it.
+
+Set `completion_sound_file` to an audio file path to replace the theme event
+with a custom sound. Playback uses `canberra-gtk-play` without a shell and is
+waited for asynchronously, so it neither blocks state handling nor depends on
+GTK input-feedback bells. If the player is unavailable, PetCard falls back to
+the GTK bell.
 
 ## Codex integration
 
@@ -106,7 +112,8 @@ Important plugin options are:
 | `done_hold_seconds` | `5` | Time the `done` animation remains before `ready`. |
 | `pause_when_unmapped` | `true` | Pause frame advancement while not visible. |
 | `show_status` | `true` | Show the state label below the image. |
-| `completion_sound` | `false` | Play one desktop theme bell per completion transition. |
+| `completion_sound` | `false` | Play one sound per completion transition. |
+| `completion_sound_file` | unset | Custom audio file; otherwise use the theme's `complete` event. |
 
 Each `[cards.plugin.animations.<state>]` table accepts `frames`, optional `fps`,
 and `loop`. Frame paths are resolved under `asset_root`. A single-frame offline
