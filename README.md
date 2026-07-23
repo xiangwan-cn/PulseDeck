@@ -18,6 +18,10 @@ do not require recompiling the application.
 - Page lifecycle awareness: hidden pages stop polling.
 - Bounded subprocess output, HTTP response size, and execution time.
 - Optional, separately compiled ScrcpyForge device-control page.
+- Optional, separately compiled event-driven Codex PetCard with animated
+  status, remembered sizing, and a completion sound.
+- A remembered toolbar toggle between the normal grid and a compact six-column
+  layout.
 
 ## Requirements
 
@@ -44,6 +48,13 @@ To include the optional ScrcpyForge page:
 cargo build --release --features scrcpy-forge
 ```
 
+To include PetCard, or both optional integrations:
+
+```sh
+cargo build --release --features pet-card
+cargo build --release --features scrcpy-forge,pet-card
+```
+
 ## Configuration
 
 On first launch PulseDeck copies the bundled example to:
@@ -56,6 +67,8 @@ Start with [config/config.example.toml](config/config.example.toml). A matching
 JSON example is available at [config/config.example.json](config/config.example.json).
 The current TOML schema is documented with practical card recipes in
 [config/CARD_GUIDE.md](config/CARD_GUIDE.md).
+PetCard build, hook, animation, sizing, power, and sound behavior is documented
+in [docs/PET_CARD.md](docs/PET_CARD.md).
 
 The top-level sections are:
 
@@ -108,6 +121,15 @@ feature and append the generic configuration from
 connects to a separately installed ScrcpyForge daemon; PulseDeck does not own
 ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable.
 
+## Optional Codex PetCard
+
+The `pet-card` feature adds a generic plugin card without adding Codex-specific
+state or timers to the core. The separately installable hook under
+`integrations/pulsedeck-pet` publishes fixed lifecycle states through an atomic
+runtime file and never reads prompt or tool contents. Offline mode is static,
+animations pause while unmapped, and completion sound is opt-in. See
+[docs/PET_CARD.md](docs/PET_CARD.md).
+
 ## Project layout
 
 - `src/core`: configuration, scheduling, caching, and registries.
@@ -115,6 +137,7 @@ ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable
 - `src/rendering`, `src/ui`: reusable card presentation.
 - `src/actions`: bounded user-triggered actions.
 - `src/plugins`: optional external integrations.
+- `docs/PET_CARD.md`: optional Codex PetCard build, hook, and asset configuration.
 - `config`: portable examples and the card guide.
 - `data`: desktop entry and application icon.
 

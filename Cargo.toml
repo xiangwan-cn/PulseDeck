@@ -11,6 +11,7 @@ license = "MIT"
 default = []
 # Optional built-in page for the independently distributed ScrcpyForge service.
 scrcpy-forge = ["dep:bytes"]
+pet-card = []
 
 [[bin]]
 name = "pulsedeck"

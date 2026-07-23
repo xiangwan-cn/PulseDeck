@@ -15,10 +15,7 @@ use gtk::{
 
 use super::config::{CardConfig, PageConfig as ScrcpyForgeConfig};
 use super::service::{Client, DaemonController, Device, Snapshot};
-use crate::core::config::PageConfig;
-
-pub fn build(handle: tokio::runtime::Handle, page: &PageConfig) -> gtk::ScrolledWindow {
-    let cfg = page.scrcpy_forge.clone().unwrap_or_default();
+pub fn build(handle: tokio::runtime::Handle, cfg: ScrcpyForgeConfig) -> gtk::ScrolledWindow {
     let mut cards = if cfg.cards.is_empty() {
         default_cards()
     } else {

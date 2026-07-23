@@ -113,10 +113,9 @@ pub struct PageConfig {
     /// 页面实现类型；省略时为普通指标页。
     #[serde(default)]
     pub kind: Option<String>,
-    /// ScrcpyForge plugin settings are absent from builds without that feature.
-    #[cfg(feature = "scrcpy-forge")]
+    /// Generic configuration owned and decoded by the selected page plugin.
     #[serde(default)]
-    pub scrcpy_forge: Option<crate::plugins::scrcpy_forge::PageConfig>,
+    pub plugin: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +143,12 @@ pub struct CardConfig {
     pub cache_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Optional custom card implementation. Standard metric cards omit this.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Generic configuration owned and decoded by the selected card plugin.
+    #[serde(default)]
+    pub plugin: Option<toml::Value>,
 }
 
 fn default_renderer() -> RendererKind {
@@ -419,6 +424,8 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                 display: None,
                 cache_ttl_seconds: None,
                 schedule: None,
+                kind: None,
+                plugin: None,
             },
         )
         .collect()
@@ -501,27 +508,22 @@ mod tests {
             serde_json::from_str(include_str!("../../config/config.example.json")).unwrap();
         assert_eq!(config.app.title, "PulseDeck");
         assert!(config.cards.iter().any(|card| card.id == "cpu"));
-        assert!(config.actions.iter().any(|action| action.id == "system-summary"));
+        assert!(config
+            .actions
+            .iter()
+            .any(|action| action.id == "system-summary"));
     }
 
-    #[cfg(feature = "scrcpy-forge")]
     #[test]
-    fn scrcpy_forge_plugin_example_is_valid() {
-        let source = format!(
-            "{}\n{}",
-            include_str!("../../config/config.example.toml"),
-            include_str!("../plugins/scrcpy_forge/config.example.toml")
-        );
-        let config: AppConfig = toml::from_str(&source).unwrap();
-        let page = config
-            .pages
-            .iter()
-            .find(|page| page.kind.as_deref() == Some("scrcpy-forge"))
-            .unwrap();
-        assert_eq!(
-            page.scrcpy_forge.as_ref().unwrap().endpoints.tasks,
-            "scripts"
-        );
+    fn plugin_page_options_are_generic() {
+        let config: AppConfig = toml::from_str(
+            "[[pages]]\nid='plugin-page'\ntitle='Plugin'\nkind='example'\n[pages.plugin]\nvalue=7\n",
+        )
+        .unwrap();
+        let page = &config.pages[0];
+        let options = page.plugin.as_ref().unwrap();
+        assert_eq!(page.kind.as_deref(), Some("example"));
+        assert_eq!(options["value"].as_integer(), Some(7));
     }
 
     #[test]

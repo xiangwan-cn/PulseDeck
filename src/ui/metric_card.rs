@@ -28,6 +28,7 @@ pub struct MetricCard {
     pub card: GtkBox,
     pub header_name: Label,
     pub header_description: Label,
+    header_icon: Image,
     pub refresh_btn: Button,
     pub render_widgets: RenderWidgets,
     pub footer: Label,
@@ -46,9 +47,7 @@ impl MetricCard {
         card.set_hexpand(true);
         card.set_vexpand(!layout.fixed);
         card.set_size_request(layout.width.unwrap_or(-1), layout.height);
-        if layout.fixed {
-            card.set_overflow(gtk::Overflow::Hidden);
-        }
+        card.set_overflow(gtk::Overflow::Hidden);
 
         let accent = accent_for_card(&model.id, &model.renderer);
         card.add_css_class(accent);
@@ -186,6 +185,7 @@ impl MetricCard {
             card,
             header_name,
             header_description,
+            header_icon,
             refresh_btn,
             render_widgets,
             footer,
@@ -238,7 +238,6 @@ impl MetricCard {
             self.footer.set_label(&label);
             self.footer.set_visible(true);
         }
-
         // Preserve static identity and layout metadata. Metric updates carry
         // only dynamic fields and intentionally leave these values empty.
         let mut stored = model.clone();
@@ -251,6 +250,26 @@ impl MetricCard {
         }
         self.model = Some(stored);
         self.apply_density(model);
+    }
+
+    pub fn set_compact(&mut self, compact: bool) {
+        self.header_icon.set_visible(!compact);
+        self.refresh_btn.set_visible(!compact);
+        let description_visible = !self.header_description.text().is_empty();
+        self.header_description.set_visible(description_visible);
+        if compact {
+            self.card.add_css_class("compact-card");
+        } else {
+            self.card.remove_css_class("compact-card");
+        }
+        let footer_visible = self.model.as_ref().is_some_and(|model| {
+            model.cached
+                || model
+                    .subtitle
+                    .as_deref()
+                    .is_some_and(|subtitle| !subtitle.is_empty())
+        });
+        self.footer.set_visible(footer_visible);
     }
 
     fn apply_density(&self, model: &CardModel) {

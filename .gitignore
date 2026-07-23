@@ -1,5 +1,8 @@
 /target/
 
+# Local Codex project instructions (machine-specific development policy).
+/AGENTS.md
+
 # Local runtime configuration and credentials.
 /config/config.toml
 /config/config.local.toml

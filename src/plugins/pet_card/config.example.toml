@@ -1,0 +1,62 @@
+# Build with: cargo build --release --features pet-card
+# Frame paths are relative to asset_root. Missing animations fall back to emoji.
+
+[[cards]]
+id = "codex-pet"
+title = "Codex Pet"
+page = "monitor"
+order = 5
+kind = "pet-card"
+enabled = true
+
+[cards.display]
+card_height = 133
+fixed_size = true
+
+[cards.plugin]
+asset_root = "/home/you/.local/share/pulsedeck/pets/default"
+offline_after_seconds = 180
+fps = 12
+done_hold_seconds = 5
+offline_normal_after_seconds = 300
+pause_when_unmapped = true
+show_status = true
+completion_sound = false
+
+[cards.plugin.animations.offline]
+frames = ["offline/00.png"]
+loop = false
+
+[cards.plugin.animations.ready]
+frames = ["ready/00.png", "ready/01.png", "ready/02.png"]
+fps = 8
+loop = true
+
+[cards.plugin.animations.thinking]
+frames = ["thinking/00.png", "thinking/01.png", "thinking/02.png"]
+fps = 8
+loop = true
+
+[cards.plugin.animations.working]
+frames = ["working/00.png", "working/01.png", "working/02.png"]
+fps = 10
+loop = true
+
+[cards.plugin.animations.coding]
+frames = ["coding/00.png", "coding/01.png", "coding/02.png"]
+fps = 12
+loop = true
+
+[cards.plugin.animations.waiting]
+frames = ["waiting/00.png"]
+loop = false
+
+[cards.plugin.animations.error]
+frames = ["error/00.png", "error/01.png", "error/02.png"]
+fps = 8
+loop = false
+
+[cards.plugin.animations.done]
+frames = ["done/00.png", "done/01.png", "done/02.png"]
+fps = 10
+loop = false

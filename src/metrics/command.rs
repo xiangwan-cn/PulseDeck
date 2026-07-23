@@ -46,9 +46,13 @@ impl CommandMetric {
                 subtitle: Some(format!(
                     "退出码 {}: {}",
                     output.exit_code,
-                    output.stderr.trim()
+                    command_error_summary(&output.stderr)
                 )),
-                tooltip: Some("命令执行失败".into()),
+                tooltip: Some(if output.stderr.trim().is_empty() {
+                    "命令执行失败".into()
+                } else {
+                    output.stderr.trim().to_string()
+                }),
                 state: MetricState::Error,
                 cached: false,
                 metadata: None,
@@ -106,5 +110,33 @@ impl CommandMetric {
 
     pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
         self.collect_no_ctx()
+    }
+}
+
+fn command_error_summary(stderr: &str) -> String {
+    let final_line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("命令执行失败");
+    final_line
+        .strip_prefix("RuntimeError:")
+        .unwrap_or(final_line)
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_error_summary;
+
+    #[test]
+    fn traceback_is_reduced_to_its_final_message() {
+        let traceback =
+            "Traceback (most recent call last):\n  File \"card.py\", line 1\nRuntimeError: 网络异常\n";
+        assert_eq!(command_error_summary(traceback), "网络异常");
     }
 }

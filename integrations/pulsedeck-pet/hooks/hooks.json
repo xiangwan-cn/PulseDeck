@@ -1,0 +1,26 @@
+{
+  "description": "Update PulseDeck PetCard with fixed states without reading prompt or tool contents.",
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" ready", "timeout": 2}]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" thinking", "timeout": 2}]
+    }],
+    "PreToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" working", "timeout": 2}]
+    }],
+    "PermissionRequest": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" waiting", "timeout": 2}]
+    }],
+    "PostToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" thinking", "timeout": 2}]
+    }],
+    "Stop": [{
+      "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" done", "timeout": 2}]
+    }]
+  }
+}

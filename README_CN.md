@@ -17,6 +17,8 @@ PulseDeck 是面向 Linux 手机、平板和桌面的轻量 GTK4/Libadwaita 配�
 - 页面不可见时停止轮询。
 - 限制子进程输出、HTTP 响应大小和执行时间。
 - 可选、独立编译的 ScrcpyForge 设备控制页面。
+- 可选、独立编译的 Codex PetCard，支持事件驱动动画、尺寸记忆和完成提示音。
+- 页面工具栏可在普通网格与六列紧凑网格间切换，并记忆上次选择。
 
 ## 环境要求
 
@@ -42,6 +44,13 @@ cargo build --release
 cargo build --release --features scrcpy-forge
 ```
 
+如需包含 PetCard，或同时包含两个可选集成：
+
+```sh
+cargo build --release --features pet-card
+cargo build --release --features scrcpy-forge,pet-card
+```
+
 ## 配置
 
 首次启动时，PulseDeck 会将内置示例复制到：
@@ -53,6 +62,8 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 建议从 [config/config.example.toml](config/config.example.toml) 开始。仓库同时提供
 内容一致的 [config/config.example.json](config/config.example.json)。当前 TOML schema
 及实用卡片示例见 [config/CARD_GUIDE.md](config/CARD_GUIDE.md)。
+PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
+[docs/PET_CARD.md](docs/PET_CARD.md)。
 
 顶层配置包括：
 
@@ -102,6 +113,13 @@ timeout_seconds = 5
 它连接到单独安装的 ScrcpyForge 后端；PulseDeck 不持有 ADB 或 scrcpy 进程。服务
 程序、URL 和脚本均可配置。
 
+## 可选 Codex PetCard
+
+`pet-card` feature 通过通用卡片插件接口接入，Codex 专属状态和定时器不会进入主线
+核心。`integrations/pulsedeck-pet` 中可单独安装的 hook 只通过原子状态文件发布固定
+生命周期状态，不读取提示词或工具内容。离线状态完全静止，卡片不可见时暂停动画，
+完成提示音默认关闭。详见 [docs/PET_CARD.md](docs/PET_CARD.md)。
+
 ## 项目结构
 
 - `src/core`：配置、调度、缓存和注册表。
@@ -109,6 +127,7 @@ timeout_seconds = 5
 - `src/rendering`、`src/ui`：可复用卡片展示。
 - `src/actions`：有执行边界的用户操作。
 - `src/plugins`：可选外部集成。
+- `docs/PET_CARD.md`：可选 Codex PetCard 的构建、hook 与资源配置。
 - `config`：可移植示例和卡片指南。
 - `data`：桌面入口和应用图标。
 

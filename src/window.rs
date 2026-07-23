@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -26,6 +26,7 @@ use crate::ui::page::Page;
 const APP_CSS: &str = r#"
 .tab-bar-area { padding: 5px 6px; }
 .tab-bar-area tab { border-radius: 10px; min-height: 32px; font-size: 13px; }
+.compact-grid-button { min-width: 32px; min-height: 32px; padding: 0; }
 .pulsedeck-card { padding: 10px 8px 8px; border-radius: 14px; border: 1px solid alpha(currentColor, 0.12); background: alpha(currentColor, 0.035); box-shadow: 0 2px 8px alpha(black, 0.08); }
 .metric-card { }
 .accent-blue   { border-left: 2px solid #3584e4; }
@@ -47,6 +48,18 @@ const APP_CSS: &str = r#"
 .metric-footer { font-size: 9px; opacity: 0.7; margin-top: 1px; }
 .content-medium .metric-footer, .content-medium .metric-header-sub { font-size: 8px; }
 .content-dense .metric-footer, .content-dense .metric-header-sub { font-size: 7px; }
+.compact-card { padding: 6px 4px; border-radius: 10px; }
+.compact-card .metric-header-name { font-size: 11px; }
+.compact-card .metric-header-icon { opacity: 0; min-width: 0; min-height: 0; }
+.compact-card .metric-header-sub, .compact-card .metric-footer { font-size: 8px; }
+.compact-card .metric-value-box { margin: 2px 0 0 0; }
+.compact-card .metric-value { font-size: 16px; }
+.compact-card.content-medium .metric-value { font-size: 15px; }
+.compact-card.content-dense .metric-value { font-size: 13px; }
+.compact-card .action-icon { opacity: 0; min-width: 0; min-height: 0; }
+.compact-card .action-desc, .compact-card .action-confirm-badge { font-size: 8px; }
+.compact-card .action-name { font-size: 11px; }
+.compact-card .action-run-btn { padding: 2px 4px; min-width: 0; }
 .action-card { }
 .action-icon { opacity: 0.55; }
 .action-name { font-weight: 700; font-size: 13px; }
@@ -60,6 +73,8 @@ const APP_CSS: &str = r#"
 .status-icon { opacity: 0.55; }
 .status-text { font-size: 11px; opacity: 0.6; }
 .settings-card-row { min-height: 48px; }
+.card-fullscreen-layer { background: @window_bg_color; }
+.card-fullscreen-close { margin: 4px; }
 "#;
 
 struct MetricUpdate {
@@ -115,6 +130,7 @@ pub struct MonitorWindow {
     reload_guard: Rc<ConfigReloadGuard>,
     config_monitor: Option<gio::FileMonitor>,
     scheduler_wake: async_channel::Sender<()>,
+    compact_grid: Rc<Cell<bool>>,
 }
 
 impl MonitorWindow {
@@ -138,11 +154,23 @@ impl MonitorWindow {
         switcher.set_stack(Some(&view_stack));
         switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
 
-        let sw_area = GtkBox::new(Orientation::Horizontal, 0);
-        sw_area.set_halign(Align::Center);
+        let sw_area = gtk::CenterBox::new();
         sw_area.set_hexpand(true);
         sw_area.set_margin_top(4);
-        sw_area.append(&switcher);
+        sw_area.set_center_widget(Some(&switcher));
+        let compact_grid = gtk::ToggleButton::new();
+        compact_grid.set_icon_name("view-grid-symbolic");
+        compact_grid.add_css_class("flat");
+        compact_grid.add_css_class("compact-grid-button");
+        compact_grid.set_halign(Align::End);
+        let initial_compact = load_compact_grid_preference();
+        compact_grid.set_active(initial_compact);
+        compact_grid.set_tooltip_text(Some(if initial_compact {
+            "恢复默认卡片布局"
+        } else {
+            "切换全部卡片为 6×3 紧凑布局"
+        }));
+        sw_area.set_end_widget(Some(&compact_grid));
         sw_area.add_css_class("tab-bar-area");
 
         let content = GtkBox::new(Orientation::Vertical, 0);
@@ -153,6 +181,24 @@ impl MonitorWindow {
         window.set_content(Some(&content));
 
         let pages: Rc<RefCell<HashMap<String, Page>>> = Rc::new(RefCell::new(HashMap::new()));
+        let compact_preference = Rc::new(Cell::new(initial_compact));
+        let compact_pages = pages.clone();
+        let saved_compact_preference = compact_preference.clone();
+        compact_grid.connect_toggled(move |button| {
+            let compact = button.is_active();
+            saved_compact_preference.set(compact);
+            if let Err(error) = save_compact_grid_preference(compact) {
+                tracing::warn!(%error, "failed to save compact-grid preference");
+            }
+            button.set_tooltip_text(Some(if compact {
+                "恢复默认卡片布局"
+            } else {
+                "切换全部卡片为 6×3 紧凑布局"
+            }));
+            for page in compact_pages.borrow_mut().values_mut() {
+                page.set_compact_grid(compact);
+            }
+        });
         let config_ref = Rc::new(RefCell::new(config));
         let scheduler = Rc::new(RefCell::new(Scheduler::new()));
 
@@ -200,6 +246,7 @@ impl MonitorWindow {
             reload_guard: reload_guard.clone(),
             config_monitor: None,
             scheduler_wake,
+            compact_grid: compact_preference,
         };
 
         win.setup_pages();
@@ -275,8 +322,7 @@ impl MonitorWindow {
                     icon: Some("computer-symbolic".into()),
                     order: 10,
                     kind: None,
-                    #[cfg(feature = "scrcpy-forge")]
-                    scrcpy_forge: None,
+                    plugin: None,
                 },
                 crate::core::config::PageConfig {
                     id: "actions".into(),
@@ -284,8 +330,7 @@ impl MonitorWindow {
                     icon: Some("system-run-symbolic".into()),
                     order: 20,
                     kind: None,
-                    #[cfg(feature = "scrcpy-forge")]
-                    scrcpy_forge: None,
+                    plugin: None,
                 },
                 crate::core::config::PageConfig {
                     id: "settings".into(),
@@ -293,8 +338,7 @@ impl MonitorWindow {
                     icon: Some("preferences-system-symbolic".into()),
                     order: 30,
                     kind: None,
-                    #[cfg(feature = "scrcpy-forge")]
-                    scrcpy_forge: None,
+                    plugin: None,
                 },
             ]
         } else {
@@ -309,34 +353,40 @@ impl MonitorWindow {
         let pages_list = self.sorted_pages();
         let (cards, actions) = self.drain_cards();
 
-        let page_ids: Vec<String> = pages_list.iter().map(|p| p.id.clone()).collect();
+        let mut page_ids = Vec::new();
 
         self.pages.borrow_mut().clear();
         self.card_metas.borrow_mut().clear();
         self.builtin_metrics.lock().unwrap().clear();
 
+        let plugin_context = crate::plugins::PluginContext {
+            handle: self.handle.clone(),
+            presentation: None,
+        };
         for page_cfg in &pages_list {
-            if let Some(container) = crate::plugins::build_page(self.handle.clone(), page_cfg) {
-                self.view_stack
-                    .add_titled(&container, Some(&page_cfg.id), &page_cfg.title);
-                continue;
-            }
-            if crate::plugins::is_optional_page(page_cfg.kind.as_deref()) {
-                tracing::warn!(
-                    page = %page_cfg.id,
-                    kind = ?page_cfg.kind,
-                    "optional page skipped because its Cargo feature is disabled"
-                );
-                continue;
+            match crate::plugins::build_page(&plugin_context, page_cfg) {
+                Ok(Some(container)) => {
+                    self.view_stack
+                        .add_titled(&container, Some(&page_cfg.id), &page_cfg.title);
+                    page_ids.push(page_cfg.id.clone());
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(page = %page_cfg.id, %error, "plugin page skipped");
+                    continue;
+                }
             }
             let ui = self.config.borrow().config().ui.clone();
             let mut page = Page::new(&page_cfg.id, &ui);
+            page.set_compact_grid(self.compact_grid.get());
             self.populate_page(&mut page, &page_cfg.id, &cards, &actions);
 
             self.view_stack
                 .add_titled(&page.container, Some(&page_cfg.id), &page_cfg.title);
 
             self.pages.borrow_mut().insert(page_cfg.id.clone(), page);
+            page_ids.push(page_cfg.id.clone());
         }
 
         let preferred = self.config.borrow().config().ui.default_page.clone();
@@ -370,6 +420,39 @@ impl MonitorWindow {
         page_actions.sort_by_key(|_| 0);
 
         for card_cfg in &page_cards {
+            if card_cfg.kind.is_some() {
+                let (presentation, presentation_rx) =
+                    crate::plugins::CardPresentationHandle::channel();
+                let context = crate::plugins::PluginContext {
+                    handle: self.handle.clone(),
+                    presentation: Some(presentation.clone()),
+                };
+                match crate::plugins::build_card(&context, card_cfg) {
+                    Ok(Some(widget)) => {
+                        page.add_plugin_card(
+                            &card_cfg.id,
+                            &widget,
+                            card_cfg.display.as_ref(),
+                            presentation,
+                        );
+                        let pages = self.pages.clone();
+                        let page_id = page_id.to_string();
+                        let card_id = card_cfg.id.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            while let Ok(request) = presentation_rx.recv().await {
+                                if let Some(page) = pages.borrow_mut().get_mut(&page_id) {
+                                    page.set_plugin_card_presentation(&card_id, request);
+                                }
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(card = %card_cfg.id, %error, "plugin card skipped");
+                    }
+                }
+                continue;
+            }
             let model = CardModel {
                 id: card_cfg.id.clone(),
                 title: card_cfg.title.clone(),
@@ -1401,6 +1484,34 @@ fn default_builtin_cards() -> Vec<CardConfig> {
     ]
 }
 
+fn compact_grid_preference_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("pulsedeck/compact-grid")
+}
+
+fn load_compact_grid_preference() -> bool {
+    std::fs::read_to_string(compact_grid_preference_path())
+        .map(|value| value.trim() == "compact")
+        .unwrap_or(false)
+}
+
+fn save_compact_grid_preference(compact: bool) -> std::io::Result<()> {
+    let path = compact_grid_preference_path();
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "compact-grid preference has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, if compact { "compact\n" } else { "normal\n" })?;
+    std::fs::rename(temporary, path)
+}
+
 fn card(
     id: &str,
     title: &str,
@@ -1448,5 +1559,7 @@ fn card(
         display: None,
         cache_ttl_seconds: None,
         schedule: None,
+        kind: None,
+        plugin: None,
     }
 }

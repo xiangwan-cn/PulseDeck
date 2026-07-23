@@ -24,6 +24,7 @@ impl ActionCard {
         card.set_valign(Align::Fill);
         card.set_hexpand(true);
         card.set_size_request(-1, 133);
+        card.set_overflow(gtk::Overflow::Hidden);
 
         let hdr = GtkBox::new(Orientation::Horizontal, 10);
         let img = Image::from_icon_name(icon_name);

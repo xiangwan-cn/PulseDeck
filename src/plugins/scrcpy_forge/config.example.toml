@@ -8,7 +8,7 @@ icon = "phone-symbolic"
 order = 25
 kind = "scrcpy-forge"
 
-[pages.scrcpy_forge]
+[pages.plugin]
 api_url = "http://127.0.0.1:27180/api/v1"
 daemon_program = "scrcpy-forge-daemon"
 daemon_args = []
@@ -20,7 +20,7 @@ card_width = 180
 card_height = 252
 preview_height = 180
 
-[pages.scrcpy_forge.endpoints]
+[pages.plugin.endpoints]
 health = "health"
 shutdown = "shutdown"
 devices = "devices"
@@ -36,19 +36,19 @@ task_run = "scripts/run-named"
 task_stop = "scripts/devices/{serial}/stop"
 profile = "sessions/{serial}/{kind}"
 
-[[pages.scrcpy_forge.cards]]
+[[pages.plugin.cards]]
 role = "backend"
 title = "ScrcpyForge"
 description = "后端运行状态与启停开关"
 order = 10
 
-[[pages.scrcpy_forge.cards]]
+[[pages.plugin.cards]]
 role = "devices"
 title = "设备预览"
 description = "每台设备生成一张独立预览卡"
 order = 20
 
-[[pages.scrcpy_forge.cards]]
+[[pages.plugin.cards]]
 role = "scripts"
 title = "设备脚本"
 description = "每台设备生成一张对应脚本卡"

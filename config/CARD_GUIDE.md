@@ -107,6 +107,8 @@ max_subtitle_lines = 3
 
 `program` 和 `args` 直接传给子进程，不经过 shell。需要管道、重定向或变量展开时，
 应在自己的本地脚本中实现，并将脚本作为 `program`；不要把未经信任的内容拼入命令。
+命令失败时，卡片只显示 stderr 最后一个非空行（例如 Python traceback 最后的
+`RuntimeError` 消息），完整 stderr 保留在 tooltip 中，因此离线错误不会撑高卡片。
 
 ### HTTP
 
@@ -198,6 +200,11 @@ card_height = 160
 fixed_size = false # false 表示内容较多时允许卡片继续增高
 ```
 
+页面切换栏右上角的网格按钮可在默认列数和六列紧凑布局间切换。紧凑模式仍保留标题、
+主要数值、顶部说明和底部状态文字，只隐藏占宽明显的图标与刷新按钮。选择通过
+`${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/compact-grid` 原子保存，下次启动
+及配置热重载后继续使用上次模式。
+
 ## 固定时间更新
 
 命令、HTTP 和外部插件卡片都可以声明每日更新时间。应用会为每个时间点生成
@@ -217,3 +224,9 @@ cache_ttl_seconds = 14400
 `cargo build --release --features scrcpy-forge` 启用，配置见
 `src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
 重新进入后自动恢复。每台设备拥有对应的预览卡和脚本卡。
+
+## 可选 PetCard
+
+PetCard 默认不编译。使用 `cargo build --release --features pet-card` 启用；配置、
+Codex hook、帧资源、四格/六格/全屏尺寸、离线回落和完成提示音见
+[`docs/PET_CARD.md`](../docs/PET_CARD.md)。

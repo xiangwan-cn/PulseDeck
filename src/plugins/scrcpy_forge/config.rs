@@ -186,3 +186,30 @@ impl Default for PageConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::PageConfig;
+
+    #[derive(Deserialize)]
+    struct ExampleConfig {
+        pages: Vec<ExamplePage>,
+    }
+
+    #[derive(Deserialize)]
+    struct ExamplePage {
+        kind: String,
+        plugin: PageConfig,
+    }
+
+    #[test]
+    fn bundled_example_is_valid() {
+        let config: ExampleConfig = toml::from_str(include_str!("config.example.toml")).unwrap();
+        let page = &config.pages[0];
+        assert_eq!(page.kind, "scrcpy-forge");
+        assert_eq!(page.plugin.endpoints.tasks, "scripts");
+        assert_eq!(page.plugin.cards.len(), 3);
+    }
+}

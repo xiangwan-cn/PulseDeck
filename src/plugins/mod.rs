@@ -1,3 +1,11 @@
+//! Compile-time plugin boundary for optional pages and cards.
+//!
+//! Plugins are registered only when their Cargo feature is enabled. Core
+//! configuration stays generic and each plugin owns decoding its options.
+
+use crate::core::config::{CardConfig, PageConfig};
+use crate::core::error::AppError;
+
 pub mod loader;
 pub mod manifest;
 pub mod one_shot;
@@ -5,23 +13,118 @@ pub mod persistent;
 pub mod protocol;
 pub mod supervisor;
 
+#[cfg(feature = "pet-card")]
+pub mod pet_card;
 #[cfg(feature = "scrcpy-forge")]
 pub mod scrcpy_forge;
 
-pub fn build_page(
-    handle: tokio::runtime::Handle,
-    page: &crate::core::config::PageConfig,
-) -> Option<gtk::Widget> {
-    #[cfg(feature = "scrcpy-forge")]
-    if scrcpy_forge::accepts(page.kind.as_deref()) {
-        use gtk::prelude::Cast;
-        return Some(scrcpy_forge::build(handle, page).upcast());
-    }
-
-    let _ = (handle, page);
-    None
+#[derive(Clone)]
+pub struct PluginContext {
+    pub handle: tokio::runtime::Handle,
+    pub presentation: Option<CardPresentationHandle>,
 }
 
-pub fn is_optional_page(kind: Option<&str>) -> bool {
-    matches!(kind, Some("scrcpy-forge"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardPresentation {
+    Normal,
+    Quad,
+    Expanded,
+    Fullscreen,
+}
+
+#[derive(Clone)]
+pub struct CardPresentationHandle {
+    sender: async_channel::Sender<CardPresentation>,
+}
+
+impl CardPresentationHandle {
+    pub fn channel() -> (Self, async_channel::Receiver<CardPresentation>) {
+        let (sender, receiver) = async_channel::unbounded();
+        (Self { sender }, receiver)
+    }
+
+    pub fn request(&self, presentation: CardPresentation) {
+        let _ = self.sender.try_send(presentation);
+    }
+}
+
+pub trait PagePlugin {
+    fn kind(&self) -> &'static str;
+    fn build(
+        &self,
+        context: &PluginContext,
+        page: &PageConfig,
+        options: &toml::Value,
+    ) -> Result<gtk::Widget, AppError>;
+}
+
+pub trait CardPlugin {
+    fn kind(&self) -> &'static str;
+    fn build(
+        &self,
+        context: &PluginContext,
+        card: &CardConfig,
+        options: &toml::Value,
+    ) -> Result<gtk::Widget, AppError>;
+}
+
+fn page_plugins() -> Vec<Box<dyn PagePlugin>> {
+    #[allow(unused_mut)]
+    let mut plugins: Vec<Box<dyn PagePlugin>> = Vec::new();
+    #[cfg(feature = "scrcpy-forge")]
+    plugins.push(Box::new(scrcpy_forge::Plugin));
+    plugins
+}
+
+fn card_plugins() -> Vec<Box<dyn CardPlugin>> {
+    #[allow(unused_mut)]
+    let mut plugins: Vec<Box<dyn CardPlugin>> = Vec::new();
+    #[cfg(feature = "pet-card")]
+    plugins.push(Box::new(pet_card::Plugin));
+    plugins
+}
+
+pub fn build_page(
+    context: &PluginContext,
+    page: &PageConfig,
+) -> Result<Option<gtk::Widget>, AppError> {
+    let Some(kind) = page.kind.as_deref() else {
+        return Ok(None);
+    };
+    let Some(plugin) = page_plugins()
+        .into_iter()
+        .find(|plugin| plugin.kind() == kind)
+    else {
+        return Err(AppError::Unsupported(format!(
+            "page plugin `{kind}` is not available in this build"
+        )));
+    };
+    let options = page
+        .plugin
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    plugin.build(context, page, &options).map(Some)
+}
+
+pub fn build_card(
+    context: &PluginContext,
+    card: &CardConfig,
+) -> Result<Option<gtk::Widget>, AppError> {
+    let Some(kind) = card.kind.as_deref() else {
+        return Ok(None);
+    };
+    let Some(plugin) = card_plugins()
+        .into_iter()
+        .find(|plugin| plugin.kind() == kind)
+    else {
+        return Err(AppError::Unsupported(format!(
+            "card plugin `{kind}` is not available in this build"
+        )));
+    };
+    let options = card
+        .plugin
+        .clone()
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    plugin.build(context, card, &options).map(Some)
 }
