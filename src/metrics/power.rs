@@ -61,8 +61,12 @@ impl PowerMetric {
                 self.prev_status = Some(status);
                 self.last_anchor_secs = now_secs;
                 return MetricResult {
-                    value: CardValue::Text(status.as_str().to_string()),
-                    subtitle: Some("0.0 W".to_string()),
+                    value: CardValue::Number {
+                        value: 0.0,
+                        unit: Some("W".to_string()),
+                        decimals: 1,
+                    },
+                    subtitle: Some(status.as_str().to_string()),
                     tooltip: Some(status.as_str().to_string()),
                     state: MetricState::Normal,
                     cached: false,
@@ -136,13 +140,16 @@ impl PowerMetric {
 
         if is_discharging {
             let remaining = estimate_remaining(&snapshot, avg_power);
-            let rem_clone = remaining.clone();
             MetricResult {
-                value: CardValue::Text(remaining),
-                subtitle: Some(format!("{:.1} W (平均)", avg_power)),
+                value: CardValue::Number {
+                    value: avg_power,
+                    unit: Some("W".to_string()),
+                    decimals: 1,
+                },
+                subtitle: Some(format!("放电 · 预计剩余 {remaining}")),
                 tooltip: Some(format!(
                     "平均放电功耗: {:.1} W · 剩余: {}",
-                    avg_power, rem_clone
+                    avg_power, remaining
                 )),
                 state: MetricState::Normal,
                 cached: false,
@@ -151,9 +158,9 @@ impl PowerMetric {
         } else {
             let to_full = estimate_time_to_full(&snapshot, avg_power);
             let subtitle = if !to_full.is_empty() {
-                format!("{:.1} W · {}", avg_power, to_full)
+                format!("充电 · 预计充满 {to_full}")
             } else {
-                format!("{:.1} W (平均充电)", avg_power)
+                "充电中".into()
             };
             MetricResult {
                 value: CardValue::Number {

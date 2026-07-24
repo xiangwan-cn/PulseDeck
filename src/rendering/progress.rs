@@ -5,21 +5,21 @@ use crate::model::card_model::{CardModel, CardValue};
 
 pub fn apply_progress(widgets: &ProgressWidgets, model: &CardModel) {
     let (frac, label) = match &model.value {
-        CardValue::Percentage(p) => (*p / 100.0, format!("{:.1}%", p)),
+        CardValue::Percentage(p) => (*p / 100.0, crate::rendering::format::percentage(*p)),
         CardValue::Number {
             value,
             unit,
             decimals,
-        } => {
-            let u = unit.as_deref().unwrap_or("");
-            (
-                value.clamp(0.0, 100.0) / 100.0,
-                format!("{:.*} {}", *decimals as usize, value, u),
-            )
-        }
+        } => (
+            value.clamp(0.0, 100.0) / 100.0,
+            crate::rendering::format::number(*value, unit.as_deref(), *decimals),
+        ),
         CardValue::Text(t) => {
             if let Ok(p) = t.trim_end_matches('%').parse::<f64>() {
-                (p.clamp(0.0, 100.0) / 100.0, format!("{:.1}%", p))
+                (
+                    p.clamp(0.0, 100.0) / 100.0,
+                    crate::rendering::format::percentage(p),
+                )
             } else {
                 (0.0, t.clone())
             }

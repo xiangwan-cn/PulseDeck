@@ -24,6 +24,12 @@ impl CardPlugin for Plugin {
             .clone()
             .try_into()
             .map_err(|error| AppError::Plugin(format!("invalid pet-card config: {error}")))?;
-        Ok(runtime::build(card, config, context.presentation.clone())?.upcast())
+        Ok(runtime::build(
+            card,
+            config,
+            context.presentation.clone(),
+            context.runtime.clone(),
+        )?
+        .upcast())
     }
 }

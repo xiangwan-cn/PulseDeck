@@ -20,10 +20,10 @@ pub enum SystemMetric {
 }
 
 impl SystemMetric {
-    pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
+    pub fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
         match self {
             Self::LoadAverage => load_average(),
-            Self::Swap => swap_usage(),
+            Self::Swap => swap_usage(ctx),
             Self::ProcessCount => process_count(),
             Self::CpuTemperature => cpu_temperature(),
             Self::Filesystem => filesystem_usage(),
@@ -56,20 +56,13 @@ fn load_average() -> MetricResult {
     }
 }
 
-fn swap_usage() -> MetricResult {
-    let text = match fs::read_to_string("/proc/meminfo") {
-        Ok(v) => v,
+fn swap_usage(ctx: &MetricContext) -> MetricResult {
+    let info = match ctx.procfs.lock().unwrap().read_meminfo() {
+        Ok(value) => value,
         Err(e) => return MetricResult::error(format!("读取交换空间失败: {e}")),
     };
-    let kb = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .and_then(|v| v.split_whitespace().next())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let total = kb("SwapTotal:");
-    let free = kb("SwapFree:");
+    let total = info.swap_total_kb;
+    let free = info.swap_free_kb;
     let used = total.saturating_sub(free);
     let percent = if total == 0 {
         0.0

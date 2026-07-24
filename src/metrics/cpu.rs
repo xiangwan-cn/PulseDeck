@@ -48,7 +48,7 @@ impl CpuMetric {
         if total_delta == 0 {
             return MetricResult {
                 value: CardValue::Percentage(0.0),
-                subtitle: Some("0 %".to_string()),
+                subtitle: Some("统计暂未变化".to_string()),
                 tooltip: Some("CPU 统计未变化".into()),
                 state: MetricState::Normal,
                 cached: false,
@@ -74,7 +74,7 @@ impl CpuMetric {
 
         MetricResult {
             value: CardValue::Percentage(pct),
-            subtitle: Some(format!("{:.1} %", pct)),
+            subtitle: Some("平滑使用率".to_string()),
             tooltip: Some(format!("CPU 使用率: {:.1}%", pct)),
             state: MetricState::Normal,
             cached: false,

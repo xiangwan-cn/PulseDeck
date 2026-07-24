@@ -15,7 +15,13 @@ use gtk::{
 
 use super::config::{CardConfig, PageConfig as ScrcpyForgeConfig};
 use super::service::{Client, DaemonController, Device, Snapshot};
-pub fn build(handle: tokio::runtime::Handle, cfg: ScrcpyForgeConfig) -> gtk::ScrolledWindow {
+use crate::core::runtime::{PreviewPolicy, RuntimeHandle};
+
+pub fn build(
+    handle: tokio::runtime::Handle,
+    cfg: ScrcpyForgeConfig,
+    runtime: RuntimeHandle,
+) -> gtk::ScrolledWindow {
     let mut cards = if cfg.cards.is_empty() {
         default_cards()
     } else {
@@ -54,6 +60,7 @@ pub fn build(handle: tokio::runtime::Handle, cfg: ScrcpyForgeConfig) -> gtk::Scr
                 client.clone(),
                 daemon.clone(),
                 handle.clone(),
+                runtime.clone(),
             )),
             "devices" => {
                 devices_cfg = Some(card);
@@ -76,47 +83,88 @@ pub fn build(handle: tokio::runtime::Handle, cfg: ScrcpyForgeConfig) -> gtk::Scr
         let client = client.clone();
         let handle = handle.clone();
         let tx = tx.clone();
-        move || {
+        move |include_previews: bool| {
             let client = client.clone();
             let tx = tx.clone();
             handle.spawn(async move {
-                let _ = tx.try_send(client.snapshot().await);
+                let _ = tx.try_send(client.snapshot(include_previews).await);
             });
         }
     };
-    request();
-    busy.set(true);
-    glib::timeout_add_local(Duration::from_secs(cfg.preview_interval_seconds.max(1)), {
-        let busy = busy.clone();
-        let visible_host = flow.clone();
-        move || {
-            if visible_host.is_mapped() && !busy.replace(true) {
-                request();
-            }
-            glib::ControlFlow::Continue
+    let mode_rx = runtime.subscribe();
+    let (visibility_tx, visibility_rx) = async_channel::bounded::<()>(1);
+    flow.connect_map({
+        let visibility_tx = visibility_tx.clone();
+        move |_| {
+            let _ = visibility_tx.try_send(());
         }
     });
-    let update_flow = flow.clone();
+    flow.connect_unmap(move |_| {
+        let _ = visibility_tx.try_send(());
+    });
+    let weak_flow = flow.downgrade();
+    let preview_seconds = cfg.preview_interval_seconds.max(1);
+    let request_busy = busy.clone();
+    let render_runtime = runtime.clone();
+    glib::MainContext::default().spawn_local(async move {
+        loop {
+            let Some(flow) = weak_flow.upgrade() else {
+                break;
+            };
+            let snapshot = runtime.snapshot();
+            if flow.is_mapped()
+                && snapshot.preview_policy != PreviewPolicy::Stopped
+                && !request_busy.replace(true)
+            {
+                request(snapshot.preview_policy != PreviewPolicy::MetadataOnly);
+            }
+            drop(flow);
+            let delay = match snapshot.preview_policy {
+                PreviewPolicy::Normal => preview_seconds,
+                PreviewPolicy::Reduced => preview_seconds.saturating_mul(3),
+                PreviewPolicy::MetadataOnly => preview_seconds.saturating_mul(8),
+                PreviewPolicy::Stopped => 3600,
+            };
+            let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
+            let mode = Box::pin(mode_rx.recv());
+            let visibility = Box::pin(visibility_rx.recv());
+            let first = futures_util::future::select(timer, mode);
+            let _ = futures_util::future::select(Box::pin(first), visibility).await;
+        }
+    });
+    let weak_update_flow = flow.downgrade();
     glib::MainContext::default().spawn_local(async move {
         while let Ok(result) = rx.recv().await {
             busy.set(false);
+            let Some(update_flow) = weak_update_flow.upgrade() else {
+                break;
+            };
+            if render_runtime.snapshot().preview_policy == PreviewPolicy::Stopped {
+                continue;
+            }
             match result {
-                Ok(snapshot) => render_snapshot(
-                    &update_flow,
-                    &device_views,
-                    &scripts_signature,
-                    snapshot,
-                    &client,
-                    &handle,
-                    devices_cfg.as_ref(),
-                    scripts_cfg.as_ref(),
-                    &cfg,
-                    preview_width,
-                    preview_height,
-                ),
+                Ok(snapshot) => {
+                    crate::core::error_limiter::recovered("scrcpy-forge:snapshot");
+                    render_snapshot(
+                        &update_flow,
+                        &device_views,
+                        &scripts_signature,
+                        snapshot,
+                        &client,
+                        &handle,
+                        devices_cfg.as_ref(),
+                        scripts_cfg.as_ref(),
+                        &cfg,
+                        preview_width,
+                        preview_height,
+                    )
+                }
                 Err(error) => {
                     scripts_signature.set(0);
-                    tracing::warn!(%error, "ScrcpyForge snapshot failed");
+                    crate::core::error_limiter::warn(
+                        "scrcpy-forge:snapshot",
+                        format!("ScrcpyForge snapshot failed: {error}"),
+                    );
                 }
             }
         }
@@ -134,6 +182,7 @@ fn backend_card(
     client: Client,
     daemon: DaemonController,
     handle: tokio::runtime::Handle,
+    runtime: RuntimeHandle,
 ) -> GtkBox {
     let card_shell = shell(card, cfg);
     let card_box = card_shell.root;
@@ -158,16 +207,20 @@ fn backend_card(
     connect_row.append(&connect);
     body.append(&connect_row);
     let (connect_tx, connect_rx) = async_channel::unbounded();
+    let connect_lease = Rc::new(RefCell::new(None));
     connect.connect_clicked({
         let client = client.clone();
         let handle = handle.clone();
         let endpoint = endpoint.clone();
         let connect_tx = connect_tx.clone();
+        let runtime = runtime.clone();
+        let connect_lease = connect_lease.clone();
         move |_| {
             let value = endpoint.text().trim().to_owned();
             if value.is_empty() {
                 return;
             }
+            connect_lease.replace(Some(runtime.begin_interaction(Duration::from_secs(30))));
             let client = client.clone();
             let tx = connect_tx.clone();
             handle.spawn(async move {
@@ -183,8 +236,10 @@ fn backend_card(
     });
     glib::MainContext::default().spawn_local({
         let status = status.clone();
+        let connect_lease = connect_lease.clone();
         async move {
             while let Ok(result) = connect_rx.recv().await {
+                connect_lease.borrow_mut().take();
                 status.set_text(&result.unwrap_or_else(|e| format!("连接失败：{e}")));
             }
         }
@@ -220,28 +275,56 @@ fn backend_card(
             }
         }
     });
-    let (tx, rx) = async_channel::unbounded();
-    let health_busy = Rc::new(Cell::new(false));
-    glib::timeout_add_local(
-        Duration::from_secs(cfg.health_interval_seconds.max(1)),
-        move || {
-            if let Ok(healthy) = rx.try_recv() {
-                health_busy.set(false);
-                status.set_text(if healthy { "运行中" } else { "已停止" });
-                changing.set(true);
-                toggle.set_active(healthy);
-                changing.set(false);
-            }
-            if status.is_mapped() && !health_busy.replace(true) {
+    let (tx, rx) = async_channel::bounded(1);
+    let mode_rx = runtime.subscribe();
+    let (visible_tx, visible_rx) = async_channel::bounded::<()>(1);
+    status.connect_map({
+        let visible_tx = visible_tx.clone();
+        move |_| {
+            let _ = visible_tx.try_send(());
+        }
+    });
+    status.connect_unmap(move |_| {
+        let _ = visible_tx.try_send(());
+    });
+    let weak_status = status.downgrade();
+    let weak_toggle = toggle.downgrade();
+    let base_interval = cfg.health_interval_seconds.max(1);
+    glib::MainContext::default().spawn_local(async move {
+        loop {
+            let (Some(status), Some(toggle)) = (weak_status.upgrade(), weak_toggle.upgrade())
+            else {
+                break;
+            };
+            let snapshot = runtime.snapshot();
+            if status.is_mapped() && snapshot.preview_policy != PreviewPolicy::Stopped {
                 let client = client.clone();
                 let tx = tx.clone();
                 handle.spawn(async move {
                     let _ = tx.try_send(client.healthy().await);
                 });
+                if let Ok(healthy) = rx.recv().await {
+                    status.set_text(if healthy { "运行中" } else { "已停止" });
+                    changing.set(true);
+                    toggle.set_active(healthy);
+                    changing.set(false);
+                }
             }
-            glib::ControlFlow::Continue
-        },
-    );
+            drop(status);
+            drop(toggle);
+            let delay = match snapshot.preview_policy {
+                PreviewPolicy::Normal => base_interval,
+                PreviewPolicy::Reduced => base_interval.saturating_mul(3),
+                PreviewPolicy::MetadataOnly => base_interval.saturating_mul(4),
+                PreviewPolicy::Stopped => 3600,
+            };
+            let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
+            let mode = Box::pin(mode_rx.recv());
+            let visible = Box::pin(visible_rx.recv());
+            let first = futures_util::future::select(timer, mode);
+            let _ = futures_util::future::select(Box::pin(first), visible).await;
+        }
+    });
     card_box
 }
 

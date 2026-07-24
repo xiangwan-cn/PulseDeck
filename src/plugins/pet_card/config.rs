@@ -24,8 +24,6 @@ pub struct PetConfig {
     #[serde(default = "default_true")]
     pub show_status: bool,
     #[serde(default)]
-    pub completion_sound: bool,
-    #[serde(default)]
     pub completion_sound_file: Option<PathBuf>,
     #[serde(default)]
     pub animations: HashMap<String, AnimationConfig>,
@@ -90,7 +88,6 @@ impl Default for PetConfig {
             offline_normal_after_seconds: default_offline_normal_after(),
             pause_when_unmapped: true,
             show_status: true,
-            completion_sound: false,
             completion_sound_file: None,
             animations: HashMap::new(),
         }
@@ -121,7 +118,6 @@ mod tests {
         assert_eq!(card.kind, "pet-card");
         assert_eq!(card.plugin.fps, 12);
         assert_eq!(card.plugin.offline_normal_after_seconds, 300);
-        assert!(!card.plugin.completion_sound);
         assert!(card.plugin.completion_sound_file.is_none());
         assert!(card.plugin.animations.contains_key("offline"));
         assert!(card.plugin.animations.contains_key("done"));

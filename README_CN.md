@@ -12,9 +12,13 @@ PulseDeck 是面向 Linux 手机、平板和桌面的轻量 GTK4/Libadwaita 配�
   交换空间、温度及网络吞吐指标。
 - 支持内置指标、文件、命令、HTTP 和静态值数据源。
 - 支持数值、进度、状态、文本、列表、组合和操作渲染器。
+- 主数值统一使用直观格式：整百分比不显示无意义小数，单位自然排版，网络和功耗优先
+  显示状态或功率。
 - 支持固定间隔或 `daily@08:00,20:00` 等时间计划，并按时间槽缓存。
 - 全局及单卡片响应式尺寸，适配移动端和桌面布局。
 - 页面不可见时停止轮询。
+- 统一管理前台正常、空闲省电、外接供电、后台及 Codex 事件唤醒状态，设置即时生效。
+- 文件和网络状态事件驱动更新，临近刷新合并唤醒，共享系统快照并去重持久缓存写入。
 - 限制子进程输出、HTTP 响应大小和执行时间。
 - 可选、独立编译的 ScrcpyForge 设备控制页面。
 - 可选、独立编译的 Codex PetCard，支持事件驱动动画、尺寸记忆和完成提示音。
@@ -51,6 +55,12 @@ cargo build --release --features pet-card
 cargo build --release --features scrcpy-forge,pet-card
 ```
 
+需要在实际功耗测试中查看应用内部唤醒与 I/O 计数时，可单独启用：
+
+```sh
+cargo build --release --features power-debug
+```
+
 ## 配置
 
 首次启动时，PulseDeck 会将内置示例复制到：
@@ -64,10 +74,13 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 及实用卡片示例见 [config/CARD_GUIDE.md](config/CARD_GUIDE.md)。
 PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 [docs/PET_CARD.md](docs/PET_CARD.md)。
+统一运行模式、调度策略、插件适配和功耗验证方法见
+[docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md)。
 
 顶层配置包括：
 
-- `[app]`：标题、日志、输出限制、亮屏及生命周期行为。
+- `[app]`：标题、日志、输出限制和配置重载。
+- `[runtime]`：前台常亮、空闲显示与刷新、外接供电判断及 Codex 保护/通知。
 - `[ui]`：默认页面、列数、卡片尺寸和紧凑布局。
 - `[[pages]]`：按顺序排列的导航页面。
 - `[[cards]]`：由可配置数据源提供内容的卡片。
@@ -111,23 +124,26 @@ timeout_seconds = 5
 默认构建不包含该集成。启用 `scrcpy-forge` feature，并将
 `src/plugins/scrcpy_forge/config.example.toml` 中的通用配置追加到本地 TOML 文件。
 它连接到单独安装的 ScrcpyForge 后端；PulseDeck 不持有 ADB 或 scrcpy 进程。服务
-程序、URL 和脚本均可配置。
+程序、URL 和脚本均可配置。预览与健康检查使用统一运行模式：页面隐藏或应用后台时
+停止预览，空闲时只取设备元数据，未变化的画面通过 ETag 和内容哈希复用。
 
 ## 可选 Codex PetCard
 
 `pet-card` feature 通过通用卡片插件接口接入，Codex 专属状态和定时器不会进入主线
 核心。`integrations/pulsedeck-pet` 中可单独安装的 hook 只通过原子状态文件发布固定
 生命周期状态，不读取提示词或工具内容。离线状态完全静止，卡片不可见时暂停动画，
-完成提示音默认关闭。详见 [docs/PET_CARD.md](docs/PET_CARD.md)。
+应用后台时彻底停止帧定时器；完成提示音由全局运行设置控制。详见
+[docs/PET_CARD.md](docs/PET_CARD.md)。
 
 ## 项目结构
 
-- `src/core`：配置、调度、缓存和注册表。
+- `src/core`：配置、运行/供电状态、调度、缓存和注册表。
 - `src/metrics`、`src/sources`、`src/parsers`：数据采集与转换。
 - `src/rendering`、`src/ui`：可复用卡片展示。
 - `src/actions`：有执行边界的用户操作。
 - `src/plugins`：可选外部集成。
 - `docs/PET_CARD.md`：可选 Codex PetCard 的构建、hook 与资源配置。
+- `docs/RUNTIME_POWER.md`：统一运行模式、省电策略和验证方法。
 - `config`：可移植示例和卡片指南。
 - `data`：桌面入口和应用图标。
 

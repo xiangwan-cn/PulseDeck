@@ -67,6 +67,12 @@ pub struct Client {
     http: reqwest::Client,
     metadata_ttl: Duration,
     metadata: Arc<tokio::sync::Mutex<Option<CachedMetadata>>>,
+    previews: Arc<tokio::sync::Mutex<HashMap<String, CachedPreview>>>,
+}
+#[derive(Clone)]
+struct CachedPreview {
+    etag: Option<String>,
+    bytes: bytes::Bytes,
 }
 impl Client {
     pub fn new(config: &PageConfig) -> Self {
@@ -80,6 +86,7 @@ impl Client {
             http,
             metadata_ttl: Duration::from_secs(config.metadata_interval_seconds.max(1)),
             metadata: Arc::new(tokio::sync::Mutex::new(None)),
+            previews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
     fn url(&self, path: &str) -> String {
@@ -89,6 +96,7 @@ impl Client {
         template.replace("{serial}", serial)
     }
     pub async fn healthy(&self) -> bool {
+        crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
         self.http
             .get(self.url(&self.endpoints.health))
             .send()
@@ -114,7 +122,7 @@ impl Client {
         self.invalidate_metadata().await;
         Ok(())
     }
-    pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+    pub async fn snapshot(&self, include_previews: bool) -> anyhow::Result<Snapshot> {
         let metadata = self.metadata().await?;
         let Metadata {
             devices,
@@ -122,6 +130,15 @@ impl Client {
             runs,
             sessions,
         } = metadata;
+        if !include_previews {
+            return Ok(Snapshot {
+                devices: devices.into_iter().map(|device| (device, None)).collect(),
+                scripts,
+                runs,
+                sessions,
+                metrics: HashMap::new(),
+            });
+        }
         // Device screenshots and metrics are independent network operations. Fetch
         // them concurrently so multiple devices do not multiply the UI refresh delay.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
@@ -137,18 +154,47 @@ impl Client {
                 } else {
                     client.endpoint(&client.endpoints.device_preview, &d.serial)
                 };
-                let png = match client
-                    .http
-                    .get(client.url(&path))
-                    .send()
-                    .await
-                    .and_then(|r| r.error_for_status())
-                {
-                    Ok(r) => r.bytes().await.ok(),
+                let cache_key = path.clone();
+                crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
+                let cached = client.previews.lock().await.get(&cache_key).cloned();
+                let mut request = client.http.get(client.url(&path));
+                if let Some(etag) = cached.as_ref().and_then(|value| value.etag.as_deref()) {
+                    request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+                }
+                let png = match request.send().await {
+                    Ok(response) if response.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                        cached.map(|value| value.bytes)
+                    }
+                    Ok(response) => {
+                        let response = response.error_for_status().ok();
+                        if let Some(response) = response {
+                            let etag = response
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            let bytes = response.bytes().await.ok();
+                            if let Some(bytes) = bytes.as_ref() {
+                                client.previews.lock().await.insert(
+                                    cache_key,
+                                    CachedPreview {
+                                        etag,
+                                        bytes: bytes.clone(),
+                                    },
+                                );
+                            }
+                            bytes
+                        } else {
+                            None
+                        }
+                    }
                     Err(_) => None,
                 };
                 let metrics =
                     if has_session {
+                        crate::core::power_debug::increment(
+                            crate::core::power_debug::Counter::HttpRequest,
+                        );
                         match client
                             .http
                             .get(client.url(
@@ -194,6 +240,9 @@ impl Client {
             if cached.fetched_at.elapsed() < self.metadata_ttl {
                 return Ok(cached.value.clone());
             }
+        }
+        for _ in 0..4 {
+            crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
         }
         // These resources do not depend on each other. Fetching them together
         // keeps refresh latency close to the slowest request instead of their sum.

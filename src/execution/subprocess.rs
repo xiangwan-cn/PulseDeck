@@ -15,6 +15,7 @@ pub async fn run_command(
     timeout_secs: u64,
     max_output: usize,
 ) -> Result<CommandOutput, String> {
+    crate::core::power_debug::increment(crate::core::power_debug::Counter::ExternalProcess);
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .env("LANG", "en_US.UTF-8")

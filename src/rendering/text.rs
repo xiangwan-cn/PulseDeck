@@ -10,14 +10,8 @@ pub fn apply_text(widgets: &TextWidgets, model: &CardModel) {
             value,
             unit,
             decimals,
-        } => {
-            if let Some(u) = unit {
-                format!("{:.dec$} {}", value, u, dec = *decimals as usize)
-            } else {
-                format!("{:.dec$}", value, dec = *decimals as usize)
-            }
-        }
-        CardValue::Percentage(p) => format!("{:.1}%", p),
+        } => crate::rendering::format::number(*value, unit.as_deref(), *decimals),
+        CardValue::Percentage(p) => crate::rendering::format::percentage(*p),
         CardValue::Status { label, .. } => label.clone(),
         _ => String::new(),
     };

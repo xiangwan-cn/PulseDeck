@@ -1,10 +1,28 @@
 [app]
 title = "PulseDeck"
-pause_when_inactive = true
 reload_on_change = true
 log_level = "info"
-keep_screen_on = true
 max_output_bytes = 20000
+
+[runtime]
+keep_screen_on = true
+idle_power_saving = true
+idle_timeout_seconds = 60
+idle_stability_seconds = 10
+idle_visual_brightness_percent = 15
+refresh_saving_strength = "balanced"
+external_realtime = true
+external_prevents_idle = true
+external_sample_seconds = 10
+external_enter_samples = 3
+external_exit_samples = 2
+codex_keep_bright = true
+codex_protection_minutes = 60
+codex_attention_seconds = 15
+codex_completion_sound = true
+bring_to_foreground_on_attention = false
+cpu_activity_hint = false
+idle_display = "dim"
 
 [ui]
 default_page = "monitor"

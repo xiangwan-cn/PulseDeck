@@ -21,8 +21,9 @@ done_hold_seconds = 5
 offline_normal_after_seconds = 300
 pause_when_unmapped = true
 show_status = true
-completion_sound = false
-# Optional custom audio file. Omit it to use the desktop theme's "complete" event.
+# Completion notification is enabled globally with
+# [runtime].codex_completion_sound. This optional path replaces the desktop
+# theme's "complete" event for PetCard events.
 # completion_sound_file = "/home/you/.local/share/sounds/codex-done.oga"
 
 [cards.plugin.animations.offline]

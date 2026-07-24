@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use super::config::{AnimationConfig, PetConfig};
 use crate::core::config::CardConfig;
 use crate::core::error::AppError;
+use crate::core::runtime::{AnimationPolicy, ImportantEventKind, RuntimeHandle, UserActivity};
 use crate::plugins::{CardPresentation, CardPresentationHandle};
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +22,10 @@ struct StateEvent {
     #[serde(default)]
     detail: Option<String>,
     timestamp_ms: u64,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    event_id: Option<String>,
 }
 
 struct Runtime {
@@ -29,7 +35,10 @@ struct Runtime {
     status: gtk::Label,
     config: PetConfig,
     frames: RefCell<Vec<gdk::Texture>>,
+    frame_cache: RefCell<HashMap<String, Vec<gdk::Texture>>>,
+    cache_order: RefCell<VecDeque<String>>,
     frame_index: Cell<usize>,
+    animation_policy: Cell<AnimationPolicy>,
     animation_source: RefCell<Option<glib::SourceId>>,
     offline_source: RefCell<Option<glib::SourceId>>,
     transition_source: RefCell<Option<glib::SourceId>>,
@@ -39,12 +48,14 @@ struct Runtime {
     preferred_presentation: Cell<CardPresentation>,
     current_presentation: Cell<CardPresentation>,
     presentation: Option<CardPresentationHandle>,
+    runtime: RuntimeHandle,
 }
 
 pub fn build(
     card: &CardConfig,
     config: PetConfig,
     presentation: Option<CardPresentationHandle>,
+    runtime_handle: RuntimeHandle,
 ) -> Result<gtk::Box, AppError> {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
     root.add_css_class("card");
@@ -86,7 +97,10 @@ pub fn build(
         status,
         config,
         frames: RefCell::new(Vec::new()),
+        frame_cache: RefCell::new(HashMap::new()),
+        cache_order: RefCell::new(VecDeque::new()),
         frame_index: Cell::new(0),
+        animation_policy: Cell::new(AnimationPolicy::Stopped),
         animation_source: RefCell::new(None),
         offline_source: RefCell::new(None),
         transition_source: RefCell::new(None),
@@ -96,10 +110,13 @@ pub fn build(
         preferred_presentation: Cell::new(preferred_presentation),
         current_presentation: Cell::new(CardPresentation::Normal),
         presentation,
+        runtime: runtime_handle,
     });
     Runtime::setup_presentation_menu(&runtime);
     runtime.set_state("offline", None);
     Runtime::watch_state_file(&runtime)?;
+    Runtime::watch_runtime_mode(&runtime);
+    Runtime::watch_mapping(&runtime);
 
     // The signal closure owns the runtime for exactly as long as the widget.
     let keep_alive = runtime.clone();
@@ -136,6 +153,9 @@ impl Runtime {
             let menu_popover = popover.clone();
             button.connect_clicked(move |_| {
                 if let Some(runtime) = weak.upgrade() {
+                    runtime
+                        .runtime
+                        .report_user_activity(UserActivity::PluginControl);
                     runtime.select_presentation(mode);
                 }
                 menu_popover.popdown();
@@ -163,6 +183,9 @@ impl Runtime {
         double_click.connect_released(move |_, presses, _, _| {
             if presses == 2 {
                 if let Some(runtime) = weak.upgrade() {
+                    runtime
+                        .runtime
+                        .report_user_activity(UserActivity::PluginControl);
                     let next = next_presentation(runtime.current_presentation.get());
                     runtime.select_presentation(next);
                 }
@@ -223,6 +246,24 @@ impl Runtime {
         if let Some(source) = self.transition_source.borrow_mut().take() {
             source.remove();
         }
+        let task_id = event
+            .task_id
+            .clone()
+            .unwrap_or_else(|| format!("legacy-{}", event.timestamp_ms));
+        if is_working_state(&event.state) {
+            self.runtime.report_codex_started(task_id.clone());
+        }
+        if let Some(kind) = important_event_kind(&event.state) {
+            let event_id = event
+                .event_id
+                .clone()
+                .unwrap_or_else(|| event.timestamp_ms.to_string());
+            if self.runtime.report_codex_event(task_id, event_id, kind)
+                && self.runtime.config().codex_completion_sound
+            {
+                self.play_completion_sound();
+            }
+        }
         self.set_state(&event.state, event.detail.as_deref());
         if event.state == "done" {
             self.schedule_ready(self.config.done_hold_seconds);
@@ -270,10 +311,8 @@ impl Runtime {
             return;
         }
         self.current_state.replace(state.to_string());
-        if should_play_completion_sound(&previous_state, state, self.config.completion_sound) {
-            self.play_completion_sound();
-        }
         if state == "offline" {
+            self.runtime.clear_codex();
             self.schedule_presentation_reset();
         } else {
             self.cancel_presentation_reset();
@@ -290,7 +329,7 @@ impl Runtime {
             .get(state)
             .or_else(|| self.config.animations.get("default"));
         let textures = animation
-            .map(|value| self.load_frames(value))
+            .map(|value| self.load_frames(state, value))
             .unwrap_or_default();
         self.frames.replace(textures);
         self.frame_index.set(0);
@@ -305,7 +344,7 @@ impl Runtime {
             return;
         }
         if self.frames.borrow().len() > 1 {
-            self.start_animation(animation.expect("animation exists when frames loaded"));
+            self.apply_animation_policy(self.runtime.snapshot().animation_policy);
         }
     }
 
@@ -331,25 +370,54 @@ impl Runtime {
         }
     }
 
-    fn load_frames(&self, animation: &AnimationConfig) -> Vec<gdk::Texture> {
-        animation
+    fn load_frames(&self, state: &str, animation: &AnimationConfig) -> Vec<gdk::Texture> {
+        if let Some(frames) = self.frame_cache.borrow().get(state) {
+            return frames.clone();
+        }
+        let frames = animation
             .frames
             .iter()
             .filter_map(|path| {
                 let path = resolve_path(self.config.asset_root.as_deref(), path);
                 match gdk::Texture::from_file(&gio::File::for_path(&path)) {
-                    Ok(texture) => Some(texture),
+                    Ok(texture) => {
+                        crate::core::power_debug::increment(
+                            crate::core::power_debug::Counter::ImageDecode,
+                        );
+                        Some(texture)
+                    }
                     Err(error) => {
                         tracing::warn!(?path, %error, "failed to load pet frame");
                         None
                     }
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        self.frame_cache
+            .borrow_mut()
+            .insert(state.to_string(), frames.clone());
+        let mut order = self.cache_order.borrow_mut();
+        order.retain(|key| key != state);
+        order.push_back(state.to_string());
+        while order.len() > 3 {
+            if let Some(old) = order.pop_front() {
+                if old != state {
+                    self.frame_cache.borrow_mut().remove(&old);
+                }
+            }
+        }
+        frames
     }
 
-    fn start_animation(self: &Rc<Self>, animation: &AnimationConfig) {
-        let fps = animation.fps.unwrap_or(self.config.fps).clamp(1, 30);
+    fn start_animation(self: &Rc<Self>, animation: &AnimationConfig, cap: Option<u32>) {
+        self.stop_animation();
+        if !self.root.is_mapped() {
+            return;
+        }
+        let mut fps = animation.fps.unwrap_or(self.config.fps).clamp(1, 12);
+        if let Some(cap) = cap {
+            fps = fps.min(cap.max(1));
+        }
         let interval = Duration::from_millis((1000 / fps) as u64);
         let looping = animation.r#loop;
         let pause_when_unmapped = self.config.pause_when_unmapped;
@@ -359,7 +427,8 @@ impl Runtime {
                 return glib::ControlFlow::Break;
             };
             if pause_when_unmapped && !runtime.root.is_mapped() {
-                return glib::ControlFlow::Continue;
+                runtime.animation_source.borrow_mut().take();
+                return glib::ControlFlow::Break;
             }
             let frames = runtime.frames.borrow();
             if frames.len() < 2 {
@@ -373,6 +442,7 @@ impl Runtime {
             }
             let next = next % frames.len();
             runtime.frame_index.set(next);
+            crate::core::power_debug::increment(crate::core::power_debug::Counter::AnimationTick);
             runtime.picture.set_paintable(Some(&frames[next]));
             glib::ControlFlow::Continue
         });
@@ -383,6 +453,73 @@ impl Runtime {
         if let Some(source) = self.animation_source.borrow_mut().take() {
             source.remove();
         }
+    }
+
+    fn watch_runtime_mode(this: &Rc<Self>) {
+        let rx = this.runtime.subscribe();
+        let weak = Rc::downgrade(this);
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(snapshot) = rx.recv().await {
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
+                runtime.apply_animation_policy(snapshot.animation_policy);
+            }
+        });
+    }
+
+    fn watch_mapping(this: &Rc<Self>) {
+        let weak = Rc::downgrade(this);
+        this.root.connect_map(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.apply_animation_policy(runtime.runtime.snapshot().animation_policy);
+            }
+        });
+        let weak = Rc::downgrade(this);
+        this.root.connect_unmap(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.stop_animation();
+            }
+        });
+    }
+
+    fn apply_animation_policy(self: &Rc<Self>, policy: AnimationPolicy) {
+        let should_animate = self.root.is_mapped()
+            && self.frames.borrow().len() > 1
+            && matches!(
+                policy,
+                AnimationPolicy::Normal | AnimationPolicy::Reduced(_)
+            );
+        if self.animation_policy.get() == policy
+            && ((should_animate && self.animation_source.borrow().is_some()) || !should_animate)
+        {
+            return;
+        }
+        self.animation_policy.set(policy);
+        self.stop_animation();
+        if !self.root.is_mapped()
+            || matches!(policy, AnimationPolicy::Stopped | AnimationPolicy::Frozen)
+        {
+            return;
+        }
+        let state = self.current_state.borrow().clone();
+        let Some(animation) = self
+            .config
+            .animations
+            .get(&state)
+            .or_else(|| self.config.animations.get("default"))
+        else {
+            return;
+        };
+        if self.frames.borrow().len() < 2 {
+            return;
+        }
+        let cap = match policy {
+            AnimationPolicy::Normal => None,
+            AnimationPolicy::Reduced(fps) => Some(fps),
+            AnimationPolicy::Frozen | AnimationPolicy::Stopped => return,
+        };
+        self.start_animation(animation, cap);
     }
 
     fn select_presentation(self: &Rc<Self>, presentation: CardPresentation) {
@@ -437,6 +574,8 @@ impl Runtime {
         }
         self.cancel_presentation_reset();
         self.monitor.borrow_mut().take();
+        self.frame_cache.borrow_mut().clear();
+        self.cache_order.borrow_mut().clear();
     }
 }
 
@@ -503,8 +642,25 @@ fn now_ms() -> u64 {
 
 fn normalize_state(state: &str) -> &str {
     match state {
-        "ready" | "thinking" | "working" | "coding" | "waiting" | "error" | "done" => state,
+        "ready" | "thinking" | "working" | "coding" | "waiting" | "confirm" | "cancelled"
+        | "aborted" | "error" | "done" => state,
         _ => "offline",
+    }
+}
+
+fn is_working_state(state: &str) -> bool {
+    matches!(state, "thinking" | "working" | "coding")
+}
+
+fn important_event_kind(state: &str) -> Option<ImportantEventKind> {
+    match state {
+        "done" => Some(ImportantEventKind::Completed),
+        "error" => Some(ImportantEventKind::Failed),
+        "cancelled" => Some(ImportantEventKind::Cancelled),
+        "waiting" => Some(ImportantEventKind::WaitingInput),
+        "confirm" => Some(ImportantEventKind::ConfirmationRequired),
+        "aborted" => Some(ImportantEventKind::Aborted),
+        _ => None,
     }
 }
 
@@ -515,6 +671,9 @@ fn state_label(state: &str) -> &'static str {
         "working" => "正在执行工具",
         "coding" => "正在修改代码",
         "waiting" => "等待确认",
+        "confirm" => "需要用户确认",
+        "cancelled" => "任务已取消",
+        "aborted" => "任务异常停止",
         "error" => "执行遇到问题",
         "done" => "本轮已完成",
         _ => "Codex 未运行",
@@ -528,6 +687,9 @@ fn state_emoji(state: &str) -> &'static str {
         "working" => "🛠️",
         "coding" => "⌨️",
         "waiting" => "❗",
+        "confirm" => "❓",
+        "cancelled" => "⛔",
+        "aborted" => "⚠️",
         "error" => "💥",
         "done" => "🎉",
         _ => "💤",
@@ -539,10 +701,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{
-        completion_sound_argv, next_presentation, parse_presentation, presentation_name,
-        should_play_completion_sound,
-    };
+    use super::{completion_sound_argv, next_presentation, parse_presentation, presentation_name};
     use crate::plugins::CardPresentation;
 
     #[test]
@@ -580,13 +739,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_sound_only_plays_on_entry_to_done() {
-        assert!(should_play_completion_sound("working", "done", true));
-        assert!(!should_play_completion_sound("done", "done", true));
-        assert!(!should_play_completion_sound("working", "done", false));
-    }
-
-    #[test]
     fn completion_sound_uses_theme_event_or_custom_file() {
         assert_eq!(
             completion_sound_argv(None),
@@ -601,10 +753,6 @@ mod tests {
             ]
         );
     }
-}
-
-fn should_play_completion_sound(previous: &str, next: &str, enabled: bool) -> bool {
-    enabled && next == "done" && previous != "done"
 }
 
 fn completion_sound_argv(file: Option<&Path>) -> Vec<OsString> {

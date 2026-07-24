@@ -13,9 +13,15 @@ do not require recompiling the application.
   load, swap, temperature, and network-throughput metrics.
 - Built-in, file, command, HTTP, and static-value card sources.
 - Value, progress, status, text, list, composite, and action renderers.
+- Consistent human-readable primary values: compact percentages, natural unit
+  spacing, and status-first network/power summaries.
 - Fixed intervals or schedules such as `daily@08:00,20:00`, with per-slot cache.
 - Global and per-card responsive sizing for mobile and desktop layouts.
 - Page lifecycle awareness: hidden pages stop polling.
+- Unified foreground, idle-power, external-power, background, and Codex
+  attention state, with live settings and an application-only dim/minimal mode.
+- Event-driven file and network-status cards, coalesced refresh deadlines,
+  shared system snapshots, and deduplicated persistent cache writes.
 - Bounded subprocess output, HTTP response size, and execution time.
 - Optional, separately compiled ScrcpyForge device-control page.
 - Optional, separately compiled event-driven Codex PetCard with animated
@@ -55,6 +61,12 @@ cargo build --release --features pet-card
 cargo build --release --features scrcpy-forge,pet-card
 ```
 
+For opt-in internal wakeup/I/O counters used during power profiling:
+
+```sh
+cargo build --release --features power-debug
+```
+
 ## Configuration
 
 On first launch PulseDeck copies the bundled example to:
@@ -69,10 +81,14 @@ The current TOML schema is documented with practical card recipes in
 [config/CARD_GUIDE.md](config/CARD_GUIDE.md).
 PetCard build, hook, animation, sizing, power, and sound behavior is documented
 in [docs/PET_CARD.md](docs/PET_CARD.md).
+Runtime modes, scheduler policy, plugin integration, and measurement guidance
+are documented in [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md).
 
 The top-level sections are:
 
-- `[app]`: title, logging, output limits, screen and lifecycle behavior.
+- `[app]`: title, logging, output limits, and config reload.
+- `[runtime]`: foreground inhibition, idle display, refresh policy, external
+  power validation, and Codex protection/notification policy.
 - `[ui]`: default page, columns, card dimensions, and compact layout.
 - `[[pages]]`: ordered navigation pages.
 - `[[cards]]`: rendered values supplied by a configurable source.
@@ -120,6 +136,9 @@ feature and append the generic configuration from
 `src/plugins/scrcpy_forge/config.example.toml` to your local TOML file. It
 connects to a separately installed ScrcpyForge daemon; PulseDeck does not own
 ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable.
+Its preview and health loops consume the shared runtime mode: hidden/background
+pages stop preview work, idle mode requests metadata only, and unchanged images
+reuse an ETag/hash cache.
 
 ## Optional Codex PetCard
 
@@ -127,17 +146,19 @@ The `pet-card` feature adds a generic plugin card without adding Codex-specific
 state or timers to the core. The separately installable hook under
 `integrations/pulsedeck-pet` publishes fixed lifecycle states through an atomic
 runtime file and never reads prompt or tool contents. Offline mode is static,
-animations pause while unmapped, and completion sound is opt-in. See
+animations stop while unmapped or in the background, and the global runtime
+setting controls completion sound. See
 [docs/PET_CARD.md](docs/PET_CARD.md).
 
 ## Project layout
 
-- `src/core`: configuration, scheduling, caching, and registries.
+- `src/core`: configuration, runtime/power state, scheduling, caching, and registries.
 - `src/metrics`, `src/sources`, `src/parsers`: data collection and conversion.
 - `src/rendering`, `src/ui`: reusable card presentation.
 - `src/actions`: bounded user-triggered actions.
 - `src/plugins`: optional external integrations.
 - `docs/PET_CARD.md`: optional Codex PetCard build, hook, and asset configuration.
+- `docs/RUNTIME_POWER.md`: runtime modes, low-power policies, and validation.
 - `config`: portable examples and the card guide.
 - `data`: desktop entry and application icon.
 

@@ -79,6 +79,8 @@ impl Page {
         let scroll = ScrolledWindow::new();
         scroll.set_vexpand(true);
         scroll.set_kinetic_scrolling(true);
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_width(false);
         scroll.set_child(Some(&flow_box));
 
         let overlay = gtk::Overlay::new();
@@ -167,6 +169,7 @@ impl Page {
         flow.set_margin_end(4);
         flow.set_valign(Align::Start);
         flow.set_vexpand(false);
+        flow.set_hexpand(true);
         flow
     }
 

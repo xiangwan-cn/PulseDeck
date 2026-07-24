@@ -11,7 +11,8 @@ use gtk::{Align, Box as GtkBox, Button, Label, Orientation};
 
 use crate::core::cache;
 use crate::core::config::{config_path, CardConfig, ConfigManager, DisplayConfig, SourceConfig};
-use crate::core::scheduler::Scheduler;
+use crate::core::runtime::{RuntimeHandle, RuntimeManager, RuntimeMode, UserActivity};
+use crate::core::scheduler::{IdleBehavior, Scheduler, TaskClass, TaskPolicy};
 use crate::metrics::builtin::create_builtin_metric;
 use crate::metrics::command::CommandMetric;
 use crate::metrics::file::FileMetric;
@@ -77,6 +78,9 @@ const APP_CSS: &str = r#"
 .settings-card-row { min-height: 48px; }
 .card-fullscreen-layer { background: @window_bg_color; }
 .card-fullscreen-close { margin: 4px; }
+.runtime-dim-layer { background: #000000; transition: opacity 350ms ease; }
+.runtime-idle-status { color: #777777; font-size: 16px; font-weight: 600; }
+.runtime-idle-time { color: #666666; font-size: 28px; font-feature-settings: "tnum"; }
 "#;
 
 struct MetricUpdate {
@@ -95,6 +99,24 @@ struct ActionUpdate {
 struct CardMeta {
     page_id: String,
     interval_secs: u64,
+}
+
+enum PersistentSource {
+    Command(CommandMetric),
+    File(FileMetric),
+    Http(HttpMetric),
+    Static(MetricResult),
+}
+
+impl PersistentSource {
+    fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
+        match self {
+            Self::Command(source) => source.collect_no_ctx(),
+            Self::File(source) => source.collect(ctx),
+            Self::Http(source) => source.collect(ctx),
+            Self::Static(result) => result.clone(),
+        }
+    }
 }
 
 struct ConfigReloadGuard {
@@ -125,15 +147,23 @@ pub struct MonitorWindow {
     metric_ctx: Arc<MetricContext>,
     previous_results: Rc<RefCell<HashMap<String, MetricResult>>>,
     builtin_metrics: Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>>,
+    persistent_sources: Arc<Mutex<HashMap<String, Arc<Mutex<PersistentSource>>>>>,
     card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
     current_page_id: Rc<RefCell<String>>,
-    window_focused: Rc<RefCell<bool>>,
     metric_tx: async_channel::Sender<MetricUpdate>,
     action_tx: async_channel::Sender<ActionUpdate>,
     reload_guard: Rc<ConfigReloadGuard>,
     config_monitor: Option<gio::FileMonitor>,
     scheduler_wake: async_channel::Sender<()>,
     compact_grid: Rc<Cell<bool>>,
+    runtime: RuntimeHandle,
+    dashboard_content: gtk::Box,
+    dim_layer: gtk::Box,
+    idle_status: gtk::Label,
+    idle_time: gtk::Label,
+    _power_monitor: Rc<crate::core::power_supply::PowerSupplyMonitor>,
+    file_monitors: RefCell<Vec<gio::FileMonitor>>,
+    _network_monitor: gio::NetworkMonitor,
 }
 
 impl MonitorWindow {
@@ -141,6 +171,8 @@ impl MonitorWindow {
         let window = adw::ApplicationWindow::new(app);
         window.set_default_size(420, 720);
         window.set_title(Some(&config.config().app.title));
+        let runtime_manager = RuntimeManager::new(config.config().runtime.clone());
+        let runtime = runtime_manager.handle();
 
         let provider = gtk::CssProvider::new();
         provider.load_from_data(APP_CSS);
@@ -181,7 +213,34 @@ impl MonitorWindow {
         content.append(&gtk::Separator::new(Orientation::Horizontal));
         content.append(&view_stack);
 
-        window.set_content(Some(&content));
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&content));
+        let dim_layer = gtk::Box::new(Orientation::Vertical, 0);
+        dim_layer.add_css_class("runtime-dim-layer");
+        dim_layer.set_hexpand(true);
+        dim_layer.set_vexpand(true);
+        dim_layer.set_can_target(false);
+        dim_layer.set_opacity(0.0);
+        dim_layer.set_visible(false);
+        dim_layer.set_valign(Align::Fill);
+        let idle_spacer_top = gtk::Box::new(Orientation::Vertical, 0);
+        idle_spacer_top.set_vexpand(true);
+        dim_layer.append(&idle_spacer_top);
+        let idle_time = Label::new(None);
+        idle_time.add_css_class("runtime-idle-time");
+        idle_time.set_visible(false);
+        dim_layer.append(&idle_time);
+        let idle_status = Label::new(None);
+        idle_status.add_css_class("runtime-idle-status");
+        idle_status.set_wrap(true);
+        idle_status.set_justify(gtk::Justification::Center);
+        idle_status.set_visible(false);
+        dim_layer.append(&idle_status);
+        let idle_spacer_bottom = gtk::Box::new(Orientation::Vertical, 0);
+        idle_spacer_bottom.set_vexpand(true);
+        dim_layer.append(&idle_spacer_bottom);
+        overlay.add_overlay(&dim_layer);
+        window.set_content(Some(&overlay));
 
         let pages: Rc<RefCell<HashMap<String, Page>>> = Rc::new(RefCell::new(HashMap::new()));
         let compact_preference = Rc::new(Cell::new(initial_compact));
@@ -216,6 +275,11 @@ impl MonitorWindow {
             battery_root,
             procfs_root,
         ));
+        let power_monitor = crate::core::power_supply::PowerSupplyMonitor::start(
+            runtime.clone(),
+            PathBuf::from("/sys/class/power_supply"),
+            PathBuf::from("/sys/class/thermal"),
+        );
 
         let (metric_tx, metric_rx) = async_channel::unbounded::<MetricUpdate>();
         let (action_tx, action_rx) = async_channel::unbounded::<ActionUpdate>();
@@ -225,11 +289,12 @@ impl MonitorWindow {
             Rc::new(RefCell::new(HashMap::new()));
         let builtin_metrics: Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let persistent_sources = Arc::new(Mutex::new(HashMap::new()));
         let card_metas: Rc<RefCell<HashMap<String, CardMeta>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let current_page_id = Rc::new(RefCell::new(String::new()));
-        let window_focused = Rc::new(RefCell::new(true));
         let reload_guard = ConfigReloadGuard::new(500);
+        let network_monitor = gio::NetworkMonitor::default();
 
         let mut win = Self {
             window,
@@ -241,21 +306,30 @@ impl MonitorWindow {
             metric_ctx,
             previous_results,
             builtin_metrics,
+            persistent_sources,
             card_metas,
             current_page_id: current_page_id.clone(),
-            window_focused: window_focused.clone(),
             metric_tx,
             action_tx,
             reload_guard: reload_guard.clone(),
             config_monitor: None,
             scheduler_wake,
             compact_grid: compact_preference,
+            runtime,
+            dashboard_content: content,
+            dim_layer,
+            idle_status,
+            idle_time,
+            _power_monitor: power_monitor,
+            file_monitors: RefCell::new(Vec::new()),
+            _network_monitor: network_monitor.clone(),
         };
 
         win.setup_pages();
         win.setup_screen_inhibit(app);
         win.setup_lifecycle();
         win.setup_config_monitor();
+        win.setup_network_monitor(&network_monitor);
         win.start_scheduler_polling(scheduler_wake_rx);
         win.start_metric_receiver(metric_rx);
         win.start_action_receiver(action_rx);
@@ -264,30 +338,120 @@ impl MonitorWindow {
     }
 
     fn setup_screen_inhibit(&mut self, app: &adw::Application) {
-        if !self.config.borrow().config().app.keep_screen_on {
-            return;
-        }
-
         let application = app.clone();
         let inhibit_cookie: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-        let cookie = inhibit_cookie.clone();
+        let runtime = self.runtime.clone();
+        runtime.set_foreground(self.window.is_active());
+        self.window.connect_is_active_notify({
+            let runtime = runtime.clone();
+            move |window| runtime.set_foreground(window.is_active())
+        });
 
-        // `is-active` represents the foreground application window. Unlike a
-        // process-lifetime inhibit, this releases the system as soon as PulseDeck
-        // is minimized or another application comes to the foreground.
-        self.window.connect_is_active_notify(move |window| {
-            if window.is_active() {
-                if cookie.borrow().is_none() {
-                    let flags =
-                        gtk::ApplicationInhibitFlags::IDLE | gtk::ApplicationInhibitFlags::SUSPEND;
-                    let id = application.inhibit(
-                        Some(window),
-                        flags,
-                        Some("PulseDeck 正在前台显示实时监控信息"),
-                    );
-                    cookie.replace(Some(id));
+        let rx = runtime.subscribe();
+        let window = self.window.clone();
+        let dashboard_content = self.dashboard_content.clone();
+        let dim = self.dim_layer.clone();
+        let idle_status = self.idle_status.clone();
+        let idle_time = self.idle_time.clone();
+        let clock_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let presented_attention: Rc<RefCell<Option<(String, String)>>> =
+            Rc::new(RefCell::new(None));
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(snapshot) = rx.recv().await {
+                let runtime_config = runtime.config();
+                let keep_screen_on = runtime_config.keep_screen_on;
+                if let crate::core::runtime::CodexPhase::Attention { task_id, event_id } =
+                    &snapshot.codex_phase
+                {
+                    let key = (task_id.clone(), event_id.clone());
+                    if runtime_config.bring_to_foreground_on_attention
+                        && presented_attention.borrow().as_ref() != Some(&key)
+                    {
+                        presented_attention.replace(Some(key));
+                        window.present();
+                    }
+                } else {
+                    presented_attention.borrow_mut().take();
                 }
-            } else if let Some(id) = cookie.borrow_mut().take() {
+                if snapshot.foreground && keep_screen_on {
+                    if inhibit_cookie.borrow().is_none() {
+                        let flags = gtk::ApplicationInhibitFlags::IDLE
+                            | gtk::ApplicationInhibitFlags::SUSPEND;
+                        let id = application.inhibit(
+                            Some(&window),
+                            flags,
+                            Some("PulseDeck 正在前台显示实时监控信息"),
+                        );
+                        inhibit_cookie.replace(Some(id));
+                    }
+                } else if let Some(id) = inhibit_cookie.borrow_mut().take() {
+                    application.uninhibit(id);
+                }
+
+                let idle = snapshot.mode == RuntimeMode::ForegroundIdle;
+                if idle {
+                    let runtime_config = runtime.config();
+                    let minimal = runtime_config.idle_display == "minimal";
+                    let brightness = runtime_config.idle_visual_brightness_percent.min(100) as f64;
+                    dashboard_content.set_child_visible(!minimal);
+                    idle_status.set_visible(minimal);
+                    idle_time.set_visible(minimal);
+                    if minimal {
+                        idle_status.set_text(&format!(
+                            "{:?}\n供电 {:?} · 温度 {:?}\n{}",
+                            snapshot.codex_phase,
+                            snapshot.power_verdict,
+                            snapshot.thermal_verdict,
+                            snapshot.reason
+                        ));
+                        update_idle_clock(&idle_time, &idle_status);
+                        if clock_source.borrow().is_none() {
+                            let time = idle_time.clone();
+                            let status = idle_status.clone();
+                            let mode = runtime.clone();
+                            let holder = clock_source.clone();
+                            let source =
+                                glib::timeout_add_local(Duration::from_secs(60), move || {
+                                    if mode.snapshot().mode != RuntimeMode::ForegroundIdle
+                                        || mode.config().idle_display != "minimal"
+                                    {
+                                        holder.borrow_mut().take();
+                                        return glib::ControlFlow::Break;
+                                    }
+                                    update_idle_clock(&time, &status);
+                                    glib::ControlFlow::Continue
+                                });
+                            clock_source.replace(Some(source));
+                        }
+                    } else if let Some(source) = clock_source.borrow_mut().take() {
+                        source.remove();
+                    }
+                    dim.set_visible(true);
+                    dim.set_opacity(if minimal {
+                        1.0
+                    } else {
+                        (1.0 - brightness / 100.0).clamp(0.0, 0.95)
+                    });
+                } else {
+                    dashboard_content.set_child_visible(true);
+                    idle_status.set_visible(false);
+                    idle_time.set_visible(false);
+                    if let Some(source) = clock_source.borrow_mut().take() {
+                        source.remove();
+                    }
+                    dim.set_opacity(0.0);
+                    let dim = dim.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                        if dim.opacity() <= 0.001 {
+                            dim.set_visible(false);
+                        }
+                    });
+                }
+            }
+            if let Some(source) = clock_source.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(id) = inhibit_cookie.borrow_mut().take() {
                 application.uninhibit(id);
             }
         });
@@ -355,16 +519,19 @@ impl MonitorWindow {
     fn setup_pages(&mut self) {
         let pages_list = self.sorted_pages();
         let (cards, actions) = self.drain_cards();
+        self.setup_file_monitors(&cards);
 
         let mut page_ids = Vec::new();
 
         self.pages.borrow_mut().clear();
         self.card_metas.borrow_mut().clear();
         self.builtin_metrics.lock().unwrap().clear();
+        self.persistent_sources.lock().unwrap().clear();
 
         let plugin_context = crate::plugins::PluginContext {
             handle: self.handle.clone(),
             presentation: None,
+            runtime: self.runtime.clone(),
         };
         for page_cfg in &pages_list {
             match crate::plugins::build_page(&plugin_context, page_cfg) {
@@ -407,6 +574,58 @@ impl MonitorWindow {
             .set_active_page(&self.current_page_id.borrow());
     }
 
+    fn setup_file_monitors(&self, cards: &[CardConfig]) {
+        self.file_monitors.borrow_mut().clear();
+        for card in cards {
+            let Some(source) = card.source.as_ref() else {
+                continue;
+            };
+            if source.source_type != "file" {
+                continue;
+            }
+            let Some(path) = source.path.as_ref() else {
+                continue;
+            };
+            let Ok(monitor) = gio::File::for_path(path)
+                .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            let scheduler = self.scheduler.clone();
+            let wake = self.scheduler_wake.clone();
+            let card_id = card.id.clone();
+            monitor.connect_changed(move |_, _, _, event| {
+                if matches!(
+                    event,
+                    gio::FileMonitorEvent::Changed
+                        | gio::FileMonitorEvent::ChangesDoneHint
+                        | gio::FileMonitorEvent::Created
+                        | gio::FileMonitorEvent::MovedIn
+                ) {
+                    scheduler.borrow_mut().request_now(&card_id);
+                    let _ = wake.try_send(());
+                }
+            });
+            self.file_monitors.borrow_mut().push(monitor);
+        }
+    }
+
+    fn setup_network_monitor(&self, monitor: &gio::NetworkMonitor) {
+        let scheduler = self.scheduler.clone();
+        let wake = self.scheduler_wake.clone();
+        let config = self.config.clone();
+        monitor.connect_network_changed(move |_, _| {
+            for card in &config.borrow().config().cards {
+                if card.source.as_ref().is_some_and(|source| {
+                    source.source_type == "builtin" && source.metric.as_deref() == Some("network")
+                }) {
+                    scheduler.borrow_mut().request_now(&card.id);
+                }
+            }
+            let _ = wake.try_send(());
+        });
+    }
+
     fn populate_page(
         &self,
         page: &mut Page,
@@ -431,6 +650,7 @@ impl MonitorWindow {
                 let context = crate::plugins::PluginContext {
                     handle: self.handle.clone(),
                     presentation: Some(presentation.clone()),
+                    runtime: self.runtime.clone(),
                 };
                 match crate::plugins::build_card(&context, card_cfg) {
                     Ok(Some(widget)) => {
@@ -548,9 +768,12 @@ impl MonitorWindow {
                 },
             );
 
-            self.scheduler
-                .borrow_mut()
-                .register(&card_cfg.id, card_cfg.refresh_interval, page_id);
+            self.scheduler.borrow_mut().register_with_policy(
+                &card_cfg.id,
+                card_cfg.refresh_interval,
+                page_id,
+                task_policy(card_cfg),
+            );
         }
 
         for action_cfg in &page_actions {
@@ -586,6 +809,8 @@ impl MonitorWindow {
 
     fn add_settings_content(&self, page: &mut Page) {
         let status_card = GtkBox::new(Orientation::Horizontal, 10);
+        status_card.set_hexpand(true);
+        status_card.set_overflow(gtk::Overflow::Hidden);
         status_card.add_css_class("card");
         status_card.add_css_class("pulsedeck-card");
         status_card.add_css_class("status-card");
@@ -599,14 +824,18 @@ impl MonitorWindow {
         let status_label = Label::new(Some("卡片开关会立即生效，并自动保存到配置文件"));
         status_label.set_wrap(true);
         status_label.set_xalign(0.0);
+        status_label.set_hexpand(true);
+        status_label.set_size_request(1, -1);
         status_label.add_css_class("status-text");
         status_card.append(&status_label);
 
         page.flow_insert(&status_card);
 
-        let keep_screen_on = self.config.borrow().config().app.keep_screen_on;
+        let keep_screen_on = self.config.borrow().config().runtime.keep_screen_on;
         {
             let row = GtkBox::new(Orientation::Horizontal, 14);
+            row.set_hexpand(true);
+            row.set_overflow(gtk::Overflow::Hidden);
             row.add_css_class("card");
             row.add_css_class("pulsedeck-card");
             row.add_css_class("settings-card-row");
@@ -619,6 +848,7 @@ impl MonitorWindow {
 
             let label_box = GtkBox::new(Orientation::Vertical, 2);
             label_box.set_hexpand(true);
+            label_box.set_size_request(1, -1);
             label_box.set_valign(Align::Center);
 
             let title = Label::new(Some("保持屏幕开启"));
@@ -636,16 +866,283 @@ impl MonitorWindow {
             sw.set_valign(Align::Center);
             sw.set_active(keep_screen_on);
             let config = self.config.clone();
+            let runtime = self.runtime.clone();
             sw.connect_active_notify(move |switch| {
                 let mut config = config.borrow_mut();
-                config.config_mut().app.keep_screen_on = switch.is_active();
+                config.config_mut().runtime.keep_screen_on = switch.is_active();
+                let next = config.config().runtime.clone();
                 if let Err(error) = config.save() {
                     tracing::warn!("failed to save keep-screen setting: {}", error);
                 }
+                runtime.update_config(next);
             });
             row.append(&sw);
 
             page.flow_insert(&row);
+        }
+
+        let runtime_section = Label::new(Some("运行与省电"));
+        runtime_section.set_halign(Align::Start);
+        runtime_section.add_css_class("settings-name");
+        runtime_section.set_margin_top(8);
+        page.flow_insert(&runtime_section);
+
+        let runtime_cfg = self.config.borrow().config().runtime.clone();
+        for (title, description, active, field) in [
+            (
+                "启用空闲低功耗",
+                "无真实用户操作后降低显示、刷新和动画",
+                runtime_cfg.idle_power_saving,
+                "idle_power_saving",
+            ),
+            (
+                "外接电源高实时",
+                "仅在供电稳定、没有掉电且温度正常时升档",
+                runtime_cfg.external_realtime,
+                "external_realtime",
+            ),
+            (
+                "外接供电时禁止空闲",
+                "供电可信时保持正常亮度",
+                runtime_cfg.external_prevents_idle,
+                "external_prevents_idle",
+            ),
+            (
+                "Codex 工作保持正常亮度",
+                "只保护亮度；普通卡片仍可在用户空闲时节流",
+                runtime_cfg.codex_keep_bright,
+                "codex_keep_bright",
+            ),
+            (
+                "Codex 完成提示音",
+                "重要任务边沿只提示一次，后台仍保留",
+                runtime_cfg.codex_completion_sound,
+                "codex_completion_sound",
+            ),
+            (
+                "重要事件带回前台",
+                "Codex 完成或需要处理时主动显示窗口；默认关闭",
+                runtime_cfg.bring_to_foreground_on_attention,
+                "bring_to_foreground_on_attention",
+            ),
+            (
+                "CPU 活动辅助判断",
+                "仅作为空闲稳定期辅助信号，不替代真实用户操作",
+                runtime_cfg.cpu_activity_hint,
+                "cpu_activity_hint",
+            ),
+        ] {
+            let row = setting_switch_row(title, description, active);
+            let switch = row
+                .last_child()
+                .and_then(|widget| widget.downcast::<gtk::Switch>().ok())
+                .expect("setting switch row");
+            let config = self.config.clone();
+            let runtime = self.runtime.clone();
+            switch.connect_active_notify(move |switch| {
+                let mut config = config.borrow_mut();
+                let value = switch.is_active();
+                match field {
+                    "idle_power_saving" => config.config_mut().runtime.idle_power_saving = value,
+                    "external_realtime" => config.config_mut().runtime.external_realtime = value,
+                    "external_prevents_idle" => {
+                        config.config_mut().runtime.external_prevents_idle = value
+                    }
+                    "codex_keep_bright" => config.config_mut().runtime.codex_keep_bright = value,
+                    "codex_completion_sound" => {
+                        config.config_mut().runtime.codex_completion_sound = value
+                    }
+                    "bring_to_foreground_on_attention" => {
+                        config.config_mut().runtime.bring_to_foreground_on_attention = value
+                    }
+                    "cpu_activity_hint" => config.config_mut().runtime.cpu_activity_hint = value,
+                    _ => {}
+                }
+                let next = config.config().runtime.clone();
+                if let Err(error) = config.save() {
+                    tracing::warn!(%error, "failed to save runtime setting");
+                }
+                runtime.update_config(next);
+            });
+            page.flow_insert(&row);
+        }
+
+        for (title, description, value, min, max, field) in [
+            (
+                "空闲等待时间",
+                "最后一次真实操作后等待的秒数",
+                runtime_cfg.idle_timeout_seconds,
+                10,
+                3600,
+                "idle_timeout_seconds",
+            ),
+            (
+                "稳定等待时间",
+                "达到空闲条件后防抖的秒数",
+                runtime_cfg.idle_stability_seconds,
+                0,
+                120,
+                "idle_stability_seconds",
+            ),
+            (
+                "空闲视觉亮度",
+                "应用内遮罩保留的近似亮度百分比",
+                runtime_cfg.idle_visual_brightness_percent as u64,
+                5,
+                100,
+                "idle_visual_brightness_percent",
+            ),
+            (
+                "Codex 亮度保护",
+                "新任务开始后的保护分钟数",
+                runtime_cfg.codex_protection_minutes,
+                0,
+                1440,
+                "codex_protection_minutes",
+            ),
+            (
+                "完成唤醒时间",
+                "重要事件后保持正常亮度的秒数",
+                runtime_cfg.codex_attention_seconds,
+                1,
+                300,
+                "codex_attention_seconds",
+            ),
+        ] {
+            let (row, spin) = setting_spin_row(title, description, value, min, max);
+            let config = self.config.clone();
+            let runtime = self.runtime.clone();
+            spin.connect_value_changed(move |spin| {
+                let value = spin.value().round().max(0.0) as u64;
+                let mut config = config.borrow_mut();
+                match field {
+                    "idle_timeout_seconds" => {
+                        config.config_mut().runtime.idle_timeout_seconds = value
+                    }
+                    "idle_stability_seconds" => {
+                        config.config_mut().runtime.idle_stability_seconds = value
+                    }
+                    "idle_visual_brightness_percent" => {
+                        config.config_mut().runtime.idle_visual_brightness_percent =
+                            value.min(100) as u8
+                    }
+                    "codex_protection_minutes" => {
+                        config.config_mut().runtime.codex_protection_minutes = value
+                    }
+                    "codex_attention_seconds" => {
+                        config.config_mut().runtime.codex_attention_seconds = value
+                    }
+                    _ => {}
+                }
+                let next = config.config().runtime.clone();
+                if let Err(error) = config.save() {
+                    tracing::warn!(%error, "failed to save runtime duration");
+                }
+                runtime.update_config(next);
+            });
+            page.flow_insert(&row);
+        }
+
+        let (saving_row, saving_dropdown) = setting_dropdown_row(
+            "刷新节能强度",
+            "控制空闲模式下普通卡片的默认节流倍率",
+            &["温和", "均衡", "强力"],
+            match runtime_cfg.refresh_saving_strength.as_str() {
+                "mild" => 0,
+                "aggressive" => 2,
+                _ => 1,
+            },
+        );
+        {
+            let config = self.config.clone();
+            let runtime = self.runtime.clone();
+            saving_dropdown.connect_selected_notify(move |dropdown| {
+                let value = match dropdown.selected() {
+                    0 => "mild",
+                    2 => "aggressive",
+                    _ => "balanced",
+                };
+                let mut config = config.borrow_mut();
+                config.config_mut().runtime.refresh_saving_strength = value.into();
+                let next = config.config().runtime.clone();
+                let _ = config.save();
+                runtime.update_config(next);
+            });
+        }
+        page.flow_insert(&saving_row);
+
+        let (display_row, display_dropdown) = setting_dropdown_row(
+            "空闲显示方式",
+            "遮罩保留完整页面；纯黑极简模式进一步降低 OLED 发光与合成",
+            &["深色遮罩", "纯黑极简"],
+            u32::from(runtime_cfg.idle_display == "minimal"),
+        );
+        {
+            let config = self.config.clone();
+            let runtime = self.runtime.clone();
+            display_dropdown.connect_selected_notify(move |dropdown| {
+                let mut config = config.borrow_mut();
+                config.config_mut().runtime.idle_display = if dropdown.selected() == 1 {
+                    "minimal"
+                } else {
+                    "dim"
+                }
+                .into();
+                let next = config.config().runtime.clone();
+                let _ = config.save();
+                runtime.update_config(next);
+            });
+        }
+        page.flow_insert(&display_row);
+
+        let runtime_status = setting_status_row("当前运行状态", "正在初始化…");
+        let status_value = runtime_status
+            .last_child()
+            .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+            .expect("runtime status label");
+        let runtime_rx = self.runtime.subscribe();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(snapshot) = runtime_rx.recv().await {
+                status_value.set_text(&format!(
+                    "{:?} · {:?}\n供电 {:?} · 温度 {:?}\n{}\nCodex {:?} · 保护 {}s · 唤醒 {}s",
+                    snapshot.mode,
+                    snapshot.refresh_mode,
+                    snapshot.power_verdict,
+                    snapshot.thermal_verdict,
+                    snapshot.reason,
+                    snapshot.codex_phase,
+                    snapshot.codex_protection_remaining_seconds,
+                    snapshot.attention_remaining_seconds
+                ));
+            }
+        });
+        page.flow_insert(&runtime_status);
+
+        #[cfg(feature = "power-debug")]
+        {
+            let debug = setting_status_row("功耗调试计数", "点击更新，不启用周期刷新");
+            let value = debug
+                .last_child()
+                .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+                .expect("power debug label");
+            let button = Button::with_label("读取功耗计数");
+            button.connect_clicked(move |_| {
+                let counters = crate::core::power_debug::snapshot();
+                value.set_text(&format!(
+                    "调度唤醒 {} · 卡片采集 {} · 外部进程 {}\nHTTP {} · 图片解码 {} · 动画帧 {}\nGTK 更新 {} · 磁盘读 {} · 磁盘写 {}",
+                    counters[0],
+                    counters[1],
+                    counters[2],
+                    counters[3],
+                    counters[4],
+                    counters[5],
+                    counters[6],
+                    counters[7],
+                    counters[8]
+                ));
+            });
+            debug.append(&button);
+            page.flow_insert(&debug);
         }
 
         let section = Label::new(Some("系统指标卡片"));
@@ -671,6 +1168,8 @@ impl MonitorWindow {
 
         for card in builtin_cards {
             let row = GtkBox::new(Orientation::Horizontal, 12);
+            row.set_hexpand(true);
+            row.set_overflow(gtk::Overflow::Hidden);
             row.add_css_class("card");
             row.add_css_class("pulsedeck-card");
             row.add_css_class("settings-card-row");
@@ -686,6 +1185,7 @@ impl MonitorWindow {
 
             let labels = GtkBox::new(Orientation::Vertical, 1);
             labels.set_hexpand(true);
+            labels.set_size_request(1, -1);
             let title = Label::new(Some(&card.title));
             title.set_halign(Align::Start);
             title.add_css_class("settings-name");
@@ -761,10 +1261,11 @@ impl MonitorWindow {
                                         interval_secs: card.refresh_interval,
                                     },
                                 );
-                                scheduler.borrow_mut().register(
+                                scheduler.borrow_mut().register_with_policy(
                                     &card.id,
                                     card.refresh_interval,
                                     &card.page,
+                                    task_policy(&card),
                                 );
                                 scheduler
                                     .borrow_mut()
@@ -798,17 +1299,56 @@ impl MonitorWindow {
     }
 
     fn setup_lifecycle(&self) {
-        let focused = self.window_focused.clone();
-        let sched = self.scheduler.clone();
-        let focus_wake = self.scheduler_wake.clone();
-        let pause_when_inactive = self.config.borrow().config().app.pause_when_inactive;
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed({
+            let runtime = self.runtime.clone();
+            move |_, _, _, _| runtime.report_user_activity(UserActivity::Click)
+        });
+        self.window.add_controller(click);
 
-        self.window.connect_has_focus_notify(move |_window| {
-            let is_focused = _window.has_focus();
-            focused.replace(is_focused);
-            if pause_when_inactive {
-                sched.borrow_mut().set_window_active(is_focused);
-                let _ = focus_wake.try_send(());
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        scroll.connect_scroll({
+            let runtime = self.runtime.clone();
+            move |_, _, _| {
+                runtime.report_user_activity(UserActivity::Scroll);
+                glib::Propagation::Proceed
+            }
+        });
+        self.window.add_controller(scroll);
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let runtime = self.runtime.clone();
+            move |_, _, _, _| {
+                runtime.report_user_activity(UserActivity::Keyboard);
+                glib::Propagation::Proceed
+            }
+        });
+        self.window.add_controller(keys);
+
+        let drag = gtk::GestureDrag::new();
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        drag.connect_drag_begin({
+            let runtime = self.runtime.clone();
+            move |_, _, _| runtime.report_user_activity(UserActivity::Drag)
+        });
+        self.window.add_controller(drag);
+
+        let runtime_rx = self.runtime.subscribe();
+        let runtime_config = self.runtime.clone();
+        let runtime_scheduler = self.scheduler.clone();
+        let runtime_wake = self.scheduler_wake.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(snapshot) = runtime_rx.recv().await {
+                let mut scheduler = runtime_scheduler.borrow_mut();
+                scheduler.set_window_active(snapshot.foreground);
+                scheduler.set_saving_strength(&runtime_config.config().refresh_saving_strength);
+                scheduler.set_refresh_mode(snapshot.refresh_mode);
+                drop(scheduler);
+                let _ = runtime_wake.try_send(());
             }
         });
 
@@ -816,9 +1356,11 @@ impl MonitorWindow {
         let scheduler = self.scheduler.clone();
         let scheduler_wake = self.scheduler_wake.clone();
         let view_stack = self.view_stack.clone();
+        let runtime = self.runtime.clone();
 
         view_stack.connect_visible_child_name_notify(move |stack| {
             if let Some(name) = stack.visible_child_name() {
+                runtime.report_user_activity(UserActivity::PageSwitch);
                 let name_str = name.to_string();
                 *current_page.borrow_mut() = name_str.clone();
 
@@ -844,6 +1386,10 @@ impl MonitorWindow {
 
         let config_ref = self.config.clone();
         let reload_guard = self.reload_guard.clone();
+        let runtime = self.runtime.clone();
+        let persistent_sources = self.persistent_sources.clone();
+        let scheduler = self.scheduler.clone();
+        let scheduler_wake = self.scheduler_wake.clone();
 
         monitor.connect_changed(move |_monitor, _file, _other_file, event_type| {
             if event_type == gio::FileMonitorEvent::ChangesDoneHint
@@ -851,6 +1397,10 @@ impl MonitorWindow {
             {
                 let guard = reload_guard.clone();
                 let cfg = config_ref.clone();
+                let runtime = runtime.clone();
+                let sources = persistent_sources.clone();
+                let scheduler = scheduler.clone();
+                let scheduler_wake = scheduler_wake.clone();
 
                 let should_schedule;
                 {
@@ -868,19 +1418,37 @@ impl MonitorWindow {
                         *last = Instant::now();
                         should_schedule = None;
                         drop(last);
-                        do_reload_config(&cfg);
+                        if do_reload_config(&cfg) {
+                            sources.lock().unwrap().clear();
+                            for card in &cfg.borrow().config().cards {
+                                scheduler.borrow_mut().request_now(&card.id);
+                            }
+                            let _ = scheduler_wake.try_send(());
+                            runtime.update_config(cfg.borrow().config().runtime.clone());
+                        }
                     }
                 }
 
                 if let Some(remaining_ms) = should_schedule {
                     let cfg2 = cfg.clone();
+                    let runtime2 = runtime.clone();
+                    let sources2 = sources.clone();
+                    let scheduler2 = scheduler.clone();
+                    let scheduler_wake2 = scheduler_wake.clone();
                     let sid_cell = guard.source_id.clone();
 
                     let sid = glib::timeout_add_local(
                         Duration::from_millis(remaining_ms + 50),
                         move || {
                             guard.pending.replace(false);
-                            do_reload_config(&cfg2);
+                            if do_reload_config(&cfg2) {
+                                sources2.lock().unwrap().clear();
+                                for card in &cfg2.borrow().config().cards {
+                                    scheduler2.borrow_mut().request_now(&card.id);
+                                }
+                                let _ = scheduler_wake2.try_send(());
+                                runtime2.update_config(cfg2.borrow().config().runtime.clone());
+                            }
                             glib::ControlFlow::Break
                         },
                     );
@@ -898,6 +1466,7 @@ impl MonitorWindow {
         let handle = self.handle.clone();
         let metric_ctx = self.metric_ctx.clone();
         let builtin_metrics = self.builtin_metrics.clone();
+        let persistent_sources = self.persistent_sources.clone();
         let metric_tx = self.metric_tx.clone();
 
         glib::MainContext::default().spawn_local(async move {
@@ -910,6 +1479,9 @@ impl MonitorWindow {
                 let timer = Box::pin(glib::timeout_future(delay.max(Duration::from_millis(10))));
                 let wake = Box::pin(wake_rx.recv());
                 let _ = futures_util::future::select(timer, wake).await;
+                crate::core::power_debug::increment(
+                    crate::core::power_debug::Counter::SchedulerWake,
+                );
                 let ready = scheduler.borrow_mut().poll();
 
                 for card_id in ready {
@@ -948,6 +1520,7 @@ impl MonitorWindow {
                     let h = handle.clone();
                     let ctx = metric_ctx.clone();
                     let bm = builtin_metrics.clone();
+                    let sources = persistent_sources.clone();
                     let max_output = config.borrow().config().app.max_output_bytes;
 
                     let source = card_cfg.source.clone();
@@ -1009,7 +1582,17 @@ impl MonitorWindow {
 
                     h.spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
-                            collect_card_metric(&card_cfg.id, &source, &ctx, &bm, max_output)
+                            crate::core::power_debug::increment(
+                                crate::core::power_debug::Counter::CardCollect,
+                            );
+                            collect_card_metric(
+                                &card_cfg.id,
+                                &source,
+                                &ctx,
+                                &bm,
+                                &sources,
+                                max_output,
+                            )
                         })
                         .await
                         .unwrap_or_else(|e| {
@@ -1024,10 +1607,9 @@ impl MonitorWindow {
                                     .and_then(|state| state.period.as_deref()),
                                 &result,
                             ) {
-                                tracing::warn!(
-                                    "failed to persist cache for {}: {}",
-                                    card_id,
-                                    error
+                                crate::core::error_limiter::warn(
+                                    format!("cache:{card_id}"),
+                                    format!("failed to persist cache for {card_id}: {error}"),
                                 );
                             }
                         }
@@ -1057,6 +1639,7 @@ impl MonitorWindow {
         let scheduler = self.scheduler.clone();
         let card_metas = self.card_metas.clone();
         let config = self.config.clone();
+        let runtime = self.runtime.clone();
         let scheduler_wake = self.scheduler_wake.clone();
 
         glib::MainContext::default().spawn_local(async move {
@@ -1076,6 +1659,18 @@ impl MonitorWindow {
                     };
 
                     let card_cfg = cfg.config().cards.iter().find(|c| c.id == update.card_id);
+                    let is_cpu =
+                        card_cfg
+                            .and_then(|card| card.source.as_ref())
+                            .is_some_and(|source| {
+                                source.source_type == "builtin"
+                                    && source.metric.as_deref() == Some("cpu")
+                            });
+                    if is_cpu {
+                        if let CardValue::Percentage(percent) = &update.result.value {
+                            runtime.report_cpu_activity(*percent);
+                        }
+                    }
                     let display = card_cfg.and_then(|c| c.display.as_ref()).cloned();
 
                     let should_skip = {
@@ -1088,6 +1683,9 @@ impl MonitorWindow {
                     };
 
                     if !should_skip {
+                        crate::core::power_debug::increment(
+                            crate::core::power_debug::Counter::GtkUpdate,
+                        );
                         if let Some(page) = pages.borrow_mut().get_mut(&update.page_id) {
                             if let Some(card) = page.get_metric_card(&update.card_id) {
                                 apply_metric_result(card, &update.result);
@@ -1162,6 +1760,7 @@ fn collect_card_metric(
     source: &Option<SourceConfig>,
     ctx: &Arc<MetricContext>,
     builtin_metrics: &Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>>,
+    persistent_sources: &Arc<Mutex<HashMap<String, Arc<Mutex<PersistentSource>>>>>,
     max_output: usize,
 ) -> MetricResult {
     let source = match source {
@@ -1212,6 +1811,34 @@ fn collect_card_metric(
             result
         }
 
+        "command" | "file" | "http" | "static_value" | "static" => {
+            let persistent = {
+                let mut registry = persistent_sources.lock().unwrap();
+                if let Some(source) = registry.get(card_id).cloned() {
+                    source
+                } else {
+                    let source = match build_persistent_source(source, max_output) {
+                        Ok(source) => source,
+                        Err(result) => return result,
+                    };
+                    let source = Arc::new(Mutex::new(source));
+                    registry.insert(card_id.to_string(), source.clone());
+                    source
+                }
+            };
+            let result = persistent.lock().unwrap().collect(ctx);
+            result
+        }
+
+        other => MetricResult::error(format!("不支持的数据源类型: {}", other)),
+    }
+}
+
+fn build_persistent_source(
+    source: &SourceConfig,
+    max_output: usize,
+) -> Result<PersistentSource, MetricResult> {
+    match source.source_type.as_str() {
         "command" => {
             let program = source.program.as_deref().unwrap_or("echo").to_string();
             let args = source.args.clone().unwrap_or_default();
@@ -1230,15 +1857,15 @@ fn collect_card_metric(
                 .and_then(|v| v.as_integer())
                 .unwrap_or(0) as usize;
 
-            let mut cmd = CommandMetric::new(program, args, timeout, max_out, reverse, max_sub);
-            cmd.collect_no_ctx()
+            Ok(PersistentSource::Command(CommandMetric::new(
+                program, args, timeout, max_out, reverse, max_sub,
+            )))
         }
-
         "file" => {
             let path = match &source.path {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    return MetricResult::error("未指定文件路径");
+                    return Err(MetricResult::error("未指定文件路径"));
                 }
             };
 
@@ -1249,15 +1876,16 @@ fn collect_card_metric(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
 
-            let mut file_metric = FileMetric::new(path, first_line_only);
-            file_metric.collect(ctx)
+            Ok(PersistentSource::File(FileMetric::new(
+                path,
+                first_line_only,
+            )))
         }
-
         "http" => {
             let url = match &source.url {
                 Some(u) => u.clone(),
                 None => {
-                    return MetricResult::error("未指定 HTTP URL");
+                    return Err(MetricResult::error("未指定 HTTP URL"));
                 }
             };
 
@@ -1268,11 +1896,10 @@ fn collect_card_metric(
             let parser = source.parser.clone();
             let max_out = source.max_output_bytes.min(max_output).max(1);
 
-            let mut http_metric =
-                HttpMetric::new(url, method, headers, body, timeout, parser, max_out);
-            http_metric.collect(ctx)
+            Ok(PersistentSource::Http(HttpMetric::new(
+                url, method, headers, body, timeout, parser, max_out,
+            )))
         }
-
         "static_value" | "static" => {
             let value = source
                 .options
@@ -1281,18 +1908,203 @@ fn collect_card_metric(
                 .and_then(|v| v.as_str())
                 .unwrap_or("-");
 
-            MetricResult {
+            Ok(PersistentSource::Static(MetricResult {
                 value: CardValue::Text(value.to_string()),
                 subtitle: None,
                 tooltip: None,
                 state: MetricState::Normal,
                 cached: false,
                 metadata: None,
-            }
+            }))
         }
-
-        other => MetricResult::error(format!("不支持的数据源类型: {}", other)),
+        other => Err(MetricResult::error(format!(
+            "不支持的持久数据源类型: {other}"
+        ))),
     }
+}
+
+fn task_policy(card: &CardConfig) -> TaskPolicy {
+    let configured = card.runtime.class.as_str();
+    let source_type = card
+        .source
+        .as_ref()
+        .map(|source| source.source_type.as_str())
+        .unwrap_or("other");
+    let metric = card
+        .source
+        .as_ref()
+        .and_then(|source| source.metric.as_deref())
+        .unwrap_or_default();
+    let class = match configured {
+        "system" | "system-realtime" => TaskClass::SystemRealtime,
+        "network" | "network-rate" => TaskClass::NetworkRate,
+        "network-status" => TaskClass::NetworkStatus,
+        "battery" | "thermal" | "battery-thermal" => TaskClass::BatteryThermal,
+        "command" => TaskClass::Command,
+        "http" => TaskClass::Http,
+        "file" => TaskClass::File,
+        "static" => TaskClass::Static,
+        _ => match source_type {
+            "command" => TaskClass::Command,
+            "http" => TaskClass::Http,
+            "file" => TaskClass::File,
+            "static" | "static_value" => TaskClass::Static,
+            "builtin"
+                if matches!(
+                    metric,
+                    "battery_capacity" | "battery_temperature" | "power" | "cpu_temperature"
+                ) =>
+            {
+                TaskClass::BatteryThermal
+            }
+            "builtin" if metric == "network_traffic" => TaskClass::NetworkRate,
+            "builtin" if metric == "network" => TaskClass::NetworkStatus,
+            "builtin" => TaskClass::SystemRealtime,
+            _ => TaskClass::Other,
+        },
+    };
+    TaskPolicy {
+        class,
+        idle_behavior: if card.runtime.idle_behavior == "pause" {
+            IdleBehavior::Pause
+        } else {
+            IdleBehavior::Throttle
+        },
+        idle_multiplier: card.runtime.idle_multiplier,
+        external_realtime: card.runtime.external_realtime,
+        realtime_multiplier: card.runtime.realtime_multiplier,
+        minimum_interval_secs: card.runtime.minimum_interval_seconds,
+        scheduled: card.schedule.is_some(),
+    }
+}
+
+fn setting_switch_row(title: &str, description: &str, active: bool) -> gtk::Box {
+    let row = GtkBox::new(Orientation::Horizontal, 14);
+    row.set_hexpand(true);
+    row.set_overflow(gtk::Overflow::Hidden);
+    row.add_css_class("card");
+    row.add_css_class("pulsedeck-card");
+    row.add_css_class("settings-card-row");
+    let labels = GtkBox::new(Orientation::Vertical, 2);
+    labels.set_hexpand(true);
+    labels.set_size_request(1, -1);
+    let name = Label::new(Some(title));
+    name.set_halign(Align::Start);
+    name.add_css_class("settings-name");
+    labels.append(&name);
+    let desc = Label::new(Some(description));
+    desc.set_halign(Align::Start);
+    desc.set_wrap(true);
+    desc.add_css_class("settings-desc");
+    labels.append(&desc);
+    row.append(&labels);
+    let switch = gtk::Switch::new();
+    switch.set_active(active);
+    switch.set_valign(Align::Center);
+    row.append(&switch);
+    row
+}
+
+fn setting_spin_row(
+    title: &str,
+    description: &str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> (gtk::Box, gtk::SpinButton) {
+    let row = GtkBox::new(Orientation::Horizontal, 14);
+    row.set_hexpand(true);
+    row.set_overflow(gtk::Overflow::Hidden);
+    row.add_css_class("card");
+    row.add_css_class("pulsedeck-card");
+    row.add_css_class("settings-card-row");
+    let labels = GtkBox::new(Orientation::Vertical, 2);
+    labels.set_hexpand(true);
+    labels.set_size_request(1, -1);
+    let name = Label::new(Some(title));
+    name.set_halign(Align::Start);
+    name.add_css_class("settings-name");
+    labels.append(&name);
+    let desc = Label::new(Some(description));
+    desc.set_halign(Align::Start);
+    desc.set_wrap(true);
+    desc.add_css_class("settings-desc");
+    labels.append(&desc);
+    row.append(&labels);
+    let adjustment =
+        gtk::Adjustment::new(value as f64, minimum as f64, maximum as f64, 1.0, 10.0, 0.0);
+    let spin = gtk::SpinButton::new(Some(&adjustment), 1.0, 0);
+    spin.set_valign(Align::Center);
+    row.append(&spin);
+    (row, spin)
+}
+
+fn setting_status_row(title: &str, value: &str) -> gtk::Box {
+    let row = GtkBox::new(Orientation::Vertical, 4);
+    row.set_hexpand(true);
+    row.set_overflow(gtk::Overflow::Hidden);
+    row.add_css_class("card");
+    row.add_css_class("pulsedeck-card");
+    let name = Label::new(Some(title));
+    name.set_halign(Align::Start);
+    name.add_css_class("settings-name");
+    row.append(&name);
+    let value = Label::new(Some(value));
+    value.set_halign(Align::Start);
+    value.set_xalign(0.0);
+    value.set_hexpand(true);
+    value.set_size_request(1, -1);
+    value.set_max_width_chars(48);
+    value.set_wrap(true);
+    value.set_selectable(true);
+    value.add_css_class("settings-desc");
+    row.append(&value);
+    row
+}
+
+fn setting_dropdown_row(
+    title: &str,
+    description: &str,
+    values: &[&str],
+    selected: u32,
+) -> (gtk::Box, gtk::DropDown) {
+    let row = GtkBox::new(Orientation::Horizontal, 14);
+    row.set_hexpand(true);
+    row.set_overflow(gtk::Overflow::Hidden);
+    row.add_css_class("card");
+    row.add_css_class("pulsedeck-card");
+    row.add_css_class("settings-card-row");
+    let labels = GtkBox::new(Orientation::Vertical, 2);
+    labels.set_hexpand(true);
+    labels.set_size_request(1, -1);
+    let name = Label::new(Some(title));
+    name.set_halign(Align::Start);
+    name.add_css_class("settings-name");
+    labels.append(&name);
+    let desc = Label::new(Some(description));
+    desc.set_halign(Align::Start);
+    desc.set_wrap(true);
+    desc.add_css_class("settings-desc");
+    labels.append(&desc);
+    row.append(&labels);
+    let dropdown = gtk::DropDown::from_strings(values);
+    dropdown.set_selected(selected);
+    row.append(&dropdown);
+    (row, dropdown)
+}
+
+fn update_idle_clock(time: &gtk::Label, status: &gtk::Label) {
+    let now = chrono::Local::now();
+    time.set_text(&now.format("%H:%M").to_string());
+    // Discrete five-minute shifts distribute static AMOLED pixels without a
+    // continuously running animation.
+    let slot = ((now.timestamp() / 300).rem_euclid(5)) as i32;
+    let horizontal = [0, 8, -8, 4, -4][slot as usize];
+    let vertical = [0, -6, 6, 3, -3][slot as usize];
+    time.set_margin_start(horizontal.max(0) as i32);
+    time.set_margin_end((-horizontal).max(0) as i32);
+    time.set_margin_top(vertical.max(0) as i32);
+    status.set_margin_bottom((-vertical).max(0) as i32);
 }
 
 fn results_equivalent(
@@ -1300,11 +2112,7 @@ fn results_equivalent(
     curr: &MetricResult,
     display: Option<&DisplayConfig>,
 ) -> bool {
-    if prev.state != curr.state
-        || prev.subtitle != curr.subtitle
-        || prev.tooltip != curr.tooltip
-        || prev.cached != curr.cached
-    {
+    if prev.state != curr.state || prev.cached != curr.cached || prev.metadata != curr.metadata {
         return false;
     }
 
@@ -1326,17 +2134,23 @@ fn results_equivalent(
         {
             if pu == cu {
                 let diff = (cv - pv).abs();
-                return diff < threshold;
+                if diff < threshold {
+                    // Subtitle and tooltip are commonly formatted from the same
+                    // sample. Do not let their rounding bypass minimum_change.
+                    return true;
+                }
             }
         }
 
         if let (CardValue::Percentage(pp), CardValue::Percentage(pc)) = (&prev.value, &curr.value) {
             let diff = (pc - pp).abs();
-            return diff < threshold;
+            if diff < threshold {
+                return true;
+            }
         }
     }
 
-    prev.value == curr.value
+    prev.value == curr.value && prev.subtitle == curr.subtitle && prev.tooltip == curr.tooltip
 }
 
 fn apply_metric_result(card: &mut crate::ui::metric_card::MetricCard, result: &MetricResult) {
@@ -1521,14 +2335,16 @@ fn show_action_result_dialog(parent: &gtk::Box, action_id: &str, result: &Action
     dialog.show(Some(&window));
 }
 
-fn do_reload_config(config: &Rc<RefCell<ConfigManager>>) {
+fn do_reload_config(config: &Rc<RefCell<ConfigManager>>) -> bool {
     let mut cfg = config.borrow_mut();
     match cfg.load() {
         Ok(()) => {
             tracing::info!("config hot-reloaded from {:?}", cfg.path());
+            true
         }
         Err(e) => {
             tracing::warn!("config reload failed (keeping current): {}", e);
+            false
         }
     }
 }
@@ -1700,5 +2516,6 @@ fn card(
         click_action: None,
         kind: None,
         plugin: None,
+        runtime: crate::core::config::CardRuntimeConfig::default(),
     }
 }

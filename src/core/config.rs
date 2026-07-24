@@ -10,6 +10,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub ui: UiSection,
     #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
     pub pages: Vec<PageConfig>,
     #[serde(default)]
     pub cards: Vec<CardConfig>,
@@ -18,17 +20,109 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_true")]
+    pub keep_screen_on: bool,
+    #[serde(default = "default_true")]
+    pub idle_power_saving: bool,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_seconds: u64,
+    #[serde(default = "default_idle_stability")]
+    pub idle_stability_seconds: u64,
+    #[serde(default = "default_idle_brightness")]
+    pub idle_visual_brightness_percent: u8,
+    #[serde(default = "default_refresh_saving")]
+    pub refresh_saving_strength: String,
+    #[serde(default = "default_true")]
+    pub external_realtime: bool,
+    #[serde(default = "default_true")]
+    pub external_prevents_idle: bool,
+    #[serde(default = "default_power_sample_seconds")]
+    pub external_sample_seconds: u64,
+    #[serde(default = "default_power_enter_samples")]
+    pub external_enter_samples: u32,
+    #[serde(default = "default_power_exit_samples")]
+    pub external_exit_samples: u32,
+    #[serde(default = "default_true")]
+    pub codex_keep_bright: bool,
+    #[serde(default = "default_codex_protection_minutes")]
+    pub codex_protection_minutes: u64,
+    #[serde(default = "default_codex_attention_seconds")]
+    pub codex_attention_seconds: u64,
+    #[serde(default = "default_true")]
+    pub codex_completion_sound: bool,
+    #[serde(default)]
+    pub bring_to_foreground_on_attention: bool,
+    #[serde(default)]
+    pub cpu_activity_hint: bool,
+    #[serde(default = "default_idle_display")]
+    pub idle_display: String,
+}
+
+fn default_idle_timeout() -> u64 {
+    60
+}
+fn default_idle_stability() -> u64 {
+    10
+}
+fn default_idle_brightness() -> u8 {
+    15
+}
+fn default_refresh_saving() -> String {
+    "balanced".into()
+}
+fn default_power_sample_seconds() -> u64 {
+    10
+}
+fn default_power_enter_samples() -> u32 {
+    3
+}
+fn default_power_exit_samples() -> u32 {
+    2
+}
+fn default_codex_protection_minutes() -> u64 {
+    60
+}
+fn default_codex_attention_seconds() -> u64 {
+    15
+}
+fn default_idle_display() -> String {
+    "dim".into()
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            keep_screen_on: true,
+            idle_power_saving: true,
+            idle_timeout_seconds: default_idle_timeout(),
+            idle_stability_seconds: default_idle_stability(),
+            idle_visual_brightness_percent: default_idle_brightness(),
+            refresh_saving_strength: default_refresh_saving(),
+            external_realtime: true,
+            external_prevents_idle: true,
+            external_sample_seconds: default_power_sample_seconds(),
+            external_enter_samples: default_power_enter_samples(),
+            external_exit_samples: default_power_exit_samples(),
+            codex_keep_bright: true,
+            codex_protection_minutes: default_codex_protection_minutes(),
+            codex_attention_seconds: default_codex_attention_seconds(),
+            codex_completion_sound: true,
+            bring_to_foreground_on_attention: false,
+            cpu_activity_hint: false,
+            idle_display: default_idle_display(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSection {
     #[serde(default = "default_title")]
     pub title: String,
     #[serde(default = "default_true")]
-    pub pause_when_inactive: bool,
-    #[serde(default = "default_true")]
     pub reload_on_change: bool,
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    #[serde(default = "default_true")]
-    pub keep_screen_on: bool,
     #[serde(default = "default_max_output")]
     pub max_output_bytes: usize,
 }
@@ -50,10 +144,8 @@ impl Default for AppSection {
     fn default() -> Self {
         Self {
             title: default_title(),
-            pause_when_inactive: default_true(),
             reload_on_change: default_true(),
             log_level: default_log_level(),
-            keep_screen_on: default_true(),
             max_output_bytes: default_max_output(),
         }
     }
@@ -152,6 +244,44 @@ pub struct CardConfig {
     /// Generic configuration owned and decoded by the selected card plugin.
     #[serde(default)]
     pub plugin: Option<toml::Value>,
+    #[serde(default)]
+    pub runtime: CardRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardRuntimeConfig {
+    #[serde(default = "default_auto")]
+    pub class: String,
+    #[serde(default = "default_throttle")]
+    pub idle_behavior: String,
+    #[serde(default)]
+    pub idle_multiplier: Option<f64>,
+    #[serde(default)]
+    pub external_realtime: Option<bool>,
+    #[serde(default)]
+    pub realtime_multiplier: Option<f64>,
+    #[serde(default)]
+    pub minimum_interval_seconds: Option<u64>,
+}
+
+fn default_auto() -> String {
+    "auto".into()
+}
+fn default_throttle() -> String {
+    "throttle".into()
+}
+
+impl Default for CardRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            class: default_auto(),
+            idle_behavior: default_throttle(),
+            idle_multiplier: None,
+            external_realtime: None,
+            realtime_multiplier: None,
+            minimum_interval_seconds: None,
+        }
+    }
 }
 
 fn default_renderer() -> RendererKind {
@@ -439,6 +569,7 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                 click_action: None,
                 kind: None,
                 plugin: None,
+                runtime: CardRuntimeConfig::default(),
             },
         )
         .collect()

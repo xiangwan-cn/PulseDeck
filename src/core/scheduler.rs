@@ -2,6 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Instant;
 
+use crate::core::runtime::RefreshMode;
+
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
     pub next_run: Instant,
@@ -43,6 +45,58 @@ pub struct TaskRuntime {
     pub last_started: Option<Instant>,
     pub last_success: Option<Instant>,
     pub next_run: Instant,
+    pub base_interval_secs: u64,
+    pub class: TaskClass,
+    pub idle_behavior: IdleBehavior,
+    pub idle_multiplier: Option<f64>,
+    pub external_realtime: Option<bool>,
+    pub realtime_multiplier: Option<f64>,
+    pub minimum_interval_secs: Option<u64>,
+    pub scheduled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClass {
+    SystemRealtime,
+    NetworkRate,
+    NetworkStatus,
+    BatteryThermal,
+    Command,
+    Http,
+    File,
+    Static,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleBehavior {
+    Throttle,
+    Pause,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskPolicy {
+    pub class: TaskClass,
+    pub idle_behavior: IdleBehavior,
+    pub idle_multiplier: Option<f64>,
+    pub external_realtime: Option<bool>,
+    pub realtime_multiplier: Option<f64>,
+    pub minimum_interval_secs: Option<u64>,
+    pub scheduled: bool,
+}
+
+impl Default for TaskPolicy {
+    fn default() -> Self {
+        Self {
+            class: TaskClass::Other,
+            idle_behavior: IdleBehavior::Throttle,
+            idle_multiplier: None,
+            external_realtime: None,
+            realtime_multiplier: None,
+            minimum_interval_secs: None,
+            scheduled: false,
+        }
+    }
 }
 
 pub struct Scheduler {
@@ -51,6 +105,8 @@ pub struct Scheduler {
     paused_when_inactive: bool,
     window_active: bool,
     generation_seed: u64,
+    refresh_mode: RefreshMode,
+    idle_strength: f64,
 }
 
 impl Scheduler {
@@ -61,10 +117,22 @@ impl Scheduler {
             paused_when_inactive: true,
             window_active: true,
             generation_seed: 0,
+            refresh_mode: RefreshMode::Normal,
+            idle_strength: 1.0,
         }
     }
 
-    pub fn register(&mut self, card_id: &str, _interval_secs: u64, page_id: &str) {
+    pub fn register(&mut self, card_id: &str, interval_secs: u64, page_id: &str) {
+        self.register_with_policy(card_id, interval_secs, page_id, TaskPolicy::default());
+    }
+
+    pub fn register_with_policy(
+        &mut self,
+        card_id: &str,
+        interval_secs: u64,
+        page_id: &str,
+        policy: TaskPolicy,
+    ) {
         let next_run = Instant::now();
         self.generation_seed = self.generation_seed.wrapping_add(1);
         let generation = self.generation_seed;
@@ -81,6 +149,14 @@ impl Scheduler {
                 last_started: None,
                 last_success: None,
                 next_run,
+                base_interval_secs: interval_secs.max(1),
+                class: policy.class,
+                idle_behavior: policy.idle_behavior,
+                idle_multiplier: policy.idle_multiplier,
+                external_realtime: policy.external_realtime,
+                realtime_multiplier: policy.realtime_multiplier,
+                minimum_interval_secs: policy.minimum_interval_secs,
+                scheduled: policy.scheduled,
             },
         );
         self.heap.push(Reverse(ScheduledTask {
@@ -88,6 +164,49 @@ impl Scheduler {
             card_id: card_id.to_string(),
             generation,
         }));
+    }
+
+    pub fn set_refresh_mode(&mut self, mode: RefreshMode) {
+        if self.refresh_mode == mode {
+            return;
+        }
+        self.refresh_mode = mode;
+        let now = Instant::now();
+        let mode = self.refresh_mode;
+        for (card_id, runtime) in &mut self.runtimes {
+            if runtime.running || runtime.scheduled || runtime.class == TaskClass::Static {
+                continue;
+            }
+            let interval = effective_interval(mode, runtime, self.idle_strength);
+            runtime.generation += 1;
+            if let Some(interval) = interval {
+                let anchor = runtime.last_success.or(runtime.last_started).unwrap_or(now);
+                runtime.next_run = anchor + std::time::Duration::from_secs(interval);
+                if runtime.next_run < now {
+                    runtime.next_run = now;
+                }
+                self.heap.push(Reverse(ScheduledTask {
+                    next_run: runtime.next_run,
+                    card_id: card_id.clone(),
+                    generation: runtime.generation,
+                }));
+            }
+        }
+    }
+
+    pub fn set_saving_strength(&mut self, value: &str) {
+        let strength = match value {
+            "mild" => 0.65,
+            "aggressive" => 1.75,
+            _ => 1.0,
+        };
+        if (self.idle_strength - strength).abs() < f64::EPSILON {
+            return;
+        }
+        self.idle_strength = strength;
+        let current = self.refresh_mode;
+        self.refresh_mode = RefreshMode::Normal;
+        self.set_refresh_mode(current);
     }
 
     #[allow(dead_code)]
@@ -139,6 +258,7 @@ impl Scheduler {
     pub fn request_now(&mut self, card_id: &str) {
         if let Some(rt) = self.runtimes.get_mut(card_id) {
             if !rt.running {
+                rt.run_once = true;
                 rt.next_run = Instant::now();
                 rt.generation += 1;
                 self.heap.push(Reverse(ScheduledTask {
@@ -178,6 +298,11 @@ impl Scheduler {
                 runtime.generation == task.generation
                     && runtime.enabled
                     && (!runtime.paused || runtime.run_once)
+                    && (runtime.run_once
+                        || runtime.last_started.is_none()
+                        || runtime.scheduled
+                        || effective_interval(self.refresh_mode, runtime, self.idle_strength)
+                            .is_some())
             });
             if valid {
                 return Some(task.next_run);
@@ -194,10 +319,25 @@ impl Scheduler {
             return Vec::new();
         }
         let now = Instant::now();
+        let coalescing = match self.refresh_mode {
+            RefreshMode::Realtime => std::time::Duration::from_millis(200),
+            RefreshMode::Normal => std::time::Duration::from_millis(500),
+            RefreshMode::Throttled => std::time::Duration::from_secs(3),
+            RefreshMode::Suspended => std::time::Duration::from_secs(10),
+        };
+        let cutoff = now + coalescing;
         let mut ready = Vec::new();
 
         while let Some(Reverse(task)) = self.heap.peek() {
-            if task.next_run > now {
+            if task.next_run > cutoff {
+                break;
+            }
+            if task.next_run > now
+                && self
+                    .runtimes
+                    .get(&task.card_id)
+                    .is_some_and(|runtime| runtime.scheduled)
+            {
                 break;
             }
             let task = self.heap.pop().unwrap().0;
@@ -206,7 +346,14 @@ impl Scheduler {
                 if rt.generation != task.generation {
                     continue;
                 }
-                if !rt.enabled || rt.running || (rt.paused && !rt.run_once) {
+                if !rt.enabled
+                    || rt.running
+                    || (rt.paused && !rt.run_once)
+                    || (!rt.run_once
+                        && rt.last_started.is_some()
+                        && !rt.scheduled
+                        && effective_interval(self.refresh_mode, rt, self.idle_strength).is_none())
+                {
                     continue;
                 }
                 rt.run_once = false;
@@ -235,12 +382,21 @@ impl Scheduler {
             } else {
                 rt.failure_count += 1;
             }
-            let backoff = if success || rt.failure_count == 0 {
-                interval_secs
+            let policy_interval = if rt.scheduled {
+                Some(interval_secs)
             } else {
-                interval_secs
+                effective_interval(self.refresh_mode, rt, self.idle_strength)
+            };
+            let Some(policy_interval) = policy_interval else {
+                rt.generation += 1;
+                return;
+            };
+            let backoff = if success || rt.failure_count == 0 {
+                policy_interval
+            } else {
+                policy_interval
                     .saturating_mul(2u64.pow(rt.failure_count.min(6)))
-                    .min(120)
+                    .min(policy_interval.saturating_mul(64).max(120))
             };
             rt.next_run = Instant::now() + std::time::Duration::from_secs(backoff);
             rt.generation += 1;
@@ -249,6 +405,57 @@ impl Scheduler {
                 card_id: card_id.to_string(),
                 generation: rt.generation,
             }));
+        }
+    }
+}
+
+fn effective_interval(mode: RefreshMode, runtime: &TaskRuntime, idle_strength: f64) -> Option<u64> {
+    if runtime.scheduled {
+        return Some(runtime.base_interval_secs);
+    }
+    if matches!(
+        runtime.class,
+        TaskClass::Static | TaskClass::File | TaskClass::NetworkStatus
+    ) {
+        return None;
+    }
+    let base = runtime.base_interval_secs.max(1);
+    match mode {
+        RefreshMode::Normal => Some(base),
+        RefreshMode::Suspended => None,
+        RefreshMode::Throttled => {
+            if runtime.idle_behavior == IdleBehavior::Pause {
+                return None;
+            }
+            let default = match runtime.class {
+                TaskClass::SystemRealtime => 4.0,
+                TaskClass::NetworkRate => 8.0,
+                TaskClass::NetworkStatus => return None,
+                TaskClass::BatteryThermal => 2.0,
+                TaskClass::Command | TaskClass::Http => 10.0,
+                TaskClass::File => 4.0,
+                TaskClass::Static => return None,
+                TaskClass::Other => 4.0,
+            };
+            Some(
+                ((base as f64 * runtime.idle_multiplier.unwrap_or(default) * idle_strength).ceil()
+                    as u64)
+                    .max(1),
+            )
+        }
+        RefreshMode::Realtime => {
+            let allowed = runtime.external_realtime.unwrap_or(matches!(
+                runtime.class,
+                TaskClass::SystemRealtime | TaskClass::NetworkRate
+            ));
+            if !allowed {
+                return Some(base);
+            }
+            let minimum = runtime.minimum_interval_secs.unwrap_or(2).max(1);
+            Some(
+                ((base as f64 * runtime.realtime_multiplier.unwrap_or(0.5)).ceil() as u64)
+                    .max(minimum),
+            )
         }
     }
 }
@@ -292,5 +499,38 @@ mod tests {
         );
         scheduler.mark_done("card", 5, true);
         assert_eq!(scheduler.runtimes["card"].failure_count, 0);
+    }
+
+    #[test]
+    fn static_and_file_tasks_run_once_then_wait_for_events() {
+        for class in [TaskClass::Static, TaskClass::File] {
+            let mut scheduler = Scheduler::new();
+            scheduler.register_with_policy(
+                "card",
+                5,
+                "monitor",
+                TaskPolicy {
+                    class,
+                    ..TaskPolicy::default()
+                },
+            );
+            assert_eq!(scheduler.poll(), vec!["card"]);
+            scheduler.mark_started("card");
+            scheduler.mark_done("card", 5, true);
+            assert!(scheduler.next_task().is_none());
+            scheduler.request_now("card");
+            assert!(scheduler.next_task().is_some());
+        }
+    }
+
+    #[test]
+    fn background_suspends_non_scheduled_tasks() {
+        let mut scheduler = Scheduler::new();
+        scheduler.register("card", 5, "monitor");
+        scheduler.poll();
+        scheduler.mark_started("card");
+        scheduler.mark_done("card", 5, true);
+        scheduler.set_refresh_mode(RefreshMode::Suspended);
+        assert!(scheduler.next_task().is_none());
     }
 }

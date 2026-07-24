@@ -60,9 +60,31 @@ click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[ac
 `refresh_interval` 控制普通轮询间隔。设置 `schedule` 后，应用按每日固定时间生成独立
 缓存周期。失败任务会进行有上限的退避，避免持续快速重试。
 
+调度器保留这里的原始间隔，再根据统一运行模式计算实际间隔。普通模式使用原值；
+空闲模式按卡片类别降频；供电稳定时只对明确允许的低开销指标升频；后台暂停非必要
+刷新。模式变化会立即重算下一次截止时间，手动刷新始终立即执行。临近任务会在小窗口
+内合并唤醒，但不会提前执行固定时间计划。
+
+可用 `[cards.runtime]` 覆盖自动分类：
+
+```toml
+[cards.runtime]
+class = "command"              # system/network/network-status/battery/command/http/file/static
+idle_behavior = "throttle"     # throttle 或 pause
+idle_multiplier = 8.0
+external_realtime = false      # 高开销命令/HTTP 默认不要打开
+realtime_multiplier = 0.75
+minimum_interval_seconds = 5
+```
+
 `click_action` 只引用已有 `[[actions]].id`，不会在卡片中重复保存命令。是否显示
 二次确认由对应 action 的 `confirm` 控制；设置 `visible = false` 可只保留点击入口，
 不在操作页渲染重复按钮。卡片内的刷新按钮仍只刷新数据，不触发 action。
+
+`Number` 和 `Percentage` 主数值由所有相关渲染器共享同一格式化规则：整数百分比不保留
+无意义的 `.0`，温度和中文量词直接紧跟数值，`W`、`GiB` 等拉丁单位保留空格，非有限
+数值显示为 `—`。网络状态以“已连接/受限/未连接”为主值，连接名称和 IP 放在下方；
+功耗卡始终以瓦数为主值，预计剩余或充满时间放在下方，避免主值语义随充放电变化。
 
 需要确认时可使用 `confirm_title` 和 `confirm_detail` 自定义确认页内容。省略后会使用
 action 名称作为标题、action 描述作为说明，因此确认页仍会指出即将执行的操作。
@@ -96,7 +118,8 @@ first_line_only = true
 ```
 
 文件源适合 procfs、sysfs 或普通文本。路径属于运行设备的本地配置；公开示例不要写入
-个人主目录。
+个人主目录。文件卡首次读取后由目录文件监视器触发更新，不再周期唤醒；手动刷新仍然
+可用。
 
 ### 命令
 
@@ -136,6 +159,7 @@ path = "data.status"
 
 HTTP 方法支持 `GET`、`POST`、`PUT`、`DELETE` 和 `PATCH`。真实服务地址、认证请求头
 和 token 只应写入被 Git 忽略的本地配置，不要提交到公开仓库。
+HTTP、command 和 file 数据源实例会长期复用；正则解析器只编译一次。
 
 ### 静态值
 
@@ -148,6 +172,7 @@ value = "本地仪表盘"
 ```
 
 静态值适合说明、分组提示或暂不需要轮询的数据。
+它只在首次加载或配置重建时求值，不进入周期调度。
 
 ## HTTP 解析器
 
@@ -225,13 +250,30 @@ cache_ttl_seconds = 14400
 ```
 
 该机制不依赖卡片 ID、标题或脚本内容，任意定时联网或命令卡片都可直接复用。
+持久缓存前有进程内缓存；相同结果至少间隔一段时间才重写磁盘，新的计划周期或变化的
+结果仍会原子写入，避免每次成功刷新都产生写放大。
+
+## 运行与省电
+
+全局 `[runtime]` 的推荐默认值见 `config.example.toml`。应用前台且
+`keep_screen_on = true` 时同时抑制熄屏和休眠；进入空闲模式只改变应用内显示与刷新，
+不会释放常亮。应用后台立即释放抑制并暂停非必要调度。真实点击、触摸、滚动、键盘、
+拖动、页面切换、手动刷新和插件控制会重置空闲时间；自动刷新、网络请求、动画及状态
+文件变化不会。
+
+网络连接状态通过 NetworkManager D-Bus 读取并由 GIO 网络事件触发，不再为每次刷新
+启动多个 `nmcli`。CPU/内存/Swap 等相邻采集会复用短时 `/proc` 快照。配置中的
+`minimum_change` 先比较稳定的主数值，动态 subtitle/tooltip 不会绕过阈值并造成 GTK
+重复重绘。
 
 ## 可选 ScrcpyForge 页面
 
 该页面不属于通用卡片系统，默认不会编译。使用
 `cargo build --release --features scrcpy-forge` 启用，配置见
 `src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
-重新进入后自动恢复。每台设备拥有对应的预览卡和脚本卡。
+重新进入后自动恢复。空闲模式仅更新设备元数据，不下载预览 PNG；服务端支持 ETag
+时未变化图片不传输，客户端内容哈希未变化时不重建纹理。每台设备拥有对应的预览卡和
+脚本卡。
 
 ## 可选 PetCard
 

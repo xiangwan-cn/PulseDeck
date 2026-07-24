@@ -22,6 +22,7 @@ pub mod scrcpy_forge;
 pub struct PluginContext {
     pub handle: tokio::runtime::Handle,
     pub presentation: Option<CardPresentationHandle>,
+    pub runtime: crate::core::runtime::RuntimeHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

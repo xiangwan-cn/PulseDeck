@@ -1,72 +1,55 @@
-use std::process::Command;
+use std::net::{SocketAddr, UdpSocket};
 
 use crate::model::card_model::{CardValue, StatusLevel};
 use crate::model::metric_result::{MetricResult, MetricState};
 
 use super::traits::MetricContext;
 
-pub struct NetworkMetric;
+/// Persistent NetworkManager D-Bus reader. Unlike the previous implementation,
+/// one card refresh never forks three separate `nmcli` processes.
+pub struct NetworkMetric {
+    connection: Option<zbus::blocking::Connection>,
+}
 
 impl NetworkMetric {
     pub fn new() -> Self {
-        Self
+        Self {
+            connection: zbus::blocking::Connection::system().ok(),
+        }
     }
 
     pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
-        let connectivity = get_connectivity();
-        let ip_info = get_primary_ip();
-        let wifi_name = get_active_connection_name();
-
-        let (state_label, level) = match connectivity.as_deref() {
-            Some("full") => ("已连接", StatusLevel::Good),
-            Some("portal") => ("需登录", StatusLevel::Warning),
-            Some("limited") => ("受限", StatusLevel::Warning),
-            Some("none") => ("未连接", StatusLevel::Critical),
-            Some("unknown") => ("未知", StatusLevel::Unknown),
+        let (connectivity, connection_name) = self
+            .connection
+            .as_ref()
+            .and_then(network_manager_state)
+            .unwrap_or_else(fallback_state);
+        let ip = primary_ip();
+        let (state_label, level) = match connectivity {
+            4 => ("已连接", StatusLevel::Good),
+            2 => ("需登录", StatusLevel::Warning),
+            3 => ("受限", StatusLevel::Warning),
+            1 => ("未连接", StatusLevel::Critical),
             _ => ("未知", StatusLevel::Unknown),
         };
-
-        let ip_clone = ip_info.clone();
-        let wifi_clone = wifi_name.clone();
-
-        let (value, subtitle) = if level == StatusLevel::Good {
-            if !ip_info.is_empty() {
-                (
-                    CardValue::Text(ip_info.clone()),
-                    Some(format!("{} · {}", wifi_name, state_label)),
-                )
-            } else if !wifi_name.is_empty() {
-                (
-                    CardValue::Text(state_label.to_string()),
-                    Some(wifi_name.clone()),
-                )
-            } else {
-                (
-                    CardValue::Status {
-                        label: state_label.to_string(),
-                        level,
-                    },
-                    None,
-                )
-            }
-        } else {
-            (
-                CardValue::Status {
-                    label: state_label.to_string(),
-                    level,
-                },
-                None,
-            )
+        let value = CardValue::Status {
+            label: state_label.into(),
+            level,
         };
-
+        let subtitle = match (connection_name.is_empty(), ip.is_empty()) {
+            (false, false) => Some(format!("{connection_name} · {ip}")),
+            (false, true) => Some(connection_name.clone()),
+            (true, false) => Some(ip.clone()),
+            (true, true) => None,
+        };
         MetricResult {
             value,
             subtitle,
             tooltip: Some(format!(
-                "连通性: {} · 连接: {} · IP: {}",
-                connectivity.as_deref().unwrap_or("未知"),
-                wifi_clone,
-                ip_clone
+                "NetworkManager 连通性: {} · 连接: {} · IP: {}",
+                connectivity_label(connectivity),
+                connection_name,
+                ip
             )),
             state: MetricState::Normal,
             cached: false,
@@ -75,75 +58,84 @@ impl NetworkMetric {
     }
 }
 
-fn get_connectivity() -> Option<String> {
-    let output = Command::new("nmcli")
-        .args(["-t", "-f", "STATE,CONNECTIVITY", "general"])
-        .output()
+fn network_manager_state(connection: &zbus::blocking::Connection) -> Option<(u32, String)> {
+    let manager = zbus::blocking::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+    )
+    .ok()?;
+    let connectivity = manager.get_property::<u32>("Connectivity").ok()?;
+    let primary = manager
+        .get_property::<zbus::zvariant::OwnedObjectPath>("PrimaryConnection")
         .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("connectivity:") {
-            return Some(rest.trim().to_string());
-        }
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() == 2 && parts[1].trim().len() < 20 {
-            return Some(parts[1].trim().to_string());
-        }
-    }
-    Some("unknown".to_string())
+    let name = if primary.as_str() == "/" {
+        String::new()
+    } else {
+        zbus::blocking::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            primary.as_str(),
+            "org.freedesktop.NetworkManager.Connection.Active",
+        )
+        .ok()
+        .and_then(|proxy| proxy.get_property::<String>("Id").ok())
+        .unwrap_or_default()
+    };
+    Some((connectivity, name))
 }
 
-fn get_active_connection_name() -> String {
-    let output = match Command::new("nmcli")
-        .args(["-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(),
+fn fallback_state() -> (u32, String) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return (0, String::new());
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "lo" {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() == 2 {
-            let name = parts[0].trim();
-            let ctype = parts[1].trim();
-            if ctype != "loopback" && !name.is_empty() && name != "lo" {
-                return name.to_string();
-            }
+        if std::fs::read_to_string(entry.path().join("operstate"))
+            .ok()
+            .is_some_and(|state| state.trim() == "up")
+        {
+            return (4, name);
         }
     }
-    String::new()
+    (1, String::new())
 }
 
-fn get_primary_ip() -> String {
-    let output = match Command::new("nmcli")
-        .args(["-t", "-f", "IP4.ADDRESS", "device", "show"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(),
+fn primary_ip() -> String {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        return String::new();
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("IP4.ADDRESS[1]:") {
-            let ip = rest.trim();
-            if !ip.is_empty() && ip != "--" {
-                if let Some(slash_pos) = ip.find('/') {
-                    return ip[..slash_pos].to_string();
-                }
-                return ip.to_string();
-            }
-        }
+    if socket.connect("1.1.1.1:80").is_err() {
+        return String::new();
     }
+    match socket.local_addr() {
+        Ok(SocketAddr::V4(address)) => address.ip().to_string(),
+        _ => String::new(),
+    }
+}
 
-    String::new()
+fn connectivity_label(value: u32) -> &'static str {
+    match value {
+        4 => "full",
+        3 => "limited",
+        2 => "portal",
+        1 => "none",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connectivity_label;
+
+    #[test]
+    fn network_manager_connectivity_values_are_stable() {
+        assert_eq!(connectivity_label(4), "full");
+        assert_eq!(connectivity_label(2), "portal");
+        assert_eq!(connectivity_label(1), "none");
+    }
 }

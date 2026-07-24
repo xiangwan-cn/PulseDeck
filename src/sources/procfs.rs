@@ -1,13 +1,18 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 pub struct ProcFsSource {
     root: PathBuf,
+    mem_cache: Option<(Instant, MemInfo)>,
 }
 
 impl ProcFsSource {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            mem_cache: None,
+        }
     }
 
     pub fn read_stat(&mut self) -> Result<CpuStat, anyhow::Error> {
@@ -39,24 +44,39 @@ impl ProcFsSource {
         })
     }
 
-    pub fn read_meminfo(&self) -> Result<MemInfo, anyhow::Error> {
+    pub fn read_meminfo(&mut self) -> Result<MemInfo, anyhow::Error> {
+        if let Some((captured, value)) = self.mem_cache {
+            if captured.elapsed() < Duration::from_millis(750) {
+                return Ok(value);
+            }
+        }
         let meminfo = fs::read_to_string(self.root.join("meminfo"))
             .map_err(|e| anyhow::anyhow!("read /proc/meminfo: {}", e))?;
         let mut total_kb: u64 = 0;
         let mut available_kb: u64 = 0;
+        let mut swap_total_kb: u64 = 0;
+        let mut swap_free_kb: u64 = 0;
 
         for line in meminfo.lines() {
             if let Some(rest) = line.strip_prefix("MemTotal:") {
                 total_kb = parse_kb_value(rest);
             } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
                 available_kb = parse_kb_value(rest);
+            } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+                swap_total_kb = parse_kb_value(rest);
+            } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+                swap_free_kb = parse_kb_value(rest);
             }
         }
 
-        Ok(MemInfo {
+        let value = MemInfo {
             total_kb,
             available_kb,
-        })
+            swap_total_kb,
+            swap_free_kb,
+        };
+        self.mem_cache = Some((Instant::now(), value));
+        Ok(value)
     }
 
     pub fn read_uptime(&self) -> Result<f64, anyhow::Error> {
@@ -111,6 +131,8 @@ impl CpuStat {
 pub struct MemInfo {
     pub total_kb: u64,
     pub available_kb: u64,
+    pub swap_total_kb: u64,
+    pub swap_free_kb: u64,
 }
 
 #[cfg(test)]
@@ -151,7 +173,7 @@ mod tests {
         )
         .ok();
 
-        let src = ProcFsSource::new(dir);
+        let mut src = ProcFsSource::new(dir);
         let mem = src.read_meminfo().unwrap();
         assert_eq!(mem.total_kb, 8192000);
         assert_eq!(mem.available_kb, 4500000);

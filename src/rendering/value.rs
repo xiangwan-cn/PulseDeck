@@ -21,11 +21,8 @@ pub fn apply_value(widgets: &ValueWidgets, model: &CardModel) {
             value,
             unit,
             decimals,
-        } => {
-            let u = unit.as_deref().unwrap_or("");
-            format!("{:.*} {}", *decimals as usize, value, u)
-        }
-        CardValue::Percentage(p) => format!("{:.1}%", p),
+        } => crate::rendering::format::number(*value, unit.as_deref(), *decimals),
+        CardValue::Percentage(p) => crate::rendering::format::percentage(*p),
         CardValue::Text(t) => t.clone(),
         _ => String::new(),
     };

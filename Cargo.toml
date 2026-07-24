@@ -12,6 +12,7 @@ default = []
 # Optional built-in page for the independently distributed ScrcpyForge service.
 scrcpy-forge = ["dep:bytes"]
 pet-card = []
+power-debug = []
 
 [[bin]]
 name = "pulsedeck"

@@ -11,6 +11,7 @@ pub struct HttpMetric {
     body: Option<String>,
     timeout_secs: u64,
     parser: Option<ParserConfig>,
+    compiled_regex: Option<Result<regex::Regex, String>>,
     max_output_bytes: usize,
 }
 
@@ -24,6 +25,11 @@ impl HttpMetric {
         parser: Option<ParserConfig>,
         max_output_bytes: usize,
     ) -> Self {
+        let compiled_regex = parser
+            .as_ref()
+            .filter(|parser| parser.parser_type == "regex")
+            .and_then(|parser| parser.pattern.as_ref())
+            .map(|pattern| regex::Regex::new(pattern).map_err(|error| error.to_string()));
         Self {
             url,
             method: method.unwrap_or_else(|| "GET".to_string()),
@@ -31,6 +37,7 @@ impl HttpMetric {
             timeout_secs,
             body,
             parser,
+            compiled_regex,
             max_output_bytes,
         }
     }
@@ -49,7 +56,7 @@ impl HttpMetric {
         match result {
             Ok(body) => {
                 if let Some(ref parser) = self.parser {
-                    parse_response(&body, parser)
+                    parse_response(&body, parser, self.compiled_regex.as_ref())
                 } else {
                     MetricResult {
                         value: CardValue::Text(body.trim().to_string()),
@@ -82,6 +89,7 @@ async fn http_fetch(
     timeout_secs: u64,
     max_output_bytes: usize,
 ) -> Result<String, String> {
+    crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
     let mut req = match method.to_uppercase().as_str() {
         "GET" => client.get(url),
         "POST" => client.post(url),
@@ -126,7 +134,11 @@ async fn http_fetch(
     String::from_utf8(bytes.to_vec()).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
 }
 
-fn parse_response(body: &str, parser: &ParserConfig) -> MetricResult {
+fn parse_response(
+    body: &str,
+    parser: &ParserConfig,
+    compiled_regex: Option<&Result<regex::Regex, String>>,
+) -> MetricResult {
     match parser.parser_type.as_str() {
         "json_path" => {
             let value: serde_json::Value = match serde_json::from_str(body) {
@@ -192,17 +204,34 @@ fn parse_response(body: &str, parser: &ParserConfig) -> MetricResult {
                 }
             };
 
-            let re = match regex::Regex::new(pattern) {
-                Ok(r) => r,
-                Err(e) => {
+            let fallback;
+            let re = match compiled_regex {
+                Some(Ok(regex)) => regex,
+                Some(Err(error)) => {
                     return MetricResult {
                         value: CardValue::Text("解析错误".into()),
                         subtitle: None,
-                        tooltip: Some(format!("正则表达式错误: {}", e)),
+                        tooltip: Some(format!("正则表达式错误: {}", error)),
                         state: MetricState::Error,
                         cached: false,
                         metadata: None,
                     }
+                }
+                None => {
+                    fallback = match regex::Regex::new(pattern) {
+                        Ok(regex) => regex,
+                        Err(error) => {
+                            return MetricResult {
+                                value: CardValue::Text("解析错误".into()),
+                                subtitle: None,
+                                tooltip: Some(format!("正则表达式错误: {}", error)),
+                                state: MetricState::Error,
+                                cached: false,
+                                metadata: None,
+                            }
+                        }
+                    };
+                    &fallback
                 }
             };
 

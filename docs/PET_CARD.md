@@ -21,10 +21,11 @@ configuration and update `asset_root`. If no matching image exists, the card
 uses an emoji fallback, so the event path can be tested before artwork is
 installed.
 
-Set `completion_sound = true` in `[cards.plugin]` to play the desktop theme's
-single `complete` event when the state first changes to `done`. It is disabled by
-default. Every later transition from an active state to `done` plays once;
-repeated reads of the same `done` event do not replay it.
+Set `codex_completion_sound = true` in the global `[runtime]` section to play
+the desktop theme's single `complete` event for a completion, failure,
+cancellation, waiting-input, confirmation-required, or abnormal-stop edge.
+Task and event identifiers deduplicate notifications, so polling or rereading
+the same state cannot replay the sound. The default example enables it.
 
 Set `completion_sound_file` to an audio file path to replace the theme event
 with a custom sound. Playback uses `canberra-gtk-play` without a shell and is
@@ -35,9 +36,10 @@ the GTK bell.
 ## Codex integration
 
 The installable Codex plugin is under `integrations/pulsedeck-pet`. Its Bash
-hook writes only a fixed state, protocol version and timestamp. It deliberately
-drains the event JSON on stdin directly to `/dev/null`, so prompt text, commands,
-tool arguments, tool output and session ids are neither parsed nor persisted.
+hook writes only a fixed state, protocol version and timestamp. A Bash built-in
+read loop drains the event JSON from stdin without parsing it, so prompt text,
+commands, tool arguments, tool output and session ids are neither retained nor
+passed through an extra helper process.
 Draining prevents Codex from seeing a broken pipe after the short-lived hook
 publishes its state.
 
@@ -69,8 +71,11 @@ Set `PULSEDECK_PET_STATE_FILE` for the hook and `state_file` in
 - State updates use an atomic file replacement and a directory file monitor.
 - The current state's frames are decoded on state transitions and retained in
   memory during that state, so animation does not read from disk per frame.
-- Animation is capped to 30 FPS and defaults to 12 FPS.
-- Frame advancement pauses while the card is not mapped.
+- Animation is capped to 12 FPS and defaults to 12 FPS.
+- Frame timers are removed, rather than callback-skipped, while the card is
+  unmapped or PulseDeck is in the background.
+- Foreground idle mode reduces animation to 1 FPS; normal and Codex protection
+  modes use the configured rate.
 - Offline and any single-frame state have no animation timer.
 - Stale state automatically returns to offline after
   `offline_after_seconds`.
@@ -79,8 +84,8 @@ Set `PULSEDECK_PET_STATE_FILE` for the hook and `state_file` in
 - Size preference writes happen only when the user makes a selection and use
   `${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/pet-card-presentation`.
 
-Supported states are `offline`, `ready`, `thinking`, `working`, `coding`,
-`waiting`, `error`, and `done`.
+Supported states include `offline`, `ready`, `thinking`, `working`, `coding`,
+`waiting`, `confirm`, `error`, `cancelled`, `aborted`, and `done`.
 
 ## Card size
 
@@ -113,10 +118,13 @@ Important plugin options are:
 | `offline_normal_after_seconds` | `300` | Continuous offline time before temporary one-cell fallback. |
 | `fps` | `12` | Default animation rate; per-state `fps` overrides it. |
 | `done_hold_seconds` | `5` | Time the `done` animation remains before `ready`. |
-| `pause_when_unmapped` | `true` | Pause frame advancement while not visible. |
+| `pause_when_unmapped` | `true` | Remove the frame timer while not visible. |
 | `show_status` | `true` | Show the state label below the image. |
-| `completion_sound` | `false` | Play one sound per completion transition. |
 | `completion_sound_file` | unset | Custom audio file; otherwise use the theme's `complete` event. |
+
+Sound enable/disable, the new-task brightness-protection period, and the
+post-event attention period belong to `[runtime]`, because they affect the
+whole application. PetCard only owns its optional custom audio asset.
 
 Each `[cards.plugin.animations.<state>]` table accepts `frames`, optional `fps`,
 and `loop`. Frame paths are resolved under `asset_root`. A single-frame offline
@@ -130,3 +138,6 @@ dependencies and UI implementation. Disabled Cargo features do not compile or
 register their plugin modules.
 
 ScrcpyForge and other page plugins use the generic `[pages.plugin]` table.
+Both plugin types receive the same generic runtime handle for mode changes,
+real user activity, bounded interaction leases, and important events; plugins
+do not inspect system power or control global brightness themselves.
