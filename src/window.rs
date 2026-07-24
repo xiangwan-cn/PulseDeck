@@ -45,6 +45,8 @@ const APP_CSS: &str = r#"
 .metric-value-warning  { color: #e5a50a; }
 .metric-value-critical { color: #e01b24; }
 .metric-value-good     { color: #1a5fb4; }
+.metric-card.click-action-card { transition: background-color 120ms ease; }
+.metric-card.click-action-card:hover { background-color: alpha(@accent_bg_color, 0.12); }
 .metric-footer { font-size: 9px; opacity: 0.7; margin-top: 1px; }
 .content-medium .metric-footer, .content-medium .metric-header-sub { font-size: 8px; }
 .content-dense .metric-footer, .content-dense .metric-header-sub { font-size: 7px; }
@@ -86,6 +88,7 @@ struct MetricUpdate {
 
 struct ActionUpdate {
     action_id: String,
+    result_card_id: Option<String>,
     result: ActionResult,
 }
 
@@ -415,8 +418,10 @@ impl MonitorWindow {
             all_cards.iter().filter(|c| c.page == page_id).collect();
         page_cards.sort_by_key(|c| c.order);
 
-        let mut page_actions: Vec<&crate::core::config::ActionConfig> =
-            all_actions.iter().filter(|a| a.page == page_id).collect();
+        let mut page_actions: Vec<&crate::core::config::ActionConfig> = all_actions
+            .iter()
+            .filter(|action| action.page == page_id && action.visible)
+            .collect();
         page_actions.sort_by_key(|_| 0);
 
         for card_cfg in &page_cards {
@@ -475,6 +480,64 @@ impl MonitorWindow {
                     scheduler.borrow_mut().request_now(&card_id);
                     let _ = wake.try_send(());
                 });
+
+                if let Some(action_id) = card_cfg.click_action.as_deref() {
+                    if let Some(action_cfg) =
+                        all_actions.iter().find(|action| action.id == action_id)
+                    {
+                        metric_card.card.add_css_class("click-action-card");
+                        metric_card.card.set_cursor_from_name(Some("pointer"));
+                        let click = gtk::GestureClick::new();
+                        click.set_button(gtk::gdk::BUTTON_PRIMARY);
+                        let action_cfg = action_cfg.clone();
+                        let action_tx = self.action_tx.clone();
+                        let handle = self.handle.clone();
+                        let result_card_id = card_cfg.id.clone();
+                        let (confirm_title, confirm_detail) = action_confirmation_text(&action_cfg);
+                        let global_max_output = self.config.borrow().config().app.max_output_bytes;
+                        click.connect_released(move |gesture, presses, x, y| {
+                            if presses != 1 {
+                                return;
+                            }
+                            let Some(widget) = gesture.widget() else {
+                                return;
+                            };
+                            if widget
+                                .pick(x, y, gtk::PickFlags::DEFAULT)
+                                .is_some_and(|target| widget_or_ancestor_is_button(target, &widget))
+                            {
+                                return;
+                            }
+                            let run = {
+                                let action_cfg = action_cfg.clone();
+                                let action_tx = action_tx.clone();
+                                let handle = handle.clone();
+                                let result_card_id = result_card_id.clone();
+                                move || {
+                                    execute_action_async(
+                                        action_cfg,
+                                        action_tx,
+                                        handle,
+                                        global_max_output,
+                                        Some(result_card_id),
+                                    );
+                                }
+                            };
+                            if action_cfg.confirm {
+                                confirm_action(&widget, &confirm_title, &confirm_detail, run);
+                            } else {
+                                run();
+                            }
+                        });
+                        metric_card.card.add_controller(click);
+                    } else {
+                        tracing::warn!(
+                            card = %card_cfg.id,
+                            action = %action_id,
+                            "card click action not found"
+                        );
+                    }
+                }
             }
 
             self.card_metas.borrow_mut().insert(
@@ -497,6 +560,7 @@ impl MonitorWindow {
             let action_tx = self.action_tx.clone();
             let handle = self.handle.clone();
             let global_max_output = self.config.borrow().config().app.max_output_bytes;
+            let (confirm_title, confirm_detail) = action_confirmation_text(action_cfg);
 
             page.add_action_card(
                 &action_id,
@@ -504,11 +568,13 @@ impl MonitorWindow {
                 action_cfg.description.as_deref().unwrap_or(""),
                 icon,
                 action_cfg.confirm,
+                &confirm_title,
+                &confirm_detail,
                 move |_id| {
                     let cfg = action_cfg_clone.clone();
                     let tx = action_tx.clone();
                     let h = handle.clone();
-                    execute_action_async(cfg, tx, h, global_max_output);
+                    execute_action_async(cfg, tx, h, global_max_output, None);
                 },
             );
         }
@@ -1057,6 +1123,19 @@ impl MonitorWindow {
                     updates.push(update);
                 }
                 for update in updates {
+                    if let Some(card_id) = update.result_card_id.as_deref() {
+                        for page in pages.borrow_mut().values_mut() {
+                            if let Some(card) = page.get_metric_card(card_id) {
+                                show_action_result_dialog(
+                                    &card.card,
+                                    &update.action_id,
+                                    &update.result,
+                                );
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     for (_page_id, page) in pages.borrow_mut().iter_mut() {
                         if let Some(card) = page.get_action_card(&update.action_id) {
                             card.set_running(false);
@@ -1291,6 +1370,7 @@ fn execute_action_async(
     tx: async_channel::Sender<ActionUpdate>,
     handle: tokio::runtime::Handle,
     global_max_output: usize,
+    result_card_id: Option<String>,
 ) {
     let action_id = action_cfg.id.clone();
     let command_parts = action_cfg.command.clone().unwrap_or_default();
@@ -1309,7 +1389,11 @@ fn execute_action_async(
             exit_code: -1,
             message: "未配置命令".to_string(),
         };
-        let _ = tx.try_send(ActionUpdate { action_id, result });
+        let _ = tx.try_send(ActionUpdate {
+            action_id,
+            result_card_id,
+            result,
+        });
         return;
     }
 
@@ -1341,8 +1425,62 @@ fn execute_action_async(
             },
         };
 
-        let _ = tx.try_send(ActionUpdate { action_id, result });
+        let _ = tx.try_send(ActionUpdate {
+            action_id,
+            result_card_id,
+            result,
+        });
     });
+}
+
+fn action_confirmation_text(action: &crate::core::config::ActionConfig) -> (String, String) {
+    let title = action
+        .confirm_title
+        .clone()
+        .unwrap_or_else(|| format!("确认执行「{}」？", action.name));
+    let detail = action
+        .confirm_detail
+        .clone()
+        .or_else(|| action.description.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "该操作已配置为需要确认。".to_string());
+    (title, detail)
+}
+
+fn confirm_action(parent: &gtk::Widget, title: &str, detail: &str, run: impl FnOnce() + 'static) {
+    let Some(window) = parent
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok())
+    else {
+        return;
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .message(title)
+        .detail(detail)
+        .buttons(["取消", "执行"])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+    glib::MainContext::default().spawn_local(async move {
+        if dialog.choose_future(Some(&window)).await == Ok(1) {
+            run();
+        }
+    });
+}
+
+fn widget_or_ancestor_is_button(mut widget: gtk::Widget, boundary: &gtk::Widget) -> bool {
+    loop {
+        if widget.is::<gtk::Button>() {
+            return true;
+        }
+        if widget == *boundary {
+            return false;
+        }
+        let Some(parent) = widget.parent() else {
+            return false;
+        };
+        widget = parent;
+    }
 }
 
 fn show_action_result_dialog(parent: &gtk::Box, action_id: &str, result: &ActionResult) {
@@ -1559,6 +1697,7 @@ fn card(
         display: None,
         cache_ttl_seconds: None,
         schedule: None,
+        click_action: None,
         kind: None,
         plugin: None,
     }

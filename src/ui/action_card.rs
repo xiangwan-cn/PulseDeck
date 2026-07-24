@@ -15,6 +15,8 @@ impl ActionCard {
         description: &str,
         icon_name: &str,
         confirm: bool,
+        confirm_title: &str,
+        confirm_detail: &str,
         on_click: impl Fn(&str) + 'static,
     ) -> Self {
         let card = GtkBox::new(Orientation::Vertical, 0);
@@ -69,6 +71,8 @@ impl ActionCard {
 
         let aid = action_id.to_string();
         let on_click: Rc<dyn Fn(&str)> = Rc::new(on_click);
+        let confirm_title = confirm_title.to_string();
+        let confirm_detail = confirm_detail.to_string();
         let btn = Button::with_label("执行");
         btn.set_valign(Align::Center);
         btn.add_css_class("pill");
@@ -86,8 +90,8 @@ impl ActionCard {
                 return;
             };
             let dialog = gtk::AlertDialog::builder()
-                .message("确认执行此操作？")
-                .detail("该操作已配置为需要确认")
+                .message(&confirm_title)
+                .detail(&confirm_detail)
                 .buttons(["取消", "执行"])
                 .cancel_button(0)
                 .default_button(1)

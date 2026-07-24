@@ -394,9 +394,20 @@ impl Page {
         description: &str,
         icon_name: &str,
         confirm: bool,
+        confirm_title: &str,
+        confirm_detail: &str,
         on_click: impl Fn(&str) + 'static,
     ) {
-        let card = ActionCard::new(action_id, name, description, icon_name, confirm, on_click);
+        let card = ActionCard::new(
+            action_id,
+            name,
+            description,
+            icon_name,
+            confirm,
+            confirm_title,
+            confirm_detail,
+            on_click,
+        );
         if self.compact_grid {
             card.card.add_css_class("compact-card");
         }

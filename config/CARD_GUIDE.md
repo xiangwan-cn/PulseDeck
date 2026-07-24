@@ -53,11 +53,19 @@ enabled = true
 icon = "computer-symbolic"    # 可选，Freedesktop 图标名
 description = "说明"           # 可选
 cache_ttl_seconds = 300        # 可选
+click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[actions]]
 # schedule = "daily@08:00,20:00"
 ```
 
 `refresh_interval` 控制普通轮询间隔。设置 `schedule` 后，应用按每日固定时间生成独立
 缓存周期。失败任务会进行有上限的退避，避免持续快速重试。
+
+`click_action` 只引用已有 `[[actions]].id`，不会在卡片中重复保存命令。是否显示
+二次确认由对应 action 的 `confirm` 控制；设置 `visible = false` 可只保留点击入口，
+不在操作页渲染重复按钮。卡片内的刷新按钮仍只刷新数据，不触发 action。
+
+需要确认时可使用 `confirm_title` 和 `confirm_detail` 自定义确认页内容。省略后会使用
+action 名称作为标题、action 描述作为说明，因此确认页仍会指出即将执行的操作。
 
 ## 数据源示例
 

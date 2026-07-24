@@ -143,6 +143,9 @@ pub struct CardConfig {
     pub cache_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Optional action id executed when this standard card is clicked.
+    #[serde(default)]
+    pub click_action: Option<String>,
     /// Optional custom card implementation. Standard metric cards omit this.
     #[serde(default)]
     pub kind: Option<String>,
@@ -250,12 +253,21 @@ pub struct ActionConfig {
     #[serde(default)]
     pub icon: Option<String>,
     pub page: String,
+    /// Whether to render this action on its configured page.
+    #[serde(default = "default_true")]
+    pub visible: bool,
     #[serde(default)]
     pub command: Option<Vec<String>>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default)]
     pub confirm: bool,
+    /// Optional confirmation dialog heading.
+    #[serde(default)]
+    pub confirm_title: Option<String>,
+    /// Optional confirmation dialog explanation.
+    #[serde(default)]
+    pub confirm_detail: Option<String>,
     #[serde(default)]
     pub max_output_bytes: Option<usize>,
 }
@@ -424,6 +436,7 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                 display: None,
                 cache_ttl_seconds: None,
                 schedule: None,
+                click_action: None,
                 kind: None,
                 plugin: None,
             },
@@ -524,6 +537,30 @@ mod tests {
         let options = page.plugin.as_ref().unwrap();
         assert_eq!(page.kind.as_deref(), Some("example"));
         assert_eq!(options["value"].as_integer(), Some(7));
+    }
+
+    #[test]
+    fn cards_can_reference_hidden_click_actions() {
+        let config: AppConfig = toml::from_str(
+            "[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle-service'\n\
+             [[actions]]\nid='toggle-service'\nname='Toggle'\npage='actions'\nvisible=false\nconfirm=true\n\
+             confirm_title='Confirm toggle?'\nconfirm_detail='Changes the service state.'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.cards[0].click_action.as_deref(),
+            Some("toggle-service")
+        );
+        assert!(!config.actions[0].visible);
+        assert!(config.actions[0].confirm);
+        assert_eq!(
+            config.actions[0].confirm_title.as_deref(),
+            Some("Confirm toggle?")
+        );
+        assert_eq!(
+            config.actions[0].confirm_detail.as_deref(),
+            Some("Changes the service state.")
+        );
     }
 
     #[test]
