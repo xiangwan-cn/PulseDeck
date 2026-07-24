@@ -156,8 +156,21 @@ impl Runtime {
             menu_popover.popup();
         });
         this.root.add_controller(gesture);
+
+        let double_click = gtk::GestureClick::new();
+        double_click.set_button(gdk::BUTTON_PRIMARY);
+        let weak = Rc::downgrade(this);
+        double_click.connect_released(move |_, presses, _, _| {
+            if presses == 2 {
+                if let Some(runtime) = weak.upgrade() {
+                    let next = next_presentation(runtime.current_presentation.get());
+                    runtime.select_presentation(next);
+                }
+            }
+        });
+        this.root.add_controller(double_click);
         this.root
-            .set_tooltip_text(Some("长按可切换普通、四格、六格或全屏显示"));
+            .set_tooltip_text(Some("双击依次切换大小；长按可直接选择显示方式"));
     }
 
     fn watch_state_file(this: &Rc<Self>) -> Result<(), AppError> {
@@ -436,6 +449,15 @@ fn presentation_name(presentation: CardPresentation) -> &'static str {
     }
 }
 
+fn next_presentation(presentation: CardPresentation) -> CardPresentation {
+    match presentation {
+        CardPresentation::Normal => CardPresentation::Quad,
+        CardPresentation::Quad => CardPresentation::Expanded,
+        CardPresentation::Expanded => CardPresentation::Fullscreen,
+        CardPresentation::Fullscreen => CardPresentation::Normal,
+    }
+}
+
 fn parse_presentation(value: &str) -> CardPresentation {
     match value.trim() {
         "quad" => CardPresentation::Quad,
@@ -518,7 +540,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        completion_sound_argv, parse_presentation, presentation_name, should_play_completion_sound,
+        completion_sound_argv, next_presentation, parse_presentation, presentation_name,
+        should_play_completion_sound,
     };
     use crate::plugins::CardPresentation;
 
@@ -534,6 +557,20 @@ mod tests {
                 parse_presentation(presentation_name(presentation)),
                 presentation
             );
+        }
+    }
+
+    #[test]
+    fn double_click_cycle_visits_every_presentation() {
+        let mut presentation = CardPresentation::Normal;
+        for expected in [
+            CardPresentation::Quad,
+            CardPresentation::Expanded,
+            CardPresentation::Fullscreen,
+            CardPresentation::Normal,
+        ] {
+            presentation = next_presentation(presentation);
+            assert_eq!(presentation, expected);
         }
     }
 

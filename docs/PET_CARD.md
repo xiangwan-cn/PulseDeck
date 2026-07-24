@@ -82,7 +82,8 @@ Supported states are `offline`, `ready`, `thinking`, `working`, `coding`,
 
 ## Card size
 
-Long-press PetCard to choose one of four runtime presentation modes:
+Double-click PetCard to cycle quickly through the four runtime presentation
+modes. Long-press it to choose a specific mode directly:
 
 - **Normal** keeps the card in its original FlowBox slot.
 - **Four cells** occupies the left two columns by two rows.
