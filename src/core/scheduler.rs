@@ -122,7 +122,8 @@ impl Scheduler {
         }
     }
 
-    pub fn register(&mut self, card_id: &str, interval_secs: u64, page_id: &str) {
+    #[cfg(test)]
+    fn register(&mut self, card_id: &str, interval_secs: u64, page_id: &str) {
         self.register_with_policy(card_id, interval_secs, page_id, TaskPolicy::default());
     }
 
@@ -216,17 +217,14 @@ impl Scheduler {
         self.set_refresh_mode(current);
     }
 
-    #[allow(dead_code)]
     pub fn unregister(&mut self, card_id: &str) {
         self.runtimes.remove(card_id);
     }
 
-    #[allow(dead_code)]
     pub fn set_window_active(&mut self, active: bool) {
         self.window_active = active;
     }
 
-    #[allow(dead_code)]
     pub fn set_page_paused(&mut self, page_id: &str, paused: bool) {
         let now = Instant::now();
         for (card_id, runtime) in self
@@ -261,8 +259,7 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn request_now(&mut self, card_id: &str) {
+    pub fn request_now(&mut self, card_id: &str) -> bool {
         if let Some(rt) = self.runtimes.get_mut(card_id) {
             if !rt.running {
                 rt.run_once = true;
@@ -273,8 +270,10 @@ impl Scheduler {
                     card_id: card_id.to_string(),
                     generation: rt.generation,
                 }));
+                return true;
             }
         }
+        false
     }
 
     pub fn request_all_now(&mut self) {
@@ -294,7 +293,6 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)]
     pub fn next_task(&mut self) -> Option<Instant> {
         if !self.window_active && self.paused_when_inactive {
             return None;
@@ -318,7 +316,6 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)]
     pub fn poll(&mut self) -> Vec<String> {
         // Keep due entries in the heap while the window is inactive. Popping them
         // here would silently lose the task and it would never run after resume.
@@ -371,7 +368,6 @@ impl Scheduler {
         ready
     }
 
-    #[allow(dead_code)]
     pub fn mark_started(&mut self, card_id: &str) {
         if let Some(rt) = self.runtimes.get_mut(card_id) {
             rt.running = true;
@@ -379,7 +375,6 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)]
     pub fn mark_done(&mut self, card_id: &str, interval_secs: u64, success: bool) {
         self.mark_done_after(card_id, interval_secs, success, None);
     }

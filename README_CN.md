@@ -138,10 +138,10 @@ timeout_seconds = 5
 
 ## 项目结构
 
-- `src/core`：配置、运行/供电状态、调度、缓存和注册表。
+- `src/core`：配置、运行/供电状态、调度、缓存和错误策略。
 - `src/metrics`、`src/sources`、`src/parsers`：数据采集与转换。
 - `src/rendering`、`src/ui`：可复用卡片展示。
-- `src/actions`：有执行边界的用户操作。
+- `src/execution`：为用户操作和数据源提供有边界的子进程执行。
 - `src/plugins`：可选外部集成。
 - `docs/PET_CARD.md`：可选 Codex PetCard 的构建、hook 与资源配置。
 - `docs/RUNTIME_POWER.md`：统一运行模式、省电策略和验证方法。

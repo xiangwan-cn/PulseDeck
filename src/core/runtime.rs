@@ -102,7 +102,6 @@ impl Default for RuntimeSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserActivity {
-    Touch,
     Click,
     Scroll,
     Keyboard,
@@ -110,10 +109,11 @@ pub enum UserActivity {
     PageSwitch,
     ManualRefresh,
     Dialog,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     PluginControl,
-    RemoteControl,
 }
 
+#[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportantEventKind {
     Completed,
@@ -122,8 +122,6 @@ pub enum ImportantEventKind {
     WaitingInput,
     ConfirmationRequired,
     Aborted,
-    DeviceDisconnected,
-    Alert,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +143,7 @@ pub struct RuntimeManager {
     interactions: RefCell<HashMap<u64, Instant>>,
     next_interaction: Cell<u64>,
     codex: RefCell<Option<CodexRuntime>>,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     seen_events: RefCell<HashMap<String, String>>,
     power: Cell<PowerVerdict>,
     thermal: Cell<ThermalVerdict>,
@@ -250,6 +249,7 @@ impl RuntimeManager {
         self.recompute();
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn codex_started(&self, task_id: impl Into<String>) {
         let task_id = task_id.into();
         let mut codex = self.codex.borrow_mut();
@@ -274,6 +274,7 @@ impl RuntimeManager {
         self.recompute();
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn codex_finished(
         &self,
         task_id: impl Into<String>,
@@ -317,6 +318,7 @@ impl RuntimeManager {
         true
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn clear_codex(&self) {
         self.codex.borrow_mut().take();
         self.recompute();
@@ -424,17 +426,26 @@ impl RuntimeManager {
         } else {
             RefreshMode::Normal
         };
-        let animation_policy = match mode {
-            RuntimeMode::Background => AnimationPolicy::Stopped,
-            RuntimeMode::ForegroundIdle => AnimationPolicy::Reduced(1),
-            _ => AnimationPolicy::Normal,
+        let animation_policy = if !foreground {
+            AnimationPolicy::Stopped
+        } else if matches!(thermal, ThermalVerdict::Hot | ThermalVerdict::Throttled) {
+            AnimationPolicy::Frozen
+        } else if mode == RuntimeMode::ForegroundIdle {
+            AnimationPolicy::Reduced(1)
+        } else {
+            AnimationPolicy::Normal
         };
-        let preview_policy = match mode {
-            RuntimeMode::Background => PreviewPolicy::Stopped,
-            RuntimeMode::ForegroundIdle => PreviewPolicy::MetadataOnly,
-            RuntimeMode::ExternalPowerRealtime | RuntimeMode::ForegroundNormal => {
-                PreviewPolicy::Normal
-            }
+        let preview_policy = if !foreground {
+            PreviewPolicy::Stopped
+        } else if mode == RuntimeMode::ForegroundIdle {
+            PreviewPolicy::MetadataOnly
+        } else if matches!(
+            thermal,
+            ThermalVerdict::Warm | ThermalVerdict::Hot | ThermalVerdict::Throttled
+        ) {
+            PreviewPolicy::Reduced
+        } else {
+            PreviewPolicy::Normal
         };
         let next = RuntimeSnapshot {
             mode,
@@ -555,10 +566,12 @@ impl RuntimeHandle {
         }
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn report_codex_started(&self, task_id: impl Into<String>) {
         self.manager.codex_started(task_id);
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn report_codex_event(
         &self,
         task_id: impl Into<String>,
@@ -568,6 +581,7 @@ impl RuntimeHandle {
         self.manager.codex_finished(task_id, event_id, kind)
     }
 
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub fn clear_codex(&self) {
         self.manager.clear_codex();
     }
@@ -690,11 +704,11 @@ mod tests {
         });
         manager.recompute();
         assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundIdle);
-        manager.report_activity(UserActivity::Touch);
+        manager.report_activity(UserActivity::Click);
         // With a zero timeout this becomes eligible again immediately; use a
         // real threshold to verify the recovery edge.
         manager.update_config(RuntimeConfig::default());
-        manager.report_activity(UserActivity::Touch);
+        manager.report_activity(UserActivity::Click);
         assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundNormal);
     }
 
@@ -743,6 +757,37 @@ mod tests {
         manager.recompute();
         assert_eq!(manager.snapshot().mode, RuntimeMode::ExternalPowerRealtime);
         assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Realtime);
+        assert_eq!(manager.snapshot().animation_policy, AnimationPolicy::Frozen);
+        assert_eq!(manager.snapshot().preview_policy, PreviewPolicy::Reduced);
+    }
+
+    #[test]
+    fn warm_thermal_state_reduces_preview_without_freezing_animation() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig::default());
+        manager.set_power(PowerVerdict::Battery, ThermalVerdict::Warm);
+
+        assert_eq!(manager.snapshot().animation_policy, AnimationPolicy::Normal);
+        assert_eq!(manager.snapshot().preview_policy, PreviewPolicy::Reduced);
+    }
+
+    #[test]
+    fn idle_preview_remains_metadata_only_under_thermal_pressure() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            ..RuntimeConfig::default()
+        });
+        manager.set_power(PowerVerdict::Battery, ThermalVerdict::Hot);
+        manager.recompute();
+
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundIdle);
+        assert_eq!(
+            manager.snapshot().preview_policy,
+            PreviewPolicy::MetadataOnly
+        );
+        assert_eq!(manager.snapshot().animation_policy, AnimationPolicy::Frozen);
     }
 
     #[test]

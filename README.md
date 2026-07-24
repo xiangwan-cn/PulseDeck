@@ -154,10 +154,10 @@ setting controls completion sound. See
 
 ## Project layout
 
-- `src/core`: configuration, runtime/power state, scheduling, caching, and registries.
+- `src/core`: configuration, runtime/power state, scheduling, caching, and error policy.
 - `src/metrics`, `src/sources`, `src/parsers`: data collection and conversion.
 - `src/rendering`, `src/ui`: reusable card presentation.
-- `src/actions`: bounded user-triggered actions.
+- `src/execution`: bounded subprocess execution for user-triggered actions and sources.
 - `src/plugins`: optional external integrations.
 - `docs/PET_CARD.md`: optional Codex PetCard build, hook, and asset configuration.
 - `docs/RUNTIME_POWER.md`: runtime modes, low-power policies, and validation.

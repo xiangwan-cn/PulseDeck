@@ -702,15 +702,69 @@ impl MonitorWindow {
                 let scheduler = self.scheduler.clone();
                 let wake = self.scheduler_wake.clone();
                 let card_id = card_cfg.id.clone();
-                metric_card.refresh_btn.connect_clicked(move |_| {
-                    scheduler.borrow_mut().request_now(&card_id);
-                    let _ = wake.try_send(());
+                let refresh_runtime = self.runtime.clone();
+                metric_card.refresh_btn.connect_clicked(move |button| {
+                    refresh_runtime.report_user_activity(UserActivity::ManualRefresh);
+                    if scheduler.borrow_mut().request_now(&card_id) {
+                        button.set_sensitive(false);
+                        button.set_tooltip_text(Some("正在刷新"));
+                        let _ = wake.try_send(());
+                    }
                 });
 
                 if let Some(action_id) = card_cfg.click_action.as_deref() {
                     if let Some(action_cfg) =
                         all_actions.iter().find(|action| action.id == action_id)
                     {
+                        metric_card.set_action_enabled(true);
+                        let action_controls = match &metric_card.render_widgets {
+                            crate::ui::metric_card::RenderWidgets::Action(widgets) => {
+                                Some(widgets.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(controls) = action_controls.clone() {
+                            let button_controls = controls.clone();
+                            let action_cfg = action_cfg.clone();
+                            let action_tx = self.action_tx.clone();
+                            let handle = self.handle.clone();
+                            let result_card_id = card_cfg.id.clone();
+                            let (confirm_title, confirm_detail) =
+                                action_confirmation_text(&action_cfg);
+                            let global_max_output =
+                                self.config.borrow().config().app.max_output_bytes;
+                            let runtime = self.runtime.clone();
+                            controls.button.connect_clicked(move |button| {
+                                let run = {
+                                    let controls = button_controls.clone();
+                                    let action_cfg = action_cfg.clone();
+                                    let action_tx = action_tx.clone();
+                                    let handle = handle.clone();
+                                    let result_card_id = result_card_id.clone();
+                                    move || {
+                                        controls.set_running(true);
+                                        execute_action_async(
+                                            action_cfg,
+                                            action_tx,
+                                            handle,
+                                            global_max_output,
+                                            Some(result_card_id),
+                                        );
+                                    }
+                                };
+                                if action_cfg.confirm {
+                                    confirm_action(
+                                        button.upcast_ref(),
+                                        &confirm_title,
+                                        &confirm_detail,
+                                        runtime.clone(),
+                                        run,
+                                    );
+                                } else {
+                                    run();
+                                }
+                            });
+                        }
                         metric_card.card.add_css_class("click-action-card");
                         metric_card.card.set_cursor_from_name(Some("pointer"));
                         let click = gtk::GestureClick::new();
@@ -719,6 +773,7 @@ impl MonitorWindow {
                         let action_tx = self.action_tx.clone();
                         let handle = self.handle.clone();
                         let result_card_id = card_cfg.id.clone();
+                        let dialog_runtime = self.runtime.clone();
                         let (confirm_title, confirm_detail) = action_confirmation_text(&action_cfg);
                         let global_max_output = self.config.borrow().config().app.max_output_bytes;
                         click.connect_released(move |gesture, presses, x, y| {
@@ -735,11 +790,15 @@ impl MonitorWindow {
                                 return;
                             }
                             let run = {
+                                let action_controls = action_controls.clone();
                                 let action_cfg = action_cfg.clone();
                                 let action_tx = action_tx.clone();
                                 let handle = handle.clone();
                                 let result_card_id = result_card_id.clone();
                                 move || {
+                                    if let Some(controls) = &action_controls {
+                                        controls.set_running(true);
+                                    }
                                     execute_action_async(
                                         action_cfg,
                                         action_tx,
@@ -750,7 +809,13 @@ impl MonitorWindow {
                                 }
                             };
                             if action_cfg.confirm {
-                                confirm_action(&widget, &confirm_title, &confirm_detail, run);
+                                confirm_action(
+                                    &widget,
+                                    &confirm_title,
+                                    &confirm_detail,
+                                    dialog_runtime.clone(),
+                                    run,
+                                );
                             } else {
                                 run();
                             }
@@ -790,6 +855,11 @@ impl MonitorWindow {
             let handle = self.handle.clone();
             let global_max_output = self.config.borrow().config().app.max_output_bytes;
             let (confirm_title, confirm_detail) = action_confirmation_text(action_cfg);
+            let dialog_runtime = self.runtime.clone();
+            let response_runtime = self.runtime.clone();
+            let dialog_lease = Rc::new(RefCell::new(None));
+            let open_lease = dialog_lease.clone();
+            let close_lease = dialog_lease.clone();
 
             page.add_action_card(
                 &action_id,
@@ -804,6 +874,15 @@ impl MonitorWindow {
                     let tx = action_tx.clone();
                     let h = handle.clone();
                     execute_action_async(cfg, tx, h, global_max_output, None);
+                },
+                move || {
+                    open_lease.replace(Some(
+                        dialog_runtime.begin_interaction(Duration::from_secs(300)),
+                    ));
+                },
+                move || {
+                    close_lease.borrow_mut().take();
+                    response_runtime.report_user_activity(UserActivity::Dialog);
                 },
             );
         }
@@ -1218,6 +1297,7 @@ impl MonitorWindow {
             let previous_results = self.previous_results.clone();
             let scheduler_wake = self.scheduler_wake.clone();
             let current_page_id = self.current_page_id.clone();
+            let runtime = self.runtime.clone();
             toggle.connect_active_notify(move |switch| {
                 let mut config = config.borrow_mut();
                 let changed_card = config
@@ -1257,9 +1337,14 @@ impl MonitorWindow {
                                     let scheduler = scheduler.clone();
                                     let wake = scheduler_wake.clone();
                                     let card_id = card.id.clone();
-                                    metric_card.refresh_btn.connect_clicked(move |_| {
-                                        scheduler.borrow_mut().request_now(&card_id);
-                                        let _ = wake.try_send(());
+                                    let runtime = runtime.clone();
+                                    metric_card.refresh_btn.connect_clicked(move |button| {
+                                        runtime.report_user_activity(UserActivity::ManualRefresh);
+                                        if scheduler.borrow_mut().request_now(&card_id) {
+                                            button.set_sensitive(false);
+                                            button.set_tooltip_text(Some("正在刷新"));
+                                            let _ = wake.try_send(());
+                                        }
                                     });
                                 }
                                 card_metas.borrow_mut().insert(
@@ -1300,7 +1385,9 @@ impl MonitorWindow {
         refresh_btn.set_halign(Align::Center);
         let scheduler = self.scheduler.clone();
         let wake = self.scheduler_wake.clone();
+        let runtime = self.runtime.clone();
         refresh_btn.connect_clicked(move |_| {
+            runtime.report_user_activity(UserActivity::ManualRefresh);
             scheduler.borrow_mut().request_all_now();
             let _ = wake.try_send(());
         });
@@ -1616,6 +1703,7 @@ impl MonitorWindow {
                         });
 
                         if schedule_state.is_some() || cache_ttl.is_some() {
+                            let cache_key = format!("cache:{card_id}");
                             if let Err(error) = cache::store(
                                 &card_id,
                                 schedule_state
@@ -1624,9 +1712,11 @@ impl MonitorWindow {
                                 &result,
                             ) {
                                 crate::core::error_limiter::warn(
-                                    format!("cache:{card_id}"),
+                                    cache_key.clone(),
                                     format!("failed to persist cache for {card_id}: {error}"),
                                 );
+                            } else if result.state != MetricState::Error {
+                                crate::core::error_limiter::recovered(&cache_key);
                             }
                         }
 
@@ -1705,6 +1795,12 @@ impl MonitorWindow {
                         }
                     };
 
+                    if let Some(page) = pages.borrow_mut().get_mut(&update.page_id) {
+                        if let Some(card) = page.get_metric_card(&update.card_id) {
+                            card.set_refresh_pending(false);
+                        }
+                    }
+
                     if !should_skip {
                         crate::core::power_debug::increment(
                             crate::core::power_debug::Counter::GtkUpdate,
@@ -1737,6 +1833,7 @@ impl MonitorWindow {
 
     fn start_action_receiver(&self, rx: async_channel::Receiver<ActionUpdate>) {
         let pages = self.pages.clone();
+        let runtime = self.runtime.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(first) = rx.recv().await {
@@ -1748,10 +1845,12 @@ impl MonitorWindow {
                     if let Some(card_id) = update.result_card_id.as_deref() {
                         for page in pages.borrow_mut().values_mut() {
                             if let Some(card) = page.get_metric_card(card_id) {
+                                card.set_action_running(false);
                                 show_action_result_dialog(
                                     &card.card,
                                     &update.action_id,
                                     &update.result,
+                                    runtime.clone(),
                                 );
                                 break;
                             }
@@ -1765,6 +1864,7 @@ impl MonitorWindow {
                                 &card.card,
                                 &update.action_id,
                                 &update.result,
+                                runtime.clone(),
                             );
                             break;
                         }
@@ -2200,6 +2300,8 @@ fn apply_metric_result(card: &mut crate::ui::metric_card::MetricCard, result: &M
         columns: card.model.as_ref().and_then(|m| m.columns),
     };
 
+    card.set_refresh_pending(false);
+    card.set_value_level(None);
     card.set_model(&model);
     if let Some(level) = result
         .metadata
@@ -2293,7 +2395,13 @@ fn action_confirmation_text(action: &crate::core::config::ActionConfig) -> (Stri
     (title, detail)
 }
 
-fn confirm_action(parent: &gtk::Widget, title: &str, detail: &str, run: impl FnOnce() + 'static) {
+fn confirm_action(
+    parent: &gtk::Widget,
+    title: &str,
+    detail: &str,
+    runtime: RuntimeHandle,
+    run: impl FnOnce() + 'static,
+) {
     let Some(window) = parent
         .root()
         .and_then(|root| root.downcast::<gtk::Window>().ok())
@@ -2307,8 +2415,12 @@ fn confirm_action(parent: &gtk::Widget, title: &str, detail: &str, run: impl FnO
         .cancel_button(0)
         .default_button(1)
         .build();
+    let interaction = runtime.begin_interaction(Duration::from_secs(300));
     glib::MainContext::default().spawn_local(async move {
-        if dialog.choose_future(Some(&window)).await == Ok(1) {
+        let response = dialog.choose_future(Some(&window)).await;
+        drop(interaction);
+        runtime.report_user_activity(UserActivity::Dialog);
+        if response == Ok(1) {
             run();
         }
     });
@@ -2329,7 +2441,12 @@ fn widget_or_ancestor_is_button(mut widget: gtk::Widget, boundary: &gtk::Widget)
     }
 }
 
-fn show_action_result_dialog(parent: &gtk::Box, action_id: &str, result: &ActionResult) {
+fn show_action_result_dialog(
+    parent: &gtk::Box,
+    action_id: &str,
+    result: &ActionResult,
+    runtime: RuntimeHandle,
+) {
     let root = parent.root().and_then(|r| r.downcast::<gtk::Window>().ok());
     let window = match root {
         Some(w) => w,
@@ -2364,18 +2481,25 @@ fn show_action_result_dialog(parent: &gtk::Box, action_id: &str, result: &Action
         .buttons(labels)
         .build();
 
-    dialog.show(Some(&window));
+    glib::MainContext::default().spawn_local(async move {
+        let _ = dialog.choose_future(Some(&window)).await;
+        runtime.report_user_activity(UserActivity::Dialog);
+    });
 }
 
 fn do_reload_config(config: &Rc<RefCell<ConfigManager>>) -> bool {
     let mut cfg = config.borrow_mut();
     match cfg.load() {
         Ok(()) => {
+            crate::core::error_limiter::recovered("config:reload");
             tracing::info!("config hot-reloaded from {:?}", cfg.path());
             true
         }
         Err(e) => {
-            tracing::warn!("config reload failed (keeping current): {}", e);
+            crate::core::error_limiter::warn(
+                "config:reload",
+                format!("config reload failed (keeping current): {e}"),
+            );
             false
         }
     }
@@ -2540,7 +2664,6 @@ fn card(
             shell: None,
             options: None,
             parser: None,
-            plugin_id: None,
         }),
         display: None,
         cache_ttl_seconds: None,

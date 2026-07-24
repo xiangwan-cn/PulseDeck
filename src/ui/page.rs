@@ -417,6 +417,8 @@ impl Page {
         confirm_title: &str,
         confirm_detail: &str,
         on_click: impl Fn(&str) + 'static,
+        on_dialog_open: impl Fn() + 'static,
+        on_dialog_response: impl Fn() + 'static,
     ) {
         let card = ActionCard::new(
             action_id,
@@ -427,6 +429,8 @@ impl Page {
             confirm_title,
             confirm_detail,
             on_click,
+            on_dialog_open,
+            on_dialog_response,
         );
         if self.compact_grid {
             card.card.add_css_class("compact-card");

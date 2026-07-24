@@ -18,47 +18,6 @@ pub struct CardModel {
     pub columns: Option<usize>,
 }
 
-impl CardModel {
-    pub fn placeholder(id: &str, title: &str, icon: &str, renderer: RendererKind) -> Self {
-        Self {
-            id: id.to_string(),
-            title: title.to_string(),
-            subtitle: None,
-            icon: Some(icon.to_string()),
-            renderer,
-            state: CardState::Loading,
-            value: CardValue::Empty,
-            tooltip: None,
-            cached: false,
-            columns_after: None,
-            columns: None,
-        }
-    }
-
-    pub fn loading(mut self) -> Self {
-        self.state = CardState::Loading;
-        self.value = CardValue::Text("加载中...".into());
-        self
-    }
-
-    pub fn error(mut self, msg: &str) -> Self {
-        self.state = CardState::Error;
-        self.value = CardValue::Text(format!("错误: {}", msg));
-        self
-    }
-
-    pub fn unavailable(mut self, reason: &str) -> Self {
-        self.state = CardState::Unavailable;
-        self.value = CardValue::Text(reason.to_string());
-        self
-    }
-
-    pub fn cached(mut self) -> Self {
-        self.cached = true;
-        self
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RendererKind {
@@ -122,11 +81,4 @@ pub struct CardField {
     pub label: String,
     pub value: String,
     pub level: Option<StatusLevel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CardAction {
-    pub id: String,
-    pub label: String,
-    pub icon: Option<String>,
 }

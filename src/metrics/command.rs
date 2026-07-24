@@ -2,8 +2,6 @@ use crate::execution::subprocess::run_command;
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
 
-use super::traits::MetricContext;
-
 pub struct CommandMetric {
     program: String,
     args: Vec<String>,
@@ -106,10 +104,6 @@ impl CommandMetric {
             cached: false,
             metadata: None,
         }
-    }
-
-    pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
-        self.collect_no_ctx()
     }
 }
 

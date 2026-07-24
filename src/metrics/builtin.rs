@@ -30,21 +30,3 @@ pub fn create_builtin_metric(name: &str) -> Option<BuiltinMetric> {
         _ => None,
     }
 }
-
-pub fn builtin_metric_names() -> &'static [&'static str] {
-    &[
-        "cpu",
-        "memory",
-        "uptime",
-        "battery_capacity",
-        "battery_temperature",
-        "power",
-        "network",
-        "load_average",
-        "swap",
-        "process_count",
-        "cpu_temperature",
-        "filesystem",
-        "network_traffic",
-    ]
-}

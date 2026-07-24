@@ -36,7 +36,6 @@ pub enum MetricState {
 }
 
 impl MetricResult {
-    #[allow(dead_code)]
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             value: CardValue::Text("不可用".into()),
@@ -48,49 +47,12 @@ impl MetricResult {
         }
     }
 
-    #[allow(dead_code)]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             value: CardValue::Text("错误".into()),
             subtitle: None,
             tooltip: Some(message.into()),
             state: MetricState::Error,
-            cached: false,
-            metadata: None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn loading() -> Self {
-        Self {
-            value: CardValue::Text("等待中...".into()),
-            subtitle: None,
-            tooltip: None,
-            state: MetricState::Loading,
-            cached: false,
-            metadata: None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn text(value: impl Into<String>) -> Self {
-        Self {
-            value: CardValue::Text(value.into()),
-            subtitle: None,
-            tooltip: None,
-            state: MetricState::Normal,
-            cached: false,
-            metadata: None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn percentage(value: f64) -> Self {
-        Self {
-            value: CardValue::Percentage(value.clamp(0.0, 100.0)),
-            subtitle: None,
-            tooltip: None,
-            state: MetricState::Normal,
             cached: false,
             metadata: None,
         }

@@ -14,7 +14,6 @@ const MAX_WINDOW_SIZE: usize = 60;
 struct PowerSample {
     elapsed_secs: f64,
     power_w: f64,
-    is_discharging: bool,
 }
 
 pub struct PowerMetric {
@@ -89,7 +88,6 @@ impl PowerMetric {
         self.samples.push_back(PowerSample {
             elapsed_secs: now_secs,
             power_w: power.abs(),
-            is_discharging,
         });
 
         while self.samples.len() > MAX_WINDOW_SIZE {

@@ -79,7 +79,9 @@ minimum_interval_seconds = 5
 
 `click_action` 只引用已有 `[[actions]].id`，不会在卡片中重复保存命令。是否显示
 二次确认由对应 action 的 `confirm` 控制；设置 `visible = false` 可只保留点击入口，
-不在操作页渲染重复按钮。卡片内的刷新按钮仍只刷新数据，不触发 action。
+不在操作页渲染重复按钮。卡片内的刷新按钮仍只刷新数据，不触发 action。使用
+`renderer = "action"` 时，其“执行”按钮触发同一个 `click_action`；执行期间显示 spinner
+并禁用按钮，结果返回后恢复。未配置有效 `click_action` 时按钮保持禁用。
 
 `Number` 和 `Percentage` 主数值由所有相关渲染器共享同一格式化规则：整数百分比不保留
 无意义的 `.0`，温度和中文量词直接紧跟数值，`W`、`GiB` 等拉丁单位保留空格，非有限
@@ -266,10 +268,15 @@ cache_ttl_seconds = 14400
 拖动、页面切换、手动刷新和插件控制会重置空闲时间；自动刷新、网络请求、动画及状态
 文件变化不会。
 
+手动刷新单张卡片后，刷新按钮会暂时禁用，结果返回后自动恢复；旧值在刷新期间保持可见。
+加载、错误和不可用状态使用与渲染器无关的静态提示，因此列表或组合卡片不会继续显示
+上一次成功内容。确认对话框打开期间持有最长五分钟的交互保护，用户响应后立即释放。
+
 网络连接状态通过 NetworkManager D-Bus 读取并由 GIO 网络事件触发，不再为每次刷新
 启动多个 `nmcli`。CPU/内存/Swap 等相邻采集会复用短时 `/proc` 快照。配置中的
 `minimum_change` 先比较稳定的主数值，动态 subtitle/tooltip 不会绕过阈值并造成 GTK
-重复重绘。
+重复重绘。电池 sysfs 中带符号的 `power_now`、`power_avg` 和 `current_now` 会按绝对
+功率读取，充放电方向仍以电池 `status` 为准。
 
 ## 可选 ScrcpyForge 页面
 
@@ -278,7 +285,8 @@ cache_ttl_seconds = 14400
 `src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
 重新进入后自动恢复。空闲模式仅更新设备元数据，不下载预览 PNG；服务端支持 ETag
 时未变化图片不传输，客户端内容哈希未变化时不重建纹理。每台设备拥有对应的预览卡和
-脚本卡。
+脚本卡。温度达到 warm 或更高等级时，预览和健康检查间隔自动延长；hot/throttled
+状态下 PetCard 动画冻结在当前帧并移除动画定时器。
 
 ## 可选 PetCard
 

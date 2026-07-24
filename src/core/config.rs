@@ -321,8 +321,6 @@ pub struct SourceConfig {
     pub options: Option<toml::Value>,
     #[serde(default)]
     pub parser: Option<ParserConfig>,
-    #[serde(default)]
-    pub plugin_id: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -452,21 +450,6 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub fn load_json_for_migration(
-        &self,
-        json_path: &std::path::Path,
-    ) -> Result<AppConfig, AppError> {
-        let content = std::fs::read_to_string(json_path).map_err(|e| AppError::ConfigParse {
-            path: json_path.to_path_buf(),
-            message: e.to_string(),
-        })?;
-
-        serde_json::from_str(&content).map_err(|e| AppError::ConfigParse {
-            path: json_path.to_path_buf(),
-            message: e.to_string(),
-        })
-    }
-
     pub fn save(&self) -> Result<(), AppError> {
         let tmp = self.path.with_extension("toml.tmp");
         let content =
@@ -474,10 +457,6 @@ impl ConfigManager {
         std::fs::write(&tmp, &content)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
-    }
-
-    pub fn set_config(&mut self, config: AppConfig) {
-        self.config = config;
     }
 }
 
@@ -561,7 +540,6 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                     shell: None,
                     options: None,
                     parser: None,
-                    plugin_id: None,
                 }),
                 display: None,
                 cache_ttl_seconds: None,
@@ -583,16 +561,8 @@ pub fn config_path() -> std::path::PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn secrets_path() -> std::path::PathBuf {
-    config_dir().join("secrets.toml")
-}
-
 pub fn cache_dir() -> std::path::PathBuf {
     dirs_cache().join("pulsedeck")
-}
-
-pub fn plugins_dir() -> std::path::PathBuf {
-    dirs_data().join("pulsedeck").join("plugins")
 }
 
 fn dirs_config() -> std::path::PathBuf {
@@ -608,14 +578,6 @@ fn dirs_cache() -> std::path::PathBuf {
         std::path::PathBuf::from(p)
     } else {
         dirs_home().join(".cache")
-    }
-}
-
-fn dirs_data() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("XDG_DATA_HOME") {
-        std::path::PathBuf::from(p)
-    } else {
-        dirs_home().join(".local").join("share")
     }
 }
 

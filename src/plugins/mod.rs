@@ -6,13 +6,6 @@
 use crate::core::config::{CardConfig, PageConfig};
 use crate::core::error::AppError;
 
-pub mod loader;
-pub mod manifest;
-pub mod one_shot;
-pub mod persistent;
-pub mod protocol;
-pub mod supervisor;
-
 #[cfg(feature = "pet-card")]
 pub mod pet_card;
 #[cfg(feature = "scrcpy-forge")]
@@ -20,8 +13,14 @@ pub mod scrcpy_forge;
 
 #[derive(Clone)]
 pub struct PluginContext {
+    #[cfg_attr(not(feature = "scrcpy-forge"), allow(dead_code))]
     pub handle: tokio::runtime::Handle,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     pub presentation: Option<CardPresentationHandle>,
+    #[cfg_attr(
+        not(any(feature = "pet-card", feature = "scrcpy-forge")),
+        allow(dead_code)
+    )]
     pub runtime: crate::core::runtime::RuntimeHandle,
 }
 
@@ -29,7 +28,9 @@ pub struct PluginContext {
 pub enum CardPresentation {
     Normal,
     Quad,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     Expanded,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     Fullscreen,
 }
 

@@ -37,44 +37,12 @@ pub struct BatterySnapshot {
     pub voltage_now: Option<f64>,
 }
 
-impl BatterySnapshot {
-    pub fn is_empty(&self) -> bool {
-        self.capacity == 0.0
-            && self.status == BatteryStatus::Unknown
-            && self.temperature.is_none()
-            && self.power_now.is_none()
-    }
-}
-
-fn empty_snapshot() -> BatterySnapshot {
-    BatterySnapshot {
-        capacity: 0.0,
-        status: BatteryStatus::Unknown,
-        temperature: None,
-        power_now: None,
-        time_to_empty_now: None,
-        energy_now: 0.0,
-        energy_full: None,
-        charge_now: None,
-        charge_full: None,
-        voltage_now: None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CurrentSignConvention {
-    Charging,
-    Discharging,
-    Auto,
-}
-
 pub struct BatterySource {
     root: PathBuf,
     battery_path: Option<PathBuf>,
     cached_snapshot: Option<BatterySnapshot>,
     last_read: Instant,
     cache_ttl: Duration,
-    current_sign: CurrentSignConvention,
 }
 
 impl BatterySource {
@@ -85,18 +53,7 @@ impl BatterySource {
             cached_snapshot: None,
             last_read: Instant::now(),
             cache_ttl: Duration::from_millis(500),
-            current_sign: CurrentSignConvention::Auto,
         }
-    }
-
-    pub fn with_current_sign(mut self, convention: CurrentSignConvention) -> Self {
-        self.current_sign = convention;
-        self
-    }
-
-    pub fn set_current_sign(&mut self, convention: CurrentSignConvention) {
-        self.current_sign = convention;
-        self.cached_snapshot = None;
     }
 
     pub fn snapshot(&mut self) -> Result<BatterySnapshot, anyhow::Error> {
@@ -110,10 +67,6 @@ impl BatterySource {
         self.cached_snapshot = Some(snapshot.clone());
         self.last_read = now;
         Ok(snapshot)
-    }
-
-    pub fn read_snapshot(&mut self) -> BatterySnapshot {
-        self.snapshot().unwrap_or_else(|_| empty_snapshot())
     }
 
     fn discover(&self) -> Option<PathBuf> {
@@ -278,8 +231,8 @@ fn read_temperature(path: &Path) -> Option<f64> {
 }
 
 fn read_power_w(path: &Path) -> Option<f64> {
-    if let Some(p) = read_attr_u64(path, "power_now") {
-        return Some(p as f64 / 1_000_000.0);
+    if let Some(p) = read_attr_i64(path, "power_now") {
+        return Some(p.unsigned_abs() as f64 / 1_000_000.0);
     }
 
     let voltage = read_attr_u64(path, "voltage_now").map(|v| v as f64 / 1_000_000.0);
@@ -290,8 +243,8 @@ fn read_power_w(path: &Path) -> Option<f64> {
         return Some(v * c);
     }
 
-    if let Some(p) = read_attr_u64(path, "power_avg") {
-        return Some(p as f64 / 1_000_000.0);
+    if let Some(p) = read_attr_i64(path, "power_avg") {
+        return Some(p.unsigned_abs() as f64 / 1_000_000.0);
     }
 
     None
@@ -349,28 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_snapshot_no_error() {
-        let dir = std::env::temp_dir().join("pulsedeck_test_battery_readsnap");
-        let _ = fs::remove_dir_all(&dir);
-        setup_sysfs(&dir, "BAT0");
-
-        let mut src = BatterySource::new(dir);
-        let snap = src.read_snapshot();
-        assert!(!snap.is_empty());
-    }
-
-    #[test]
-    fn test_read_snapshot_empty_on_missing() {
-        let dir = std::env::temp_dir().join("pulsedeck_test_battery_empty");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-
-        let mut src = BatterySource::new(dir);
-        let snap = src.read_snapshot();
-        assert!(snap.is_empty());
-    }
-
-    #[test]
     fn test_cache_window() {
         let dir = std::env::temp_dir().join("pulsedeck_test_battery_cache");
         let _ = fs::remove_dir_all(&dir);
@@ -389,13 +320,24 @@ mod tests {
         let bat0 = setup_sysfs(&dir, "BAT0");
 
         let mut src = BatterySource::new(dir.clone());
-        assert!(!src.read_snapshot().is_empty());
+        assert!(src.snapshot().is_ok());
 
         fs::remove_dir_all(&bat0).ok();
         src.cached_snapshot = None;
 
         setup_sysfs(&dir, "BAT1");
-        assert!(!src.read_snapshot().is_empty());
+        assert!(src.snapshot().is_ok());
+    }
+
+    #[test]
+    fn signed_power_telemetry_is_reported_as_magnitude() {
+        let dir = std::env::temp_dir().join("pulsedeck_test_battery_signed_power");
+        let _ = fs::remove_dir_all(&dir);
+        let battery = setup_sysfs(&dir, "BAT0");
+        fs::write(battery.join("power_now"), "-5500000\n").unwrap();
+
+        let mut src = BatterySource::new(dir);
+        assert_eq!(src.snapshot().unwrap().power_now, Some(5.5));
     }
 
     #[test]

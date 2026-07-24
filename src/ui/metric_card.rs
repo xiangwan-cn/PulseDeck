@@ -1,7 +1,7 @@
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Image, Label, Orientation};
 
-use crate::model::card_model::{CardModel, RendererKind};
+use crate::model::card_model::{CardModel, CardState, RendererKind};
 use crate::rendering::{
     action::ActionWidgets, composite::CompositeWidgets, list::ListWidgets,
     progress::ProgressWidgets, status::StatusWidgets, text::TextWidgets, value::ValueWidgets,
@@ -26,11 +26,12 @@ pub enum RenderWidgets {
 
 pub struct MetricCard {
     pub card: GtkBox,
-    pub header_name: Label,
     pub header_description: Label,
     header_icon: Image,
     pub refresh_btn: Button,
     pub render_widgets: RenderWidgets,
+    value_box: GtkBox,
+    state_label: Label,
     pub footer: Label,
     pub model: Option<CardModel>,
     pub renderer_kind: RendererKind,
@@ -154,6 +155,13 @@ impl MetricCard {
             }
         };
 
+        let state_label = Label::new(None);
+        state_label.set_halign(Align::Center);
+        state_label.set_hexpand(true);
+        state_label.add_css_class("metric-value");
+        state_label.set_visible(false);
+        value_box.append(&state_label);
+
         if layout.fixed {
             // GtkWidget's size request is a minimum, not a maximum. Without a
             // non-propagating viewport, multiline plugin output contributes its
@@ -181,18 +189,19 @@ impl MetricCard {
         footer.set_visible(false);
         card.append(&footer);
 
-        let result = Self {
+        let mut result = Self {
             card,
-            header_name,
             header_description,
             header_icon,
             refresh_btn,
             render_widgets,
+            value_box,
+            state_label,
             footer,
             model: Some(model.clone()),
             renderer_kind: model.renderer,
         };
-        result.apply_density(model);
+        result.set_model(model);
         result
     }
 
@@ -207,14 +216,26 @@ impl MetricCard {
         };
         self.card
             .set_tooltip_text(model.tooltip.as_deref().or(fallback));
-        match &mut self.render_widgets {
-            RenderWidgets::Text(w) => crate::rendering::text::apply_text(w, model),
-            RenderWidgets::Value(w) => crate::rendering::value::apply_value(w, model),
-            RenderWidgets::Progress(w) => crate::rendering::progress::apply_progress(w, model),
-            RenderWidgets::Status(w) => crate::rendering::status::apply_status(w, model),
-            RenderWidgets::List(w) => crate::rendering::list::apply_list(w, model),
-            RenderWidgets::Composite(w) => crate::rendering::composite::apply_composite(w, model),
-            RenderWidgets::Action(w) => crate::rendering::action::apply_action(w, model),
+        self.set_renderer_visible(matches!(model.state, CardState::Normal | CardState::Cached));
+        if matches!(model.state, CardState::Normal | CardState::Cached) {
+            match &mut self.render_widgets {
+                RenderWidgets::Text(w) => crate::rendering::text::apply_text(w, model),
+                RenderWidgets::Value(w) => crate::rendering::value::apply_value(w, model),
+                RenderWidgets::Progress(w) => crate::rendering::progress::apply_progress(w, model),
+                RenderWidgets::Status(w) => crate::rendering::status::apply_status(w, model),
+                RenderWidgets::List(w) => crate::rendering::list::apply_list(w, model),
+                RenderWidgets::Composite(w) => {
+                    crate::rendering::composite::apply_composite(w, model)
+                }
+                RenderWidgets::Action(w) => crate::rendering::action::apply_action(w, model),
+            }
+        } else {
+            self.state_label.set_label(match model.state {
+                CardState::Loading => "加载中...",
+                CardState::Unavailable => "不可用",
+                CardState::Error => "错误",
+                CardState::Normal | CardState::Cached => "",
+            });
         }
 
         if let Some(ref sub) = model.subtitle {
@@ -287,7 +308,51 @@ impl MetricCard {
         }
     }
 
-    pub fn clear_loading(&mut self) {}
+    fn set_renderer_visible(&self, visible: bool) {
+        self.state_label.set_visible(!visible);
+        match &self.render_widgets {
+            RenderWidgets::Text(w) => w.value.set_visible(visible),
+            RenderWidgets::Value(w) => w.container.set_visible(visible),
+            RenderWidgets::Progress(w) => {
+                w.value.set_visible(visible);
+                w.bar.set_visible(visible);
+            }
+            RenderWidgets::Status(w) => w.value.set_visible(visible),
+            RenderWidgets::List(w) => w.value.set_visible(visible),
+            RenderWidgets::Composite(w) => {
+                for row in &w.rows {
+                    row.container.set_visible(visible);
+                }
+            }
+            RenderWidgets::Action(w) => {
+                w.button.set_visible(visible);
+                w.status.set_visible(visible);
+                if !visible {
+                    w.spinner.stop();
+                    w.spinner.set_visible(false);
+                }
+            }
+        }
+        self.value_box.set_visible(true);
+    }
+
+    pub fn set_refresh_pending(&self, pending: bool) {
+        self.refresh_btn.set_sensitive(!pending);
+        self.refresh_btn
+            .set_tooltip_text(Some(if pending { "正在刷新" } else { "刷新" }));
+    }
+
+    pub fn set_action_enabled(&self, enabled: bool) {
+        if let RenderWidgets::Action(widgets) = &self.render_widgets {
+            widgets.set_enabled(enabled);
+        }
+    }
+
+    pub fn set_action_running(&self, running: bool) {
+        if let RenderWidgets::Action(widgets) = &self.render_widgets {
+            widgets.set_running(running);
+        }
+    }
 
     pub fn set_value_level(&self, level: Option<&str>) {
         let value = match &self.render_widgets {
@@ -306,24 +371,6 @@ impl MetricCard {
             Some("warning") => value.add_css_class("metric-value-warning"),
             Some("critical") | Some("error") => value.add_css_class("metric-value-critical"),
             _ => {}
-        }
-    }
-
-    pub fn set_error(&mut self, msg: &str) {
-        if let Some(ref mut model) = self.model {
-            let mut m = model.clone();
-            m.value = crate::model::card_model::CardValue::Text(format!("错误: {}", msg));
-            m.state = crate::model::card_model::CardState::Error;
-            self.set_model(&m);
-        }
-    }
-
-    pub fn set_unavailable(&mut self, reason: &str) {
-        if let Some(ref mut model) = self.model {
-            let mut m = model.clone();
-            m.value = crate::model::card_model::CardValue::Text(reason.to_string());
-            m.state = crate::model::card_model::CardState::Unavailable;
-            self.set_model(&m);
         }
     }
 }

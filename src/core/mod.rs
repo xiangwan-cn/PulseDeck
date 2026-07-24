@@ -4,7 +4,6 @@ pub mod error;
 pub mod error_limiter;
 pub mod power_debug;
 pub mod power_supply;
-pub mod registry;
 pub mod runtime;
 pub mod schedule;
 pub mod scheduler;

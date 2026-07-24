@@ -31,7 +31,7 @@ refresh. Every setting is applied to the live runtime manager after it is saved.
 ## Idle behavior
 
 Only real input resets idle time: touch/click, scroll, keyboard input, drag,
-page changes, manual refresh, dialogs, plugin controls, and remote control.
+page changes, manual refresh, dialog responses, and plugin controls.
 Hover and pointer motion do not. Automatic card refresh, animation, hook file
 changes, plugin polling, network responses, and preview changes are not user
 activity. Interaction leases automatically expire after at most five minutes.
@@ -88,6 +88,13 @@ work. If startup briefly transitions through suspended mode before the window
 maps, cards that have never collected retain an immediate first run, including
 event-driven file and network-status cards.
 
+Manual card refresh disables its button until the result returns, while keeping
+the previous value visible. Loading, unavailable, and error results use a
+renderer-independent static state so list/composite cards cannot retain stale
+successful content. Confirmation dialogs hold a bounded interaction lease while
+the user reads them; automatically displayed result dialogs only count as
+activity after the user closes them.
+
 ## External power
 
 The power monitor reads charger `online` state plus battery, input-power, and
@@ -97,6 +104,12 @@ realtime mode even if charging is paused, the battery is full, input telemetry
 is zero or unknown, or the thermal verdict is elevated. When
 `external_prevents_idle` is enabled, the same online signal prevents foreground
 idle. PulseDeck never changes the CPU governor.
+
+Thermal diagnostics do not change the external-power verdict. They separately
+reduce expensive presentation work: warm or hotter states slow ScrcpyForge
+preview/health intervals, while hot or throttled states freeze PetCard on its
+current frame and remove its animation timer. Idle metadata-only preview and
+background stopping still take priority.
 
 ## Agent lifecycle
 
@@ -115,6 +128,10 @@ normal mode and 1 FPS while idle, caches at most three decoded animation states,
 and keeps offline static. ScrcpyForge uses cancellable one-shot mode-aware
 preview/health loops, requests metadata only while idle, stops preview in the
 background, uses HTTP ETags, and avoids rebuilding unchanged textures.
+
+Battery power telemetry accepts signed `power_now`, `power_avg`, and
+`current_now` sysfs values and presents their magnitude; charge/discharge
+direction continues to come from the battery status.
 
 ## Configuration defaults
 

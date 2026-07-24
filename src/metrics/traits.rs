@@ -39,19 +39,6 @@ pub enum BuiltinMetric {
 }
 
 impl BuiltinMetric {
-    pub fn id(&self) -> &'static str {
-        match self {
-            BuiltinMetric::Cpu(_) => "cpu",
-            BuiltinMetric::Memory(_) => "memory",
-            BuiltinMetric::Uptime(_) => "uptime",
-            BuiltinMetric::BatteryCapacity(_) => "battery_capacity",
-            BuiltinMetric::BatteryTemperature(_) => "battery_temperature",
-            BuiltinMetric::Power(_) => "power",
-            BuiltinMetric::Network(_) => "network",
-            BuiltinMetric::System(_) => "system",
-        }
-    }
-
     pub fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
         match self {
             BuiltinMetric::Cpu(m) => m.collect(ctx),

@@ -4,7 +4,9 @@ pub enum Counter {
     CardCollect,
     ExternalProcess,
     HttpRequest,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     ImageDecode,
+    #[cfg_attr(not(feature = "pet-card"), allow(dead_code))]
     AnimationTick,
     GtkUpdate,
     DiskRead,

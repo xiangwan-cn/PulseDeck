@@ -18,6 +18,8 @@ impl ActionCard {
         confirm_title: &str,
         confirm_detail: &str,
         on_click: impl Fn(&str) + 'static,
+        on_dialog_open: impl Fn() + 'static,
+        on_dialog_response: impl Fn() + 'static,
     ) -> Self {
         let card = GtkBox::new(Orientation::Vertical, 0);
         card.add_css_class("card");
@@ -71,6 +73,8 @@ impl ActionCard {
 
         let aid = action_id.to_string();
         let on_click: Rc<dyn Fn(&str)> = Rc::new(on_click);
+        let on_dialog_open: Rc<dyn Fn()> = Rc::new(on_dialog_open);
+        let on_dialog_response: Rc<dyn Fn()> = Rc::new(on_dialog_response);
         let confirm_title = confirm_title.to_string();
         let confirm_detail = confirm_detail.to_string();
         let btn = Button::with_label("执行");
@@ -78,8 +82,10 @@ impl ActionCard {
         btn.add_css_class("pill");
         btn.add_css_class("suggested-action");
         btn.add_css_class("action-run-btn");
+        let running_spinner = spinner.clone();
         btn.connect_clicked(move |button| {
             if !confirm {
+                set_running(button, &running_spinner, true);
                 on_click(&aid);
                 return;
             }
@@ -96,10 +102,17 @@ impl ActionCard {
                 .cancel_button(0)
                 .default_button(1)
                 .build();
+            on_dialog_open();
             let aid = aid.clone();
             let on_click = on_click.clone();
+            let on_dialog_response = on_dialog_response.clone();
+            let button = button.clone();
+            let running_spinner = running_spinner.clone();
             glib::MainContext::default().spawn_local(async move {
-                if dialog.choose_future(Some(&window)).await == Ok(1) {
+                let response = dialog.choose_future(Some(&window)).await;
+                on_dialog_response();
+                if response == Ok(1) {
+                    set_running(&button, &running_spinner, true);
                     on_click(&aid);
                 }
             });
@@ -115,13 +128,16 @@ impl ActionCard {
     }
 
     pub fn set_running(&self, running: bool) {
-        self.spinner.set_visible(running);
-        if running {
-            self.spinner.start();
-            self.button.set_sensitive(false);
-        } else {
-            self.spinner.stop();
-            self.button.set_sensitive(true);
-        }
+        set_running(&self.button, &self.spinner, running);
     }
+}
+
+fn set_running(button: &Button, spinner: &Spinner, running: bool) {
+    spinner.set_visible(running);
+    if running {
+        spinner.start();
+    } else {
+        spinner.stop();
+    }
+    button.set_sensitive(!running);
 }

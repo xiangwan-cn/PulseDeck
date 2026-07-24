@@ -9,24 +9,10 @@ pub enum AppError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("parse error: {0}")]
-    Parse(String),
-
-    #[error("timeout")]
-    Timeout,
-
-    #[error("cancelled")]
-    Cancelled,
-
-    #[error("process error: {0}")]
-    Process(String),
-
-    #[error("http error: {0}")]
-    Http(String),
-
-    #[error("dbus error: {0}")]
-    Dbus(String),
-
+    #[cfg_attr(
+        not(any(feature = "pet-card", feature = "scrcpy-forge")),
+        allow(dead_code)
+    )]
     #[error("plugin error: {0}")]
     Plugin(String),
 
@@ -38,7 +24,4 @@ pub enum AppError {
 
     #[error("config parse error in {path}: {message}")]
     ConfigParse { path: PathBuf, message: String },
-
-    #[error("secrets file has wrong permissions: {0}")]
-    SecretsPermission(PathBuf),
 }
