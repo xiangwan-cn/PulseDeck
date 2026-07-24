@@ -13,6 +13,7 @@
 !.env.example
 
 # Private extensions and generated runtime data.
+/ignore/
 /scripts/local/
 /plugins/local/
 *.log

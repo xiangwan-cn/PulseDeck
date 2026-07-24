@@ -1,5 +1,5 @@
 {
-  "description": "Update PulseDeck PetCard with fixed states without reading prompt or tool contents.",
+  "description": "Update PulseDeck PetCard with fixed states without parsing or retaining event contents.",
   "hooks": {
     "SessionStart": [{
       "hooks": [{"type": "command", "command": "bash \"$PLUGIN_ROOT/scripts/pet_state.sh\" ready", "timeout": 2}]

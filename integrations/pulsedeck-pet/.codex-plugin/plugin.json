@@ -1,18 +1,25 @@
 {
   "name": "pulsedeck-pet",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260724115326",
   "description": "Publishes Codex lifecycle state to the PulseDeck PetCard.",
   "author": {
     "name": "PulseDeck contributors"
   },
   "license": "MIT",
-  "keywords": ["codex", "pulsedeck", "pet", "status"],
+  "keywords": [
+    "codex",
+    "pulsedeck",
+    "pet",
+    "status"
+  ],
   "interface": {
     "displayName": "PulseDeck Pet",
     "shortDescription": "Show Codex activity in PulseDeck",
     "longDescription": "Publishes privacy-minimized Codex lifecycle events to the optional PulseDeck PetCard.",
     "developerName": "PulseDeck contributors",
     "category": "Productivity",
-    "capabilities": ["Hooks"]
+    "capabilities": [
+      "Hooks"
+    ]
   }
 }

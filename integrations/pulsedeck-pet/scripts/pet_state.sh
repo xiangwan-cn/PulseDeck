@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Publish one fixed, privacy-minimized state. Codex event JSON on stdin is
-# intentionally ignored, so prompts, commands and tool output are never parsed.
+# Publish one fixed, privacy-minimized state. Drain Codex event JSON directly
+# to /dev/null so prompts, commands and tool output are never parsed or retained.
 
 set -u
+
+# Codex writes the event payload to every command hook. Exiting before consuming
+# it closes the pipe early and makes the caller report EPIPE/Broken pipe.
+cat >/dev/null 2>/dev/null || true
 
 state=${1:-working}
 case "$state" in

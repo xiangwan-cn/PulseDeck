@@ -36,8 +36,10 @@ the GTK bell.
 
 The installable Codex plugin is under `integrations/pulsedeck-pet`. Its Bash
 hook writes only a fixed state, protocol version and timestamp. It deliberately
-does not read the event JSON on stdin, so prompt text, commands, tool arguments,
-tool output and session ids are neither parsed nor persisted.
+drains the event JSON on stdin directly to `/dev/null`, so prompt text, commands,
+tool arguments, tool output and session ids are neither parsed nor persisted.
+Draining prevents Codex from seeing a broken pipe after the short-lived hook
+publishes its state.
 
 Codex must trust the plugin hooks before they run. Inspect them with `/hooks`
 after installing or enabling the plugin.
