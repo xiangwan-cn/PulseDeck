@@ -253,10 +253,14 @@ impl RuntimeManager {
     pub fn codex_started(&self, task_id: impl Into<String>) {
         let task_id = task_id.into();
         let mut codex = self.codex.borrow_mut();
-        if codex
-            .as_ref()
-            .is_some_and(|current| current.task_id == task_id)
-        {
+        if let Some(current) = codex.as_mut().filter(|current| current.task_id == task_id) {
+            if current.active && current.attention.is_none() {
+                return;
+            }
+            current.active = true;
+            current.attention = None;
+            drop(codex);
+            self.recompute();
             return;
         }
         let minutes = self.config.borrow().codex_protection_minutes;
@@ -274,7 +278,7 @@ impl RuntimeManager {
         &self,
         task_id: impl Into<String>,
         event_id: impl Into<String>,
-        _kind: ImportantEventKind,
+        kind: ImportantEventKind,
     ) -> bool {
         let task_id = task_id.into();
         let event_id = event_id.into();
@@ -295,6 +299,10 @@ impl RuntimeManager {
             .as_ref()
             .map(|state| state.protected_until)
             .unwrap_or_else(Instant::now);
+        let active = matches!(
+            kind,
+            ImportantEventKind::WaitingInput | ImportantEventKind::ConfirmationRequired
+        );
         *codex = Some(CodexRuntime {
             task_id,
             protected_until,
@@ -302,7 +310,7 @@ impl RuntimeManager {
                 event_id,
                 Instant::now() + Duration::from_secs(seconds.max(1)),
             )),
-            active: false,
+            active,
         });
         drop(codex);
         self.recompute();
@@ -344,9 +352,14 @@ impl RuntimeManager {
 
         let power = self.power.get();
         let thermal = self.thermal.get();
-        let external = cfg.external_realtime
-            && power == PowerVerdict::ExternalSufficient
-            && !matches!(thermal, ThermalVerdict::Hot | ThermalVerdict::Throttled);
+        let external_connected = matches!(
+            power,
+            PowerVerdict::ExternalUnstable
+                | PowerVerdict::ExternalSufficient
+                | PowerVerdict::ExternalInsufficient
+        );
+        let external_realtime = cfg.external_realtime && external_connected;
+        let external_prevents_idle = cfg.external_prevents_idle && external_connected;
 
         let mut protection_remaining = 0;
         let mut attention_remaining = 0;
@@ -384,12 +397,14 @@ impl RuntimeManager {
 
         let (mode, reason) = if !foreground {
             (RuntimeMode::Background, "应用不在前台")
-        } else if external && (cfg.external_prevents_idle || !stable_idle) {
-            (RuntimeMode::ExternalPowerRealtime, "外接供电稳定且温度正常")
+        } else if external_realtime && (external_prevents_idle || !stable_idle) {
+            (RuntimeMode::ExternalPowerRealtime, "已连接外接电源")
         } else if attention_active {
             (RuntimeMode::ForegroundNormal, "重要事件短暂唤醒")
         } else if protected {
             (RuntimeMode::ForegroundNormal, "Codex 短时亮度保护")
+        } else if external_prevents_idle {
+            (RuntimeMode::ForegroundNormal, "已连接外接电源")
         } else if stable_idle {
             (RuntimeMode::ForegroundIdle, "用户空闲并通过稳定等待")
         } else {
@@ -398,9 +413,11 @@ impl RuntimeManager {
 
         let refresh_mode = if !foreground {
             RefreshMode::Suspended
-        } else if external {
+        } else if external_realtime {
             RefreshMode::Realtime
         } else if attention_active {
+            RefreshMode::Normal
+        } else if external_prevents_idle {
             RefreshMode::Normal
         } else if stable_idle || (eligible_idle && protected) {
             RefreshMode::Throttled
@@ -576,11 +593,81 @@ mod tests {
     }
 
     #[test]
+    fn resumed_task_becomes_active_without_extending_protection() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig::default());
+        manager.codex_started("task");
+        let protected_until = manager.codex.borrow().as_ref().unwrap().protected_until;
+        manager.codex_finished("task", "1", ImportantEventKind::Failed);
+        manager.codex_started("task");
+
+        let codex = manager.codex.borrow();
+        let codex = codex.as_ref().unwrap();
+        assert!(codex.active);
+        assert!(codex.attention.is_none());
+        assert_eq!(codex.protected_until, protected_until);
+    }
+
+    #[test]
     fn important_events_are_deduplicated() {
         let _guard = GLIB_TEST_LOCK.lock().unwrap();
         let manager = RuntimeManager::new(RuntimeConfig::default());
         assert!(manager.codex_finished("task", "1", ImportantEventKind::Completed));
         assert!(!manager.codex_finished("task", "1", ImportantEventKind::Completed));
+    }
+
+    #[test]
+    fn waiting_agent_keeps_idle_overlay_disabled_until_protection_expires() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            codex_protection_minutes: 60,
+            ..RuntimeConfig::default()
+        });
+        manager.codex_started("task");
+        manager.codex_finished("task", "1", ImportantEventKind::WaitingInput);
+        manager.codex.borrow_mut().as_mut().unwrap().attention = None;
+        manager.recompute();
+
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundNormal);
+        assert!(matches!(
+            manager.snapshot().codex_phase,
+            CodexPhase::Protected { .. }
+        ));
+    }
+
+    #[test]
+    fn confirmation_agent_keeps_idle_overlay_disabled_until_protection_expires() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            codex_protection_minutes: 60,
+            ..RuntimeConfig::default()
+        });
+        manager.codex_started("task");
+        manager.codex_finished("task", "1", ImportantEventKind::ConfirmationRequired);
+        manager.codex.borrow_mut().as_mut().unwrap().attention = None;
+        manager.recompute();
+
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundNormal);
+    }
+
+    #[test]
+    fn completed_agent_releases_idle_overlay_after_attention() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            ..RuntimeConfig::default()
+        });
+        manager.codex_started("task");
+        manager.codex_finished("task", "1", ImportantEventKind::Completed);
+        manager.codex.borrow_mut().as_mut().unwrap().attention = None;
+        manager.recompute();
+
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundIdle);
     }
 
     #[test]
@@ -623,5 +710,69 @@ mod tests {
         manager.recompute();
         assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundNormal);
         assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Throttled);
+    }
+
+    #[test]
+    fn any_connected_external_power_enables_realtime() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        for verdict in [
+            PowerVerdict::ExternalUnstable,
+            PowerVerdict::ExternalInsufficient,
+        ] {
+            let manager = RuntimeManager::new(RuntimeConfig {
+                idle_timeout_seconds: 0,
+                idle_stability_seconds: 0,
+                ..RuntimeConfig::default()
+            });
+            manager.set_power(verdict, ThermalVerdict::Normal);
+            manager.recompute();
+            assert_eq!(manager.snapshot().mode, RuntimeMode::ExternalPowerRealtime);
+            assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Realtime);
+        }
+    }
+
+    #[test]
+    fn connected_external_power_stays_realtime_when_thermal_is_hot() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            ..RuntimeConfig::default()
+        });
+        manager.set_power(PowerVerdict::ExternalInsufficient, ThermalVerdict::Hot);
+        manager.recompute();
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ExternalPowerRealtime);
+        assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Realtime);
+    }
+
+    #[test]
+    fn preventing_idle_does_not_depend_on_external_realtime() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            external_realtime: false,
+            external_prevents_idle: true,
+            ..RuntimeConfig::default()
+        });
+        manager.set_power(PowerVerdict::ExternalSufficient, ThermalVerdict::Normal);
+        manager.recompute();
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundNormal);
+        assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Normal);
+    }
+
+    #[test]
+    fn connected_external_power_can_idle_without_disabling_realtime() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig {
+            idle_timeout_seconds: 0,
+            idle_stability_seconds: 0,
+            external_prevents_idle: false,
+            ..RuntimeConfig::default()
+        });
+        manager.set_power(PowerVerdict::ExternalUnstable, ThermalVerdict::Normal);
+        manager.recompute();
+        assert_eq!(manager.snapshot().mode, RuntimeMode::ForegroundIdle);
+        assert_eq!(manager.snapshot().refresh_mode, RefreshMode::Realtime);
     }
 }

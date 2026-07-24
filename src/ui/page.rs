@@ -20,6 +20,7 @@ pub struct Page {
     card_layout: CardLayout,
     normal_columns: u32,
     compact_grid: bool,
+    settings_page: bool,
     featured_area: gtk::Grid,
     featured_side: FlowBox,
     featured_companions: Vec<(gtk::Widget, i32)>,
@@ -40,14 +41,15 @@ struct PluginCardEntry {
 
 impl Page {
     pub fn new(page_id: &str, ui: &UiSection) -> Self {
+        let settings_page = page_id == "settings";
         let flow_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         flow_box.set_margin_top(4);
         flow_box.set_margin_bottom(4);
         flow_box.set_valign(Align::Fill);
         flow_box.set_vexpand(true);
 
-        let columns = if page_id == "settings" {
-            1
+        let columns = if settings_page {
+            ui.card_columns.clamp(1, 3)
         } else {
             ui.card_columns.max(1)
         };
@@ -64,6 +66,9 @@ impl Page {
         flow_box.append(&featured_area);
 
         let metric_flow = Self::create_flow(columns);
+        if settings_page {
+            metric_flow.set_min_children_per_line(1);
+        }
         flow_box.append(&metric_flow);
 
         let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
@@ -79,8 +84,12 @@ impl Page {
         let scroll = ScrolledWindow::new();
         scroll.set_vexpand(true);
         scroll.set_kinetic_scrolling(true);
-        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        scroll.set_propagate_natural_width(false);
+        if settings_page {
+            scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+            scroll.set_propagate_natural_width(false);
+            flow_box.set_hexpand(true);
+            metric_flow.set_hexpand(true);
+        }
         scroll.set_child(Some(&flow_box));
 
         let overlay = gtk::Overlay::new();
@@ -148,6 +157,7 @@ impl Page {
             },
             normal_columns: columns,
             compact_grid: false,
+            settings_page,
             featured_area,
             featured_side,
             featured_companions: Vec::new(),
@@ -169,7 +179,6 @@ impl Page {
         flow.set_margin_end(4);
         flow.set_valign(Align::Start);
         flow.set_vexpand(false);
-        flow.set_hexpand(true);
         flow
     }
 
@@ -342,10 +351,18 @@ impl Page {
             return;
         }
         self.compact_grid = compact;
-        let columns = if compact { 6 } else { self.normal_columns };
-        self.metric_flow.set_min_children_per_line(columns);
+        let columns = if self.settings_page {
+            self.normal_columns
+        } else if compact {
+            6
+        } else {
+            self.normal_columns
+        };
+        self.metric_flow
+            .set_min_children_per_line(if self.settings_page { 1 } else { columns });
         self.metric_flow.set_max_children_per_line(columns);
-        self.action_flow.set_min_children_per_line(columns);
+        self.action_flow
+            .set_min_children_per_line(if self.settings_page { 1 } else { columns });
         self.action_flow.set_max_children_per_line(columns);
         for card in self.metric_cards.values_mut() {
             card.set_compact(compact);

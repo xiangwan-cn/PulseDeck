@@ -20,7 +20,7 @@ impl BatteryCapacityMetric {
                     tooltip: Some(format!("读取电池状态失败: {}", e)),
                     state: MetricState::Unavailable,
                     cached: false,
-                    metadata: None,
+                    metadata: Some(serde_json::json!({ "value_level": "normal" })),
                 }
             }
         };
@@ -34,7 +34,29 @@ impl BatteryCapacityMetric {
             tooltip: Some(format!("电池电量: {:.0}% ({})", capacity, status_text)),
             state: MetricState::Normal,
             cached: false,
-            metadata: None,
+            metadata: Some(serde_json::json!({ "value_level": value_level(capacity) })),
         }
+    }
+}
+
+fn value_level(capacity: f64) -> &'static str {
+    if capacity >= 80.0 {
+        "good"
+    } else if capacity <= 20.0 {
+        "critical"
+    } else {
+        "normal"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_level;
+
+    #[test]
+    fn battery_capacity_uses_high_and_low_value_colors() {
+        assert_eq!(value_level(80.0), "good");
+        assert_eq!(value_level(50.0), "normal");
+        assert_eq!(value_level(20.0), "critical");
     }
 }

@@ -1,8 +1,8 @@
 # PetCard
 
 PetCard is an optional, compile-time PulseDeck card plugin. It displays Codex
-lifecycle state using cached image frames and performs no polling while
-offline.
+or OpenCode lifecycle state using cached image frames and performs no polling
+while offline.
 
 ## Build
 
@@ -66,6 +66,24 @@ $XDG_RUNTIME_DIR/pulsedeck/codex-pet.json
 Set `PULSEDECK_PET_STATE_FILE` for the hook and `state_file` in
 `[cards.plugin]` when a custom path is required.
 
+## OpenCode integration
+
+OpenCode can publish the same state protocol through the zero-dependency local
+plugin at `integrations/pulsedeck-pet/opencode/pulsedeck-pet.ts`. Install it to
+the global auto-discovery directory:
+
+```sh
+install -Dm600 integrations/pulsedeck-pet/opencode/pulsedeck-pet.ts \
+  "$HOME/.config/opencode/plugins/pulsedeck-pet.ts"
+```
+
+Quit and restart OpenCode after installation. The plugin maps lifecycle events
+to fixed PetCard states without reading prompts, commands, tool arguments, tool
+output, or real session identifiers. It writes atomically, uses event-driven
+rate-limited heartbeats, and starts no polling timer or helper process. Codex
+and OpenCode share one state file, so the most recent event wins when both are
+active.
+
 ## Runtime behavior
 
 - State updates use an atomic file replacement and a directory file monitor.
@@ -79,6 +97,9 @@ Set `PULSEDECK_PET_STATE_FILE` for the hook and `state_file` in
 - Offline and any single-frame state have no animation timer.
 - Stale state automatically returns to offline after
   `offline_after_seconds`.
+- A stale state only changes the card's visual state. It does not cancel an
+  already active agent's original one-hour idle-overlay protection; an explicit
+  terminal/offline event or the protection deadline controls that lifecycle.
 - After five continuous offline minutes, the card temporarily returns to one
   normal cell. The next active state restores the last user-selected size.
 - Size preference writes happen only when the user makes a selection and use

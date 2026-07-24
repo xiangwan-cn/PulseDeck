@@ -113,7 +113,7 @@ pub fn build(
         runtime: runtime_handle,
     });
     Runtime::setup_presentation_menu(&runtime);
-    runtime.set_state("offline", None);
+    runtime.set_state("offline", None, true);
     Runtime::watch_state_file(&runtime)?;
     Runtime::watch_runtime_mode(&runtime);
     Runtime::watch_mapping(&runtime);
@@ -230,7 +230,7 @@ impl Runtime {
 
     fn load_state(self: &Rc<Self>) {
         let Ok(data) = std::fs::read_to_string(&self.config.state_file) else {
-            self.set_state("offline", None);
+            self.set_state("offline", None, false);
             return;
         };
         let Ok(event) = serde_json::from_str::<StateEvent>(&data) else {
@@ -240,7 +240,7 @@ impl Runtime {
         let now = now_ms();
         let max_age = self.config.offline_after_seconds.saturating_mul(1000);
         if now.saturating_sub(event.timestamp_ms) >= max_age {
-            self.set_state("offline", None);
+            self.set_state("offline", None, false);
             return;
         }
         if let Some(source) = self.transition_source.borrow_mut().take() {
@@ -250,7 +250,7 @@ impl Runtime {
             .task_id
             .clone()
             .unwrap_or_else(|| format!("legacy-{}", event.timestamp_ms));
-        if is_working_state(&event.state) {
+        if is_active_agent_state(&event.state) {
             self.runtime.report_codex_started(task_id.clone());
         }
         if let Some(kind) = important_event_kind(&event.state) {
@@ -264,7 +264,11 @@ impl Runtime {
                 self.play_completion_sound();
             }
         }
-        self.set_state(&event.state, event.detail.as_deref());
+        self.set_state(
+            &event.state,
+            event.detail.as_deref(),
+            event.state == "offline",
+        );
         if event.state == "done" {
             self.schedule_ready(self.config.done_hold_seconds);
         }
@@ -279,7 +283,7 @@ impl Runtime {
         let source =
             glib::timeout_add_local_once(Duration::from_secs(delay_seconds.max(1)), move || {
                 if let Some(runtime) = weak.upgrade() {
-                    runtime.set_state("ready", None);
+                    runtime.set_state("ready", None, false);
                     runtime.transition_source.borrow_mut().take();
                 }
             });
@@ -294,17 +298,25 @@ impl Runtime {
         let source =
             glib::timeout_add_local_once(Duration::from_millis(delay_ms.max(1)), move || {
                 if let Some(runtime) = weak.upgrade() {
-                    runtime.set_state("offline", None);
+                    runtime.set_state("offline", None, false);
                     runtime.offline_source.borrow_mut().take();
                 }
             });
         self.offline_source.replace(Some(source));
     }
 
-    fn set_state(self: &Rc<Self>, requested: &str, detail: Option<&str>) {
+    fn set_state(
+        self: &Rc<Self>,
+        requested: &str,
+        detail: Option<&str>,
+        clear_agent_on_offline: bool,
+    ) {
         let state = normalize_state(requested);
         let previous_state = self.current_state.borrow().clone();
         if previous_state == state {
+            if state == "offline" && clear_agent_on_offline {
+                self.runtime.clear_codex();
+            }
             if let Some(detail) = detail {
                 self.status.set_text(detail);
             }
@@ -312,7 +324,9 @@ impl Runtime {
         }
         self.current_state.replace(state.to_string());
         if state == "offline" {
-            self.runtime.clear_codex();
+            if clear_agent_on_offline {
+                self.runtime.clear_codex();
+            }
             self.schedule_presentation_reset();
         } else {
             self.cancel_presentation_reset();
@@ -648,8 +662,11 @@ fn normalize_state(state: &str) -> &str {
     }
 }
 
-fn is_working_state(state: &str) -> bool {
-    matches!(state, "thinking" | "working" | "coding")
+fn is_active_agent_state(state: &str) -> bool {
+    matches!(
+        state,
+        "thinking" | "working" | "coding" | "waiting" | "confirm"
+    )
 }
 
 fn important_event_kind(state: &str) -> Option<ImportantEventKind> {
@@ -701,7 +718,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{completion_sound_argv, next_presentation, parse_presentation, presentation_name};
+    use super::{
+        completion_sound_argv, is_active_agent_state, next_presentation, parse_presentation,
+        presentation_name,
+    };
     use crate::plugins::CardPresentation;
 
     #[test]
@@ -736,6 +756,16 @@ mod tests {
     #[test]
     fn unknown_presentation_falls_back_to_normal() {
         assert_eq!(parse_presentation("future-mode"), CardPresentation::Normal);
+    }
+
+    #[test]
+    fn waiting_and_confirmation_are_active_agent_states() {
+        for state in ["thinking", "working", "coding", "waiting", "confirm"] {
+            assert!(is_active_agent_state(state));
+        }
+        for state in ["ready", "done", "error", "offline"] {
+            assert!(!is_active_agent_state(state));
+        }
     }
 
     #[test]

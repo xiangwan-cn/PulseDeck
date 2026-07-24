@@ -32,16 +32,7 @@ impl NetworkMetric {
             1 => ("未连接", StatusLevel::Critical),
             _ => ("未知", StatusLevel::Unknown),
         };
-        let value = CardValue::Status {
-            label: state_label.into(),
-            level,
-        };
-        let subtitle = match (connection_name.is_empty(), ip.is_empty()) {
-            (false, false) => Some(format!("{connection_name} · {ip}")),
-            (false, true) => Some(connection_name.clone()),
-            (true, false) => Some(ip.clone()),
-            (true, true) => None,
-        };
+        let (value, subtitle) = network_presentation(state_label, level, &connection_name, &ip);
         MetricResult {
             value,
             subtitle,
@@ -56,6 +47,29 @@ impl NetworkMetric {
             metadata: None,
         }
     }
+}
+
+fn network_presentation(
+    state_label: &str,
+    level: StatusLevel,
+    connection_name: &str,
+    ip: &str,
+) -> (CardValue, Option<String>) {
+    let value = CardValue::Status {
+        label: if ip.is_empty() { state_label } else { ip }.into(),
+        level: if ip.is_empty() {
+            level
+        } else {
+            StatusLevel::Normal
+        },
+    };
+    let subtitle = match (state_label.is_empty(), connection_name.is_empty()) {
+        (false, false) => Some(format!("{state_label} · {connection_name}")),
+        (false, true) => Some(state_label.into()),
+        (true, false) => Some(connection_name.into()),
+        (true, true) => None,
+    };
+    (value, subtitle)
 }
 
 fn network_manager_state(connection: &zbus::blocking::Connection) -> Option<(u32, String)> {
@@ -130,12 +144,39 @@ fn connectivity_label(value: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::connectivity_label;
+    use crate::model::card_model::{CardValue, StatusLevel};
+
+    use super::{connectivity_label, network_presentation};
 
     #[test]
     fn network_manager_connectivity_values_are_stable() {
         assert_eq!(connectivity_label(4), "full");
         assert_eq!(connectivity_label(2), "portal");
         assert_eq!(connectivity_label(1), "none");
+    }
+
+    #[test]
+    fn ip_is_the_primary_network_value() {
+        let (value, subtitle) =
+            network_presentation("已连接", StatusLevel::Good, "Home Wi-Fi", "192.168.1.8");
+
+        assert!(matches!(
+            value,
+            CardValue::Status { label, level }
+                if label == "192.168.1.8" && level == StatusLevel::Normal
+        ));
+        assert_eq!(subtitle.as_deref(), Some("已连接 · Home Wi-Fi"));
+    }
+
+    #[test]
+    fn network_state_remains_visible_without_an_ip() {
+        let (value, subtitle) = network_presentation("未连接", StatusLevel::Critical, "", "");
+
+        assert!(matches!(
+            value,
+            CardValue::Status { label, level }
+                if label == "未连接" && level == StatusLevel::Critical
+        ));
+        assert_eq!(subtitle.as_deref(), Some("未连接"));
     }
 }

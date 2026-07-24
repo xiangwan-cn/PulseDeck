@@ -2,7 +2,7 @@
 
 PulseDeck uses one core runtime manager for normal pages and every plugin. The
 manager owns foreground state, real user-idle time, bounded interactions,
-validated external power, thermal state, Codex task protection, and important
+external-power state, thermal diagnostics, agent task protection, and important
 event edges. Plugins consume its snapshot; they do not implement their own
 global power decisions.
 
@@ -11,15 +11,15 @@ global power decisions.
 The display mode priority is:
 
 1. background;
-2. stable external-power realtime;
-3. Codex important-event attention;
-4. Codex new-task brightness protection;
+2. connected external-power realtime;
+3. agent important-event attention;
+4. agent new-task brightness protection;
 5. stable user idle;
 6. foreground normal.
 
-Display and refresh are deliberately separate. Codex protection keeps normal
+Display and refresh are deliberately separate. Agent protection keeps normal
 brightness but ordinary cards may still use throttled refresh after the user
-idle threshold. Stable external power can select realtime refresh, while
+idle threshold. Connected external power can select realtime refresh, while
 high-cost command and HTTP cards remain at their original interval unless their
 card policy explicitly opts in.
 
@@ -80,22 +80,31 @@ than repeated `nmcli` subprocesses. Result comparison applies
 `minimum_change` to the stable primary value before derived subtitle/tooltip
 text. Persistent cache writes are content-deduplicated and rate-limited.
 Repeated identical errors are log-limited and a recovery event records return
-to health.
+to health. Initial synchronous card collection has four blocking workers. The
+CPU card takes one baseline sample and schedules a single 250 ms follow-up,
+then returns to its configured steady interval. A mapped window continues
+collecting even when it does not own keyboard focus; unmapping pauses ordinary
+work. If startup briefly transitions through suspended mode before the window
+maps, cards that have never collected retain an immediate first run, including
+event-driven file and network-status cards.
 
 ## External power
 
-The power monitor combines charger online state, battery status and trend,
-reported input power where available, battery/SoC temperature, and thermal
-pressure. Entry requires consecutive trustworthy samples; unplugging and
-negative/thermal samples downshift faster. A cable with continuing discharge,
-unknown/insufficient margin, or thermal pressure does not select realtime mode.
-PulseDeck never changes the CPU governor.
+The power monitor reads charger `online` state plus battery, input-power, and
+thermal diagnostics. Runtime policy deliberately uses only the online signal:
+when `external_realtime` is enabled, any detected external supply selects
+realtime mode even if charging is paused, the battery is full, input telemetry
+is zero or unknown, or the thermal verdict is elevated. When
+`external_prevents_idle` is enabled, the same online signal prevents foreground
+idle. PulseDeck never changes the CPU governor.
 
-## Codex lifecycle
+## Agent lifecycle
 
 A new task identifier creates one brightness-protection deadline. State
 heartbeats and progress do not extend it. After the deadline, normal idle rules
-apply. A terminal or user-attention event contains a separate event identifier:
+apply. Waiting for user input or confirmation keeps the task active under the
+same original protection deadline; it does not reset or extend that deadline.
+A terminal or user-attention event contains a separate event identifier:
 the first edge plays the configured sound, restores normal display/refresh, and
 starts the attention deadline. The same event cannot notify twice. State
 monitoring and sound remain available in the background; foreground takeover is
@@ -112,8 +121,8 @@ background, uses HTTP ETags, and avoids rebuilding unchanged textures.
 The authoritative examples are `config/config.example.toml` and
 `config/config.example.json`. Important defaults are: foreground inhibition
 enabled, idle power saving after 60 seconds plus 10 seconds stability, 15%
-application visual brightness, balanced refresh saving, external realtime with
-three stable entry samples/two exit samples, Codex brightness protection for 60
+application visual brightness, balanced refresh saving, external realtime when
+a supply reports `online=1`, agent brightness protection for 60
 minutes, and 15 seconds of attention after an important event.
 
 ## Measurement
@@ -126,7 +135,7 @@ adds no periodic sampling and is excluded from default builds.
 Validate on the target device with the same brightness and workload:
 
 1. record at least 10 minutes each for foreground normal, foreground idle,
-   background, stable external power, and long-running Codex;
+   background, connected external power, and a long-running agent task;
 2. compare battery energy/current and `powertop` wakeups, not only average CPU;
 3. verify process launches with `execsnoop`/audit tooling and traffic with
    interface counters;

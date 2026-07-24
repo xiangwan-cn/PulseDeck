@@ -289,6 +289,26 @@ impl MetricCard {
 
     pub fn clear_loading(&mut self) {}
 
+    pub fn set_value_level(&self, level: Option<&str>) {
+        let value = match &self.render_widgets {
+            RenderWidgets::Text(w) => &w.value,
+            RenderWidgets::Value(w) => &w.value,
+            RenderWidgets::Progress(w) => &w.value,
+            RenderWidgets::Status(w) => &w.value,
+            RenderWidgets::List(w) => &w.value,
+            RenderWidgets::Composite(_) | RenderWidgets::Action(_) => return,
+        };
+        value.remove_css_class("metric-value-good");
+        value.remove_css_class("metric-value-warning");
+        value.remove_css_class("metric-value-critical");
+        match level {
+            Some("good") => value.add_css_class("metric-value-good"),
+            Some("warning") => value.add_css_class("metric-value-warning"),
+            Some("critical") | Some("error") => value.add_css_class("metric-value-critical"),
+            _ => {}
+        }
+    }
+
     pub fn set_error(&mut self, msg: &str) {
         if let Some(ref mut model) = self.model {
             let mut m = model.clone();

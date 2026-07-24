@@ -45,7 +45,7 @@ const APP_CSS: &str = r#"
 .metric-value-placeholder { font-size: 11px; font-weight: 400; opacity: 0.3; }
 .metric-value-warning  { color: #e5a50a; }
 .metric-value-critical { color: #e01b24; }
-.metric-value-good     { color: #1a5fb4; }
+.metric-value-good     { color: #33d17a; }
 .metric-card.click-action-card { transition: background-color 120ms ease; }
 .metric-card.click-action-card:hover { background-color: alpha(@accent_bg_color, 0.12); }
 .metric-footer { font-size: 9px; opacity: 0.7; margin-top: 1px; }
@@ -88,6 +88,7 @@ struct MetricUpdate {
     page_id: String,
     result: MetricResult,
     interval_secs: u64,
+    next_delay: Option<Duration>,
 }
 
 struct ActionUpdate {
@@ -341,10 +342,14 @@ impl MonitorWindow {
         let application = app.clone();
         let inhibit_cookie: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
         let runtime = self.runtime.clone();
-        runtime.set_foreground(self.window.is_active());
-        self.window.connect_is_active_notify({
+        runtime.set_foreground(self.window.is_mapped());
+        self.window.connect_map({
             let runtime = runtime.clone();
-            move |window| runtime.set_foreground(window.is_active())
+            move |_| runtime.set_foreground(true)
+        });
+        self.window.connect_unmap({
+            let runtime = runtime.clone();
+            move |_| runtime.set_foreground(false)
         });
 
         let rx = runtime.subscribe();
@@ -525,6 +530,7 @@ impl MonitorWindow {
 
         self.pages.borrow_mut().clear();
         self.card_metas.borrow_mut().clear();
+        self.previous_results.borrow_mut().clear();
         self.builtin_metrics.lock().unwrap().clear();
         self.persistent_sources.lock().unwrap().clear();
 
@@ -897,13 +903,13 @@ impl MonitorWindow {
             ),
             (
                 "外接电源高实时",
-                "仅在供电稳定、没有掉电且温度正常时升档",
+                "检测到外接电源在线时立即升档",
                 runtime_cfg.external_realtime,
                 "external_realtime",
             ),
             (
                 "外接供电时禁止空闲",
-                "供电可信时保持正常亮度",
+                "检测到外接电源在线时保持正常亮度",
                 runtime_cfg.external_prevents_idle,
                 "external_prevents_idle",
             ),
@@ -1209,6 +1215,7 @@ impl MonitorWindow {
             let pages = self.pages.clone();
             let scheduler = self.scheduler.clone();
             let card_metas = self.card_metas.clone();
+            let previous_results = self.previous_results.clone();
             let scheduler_wake = self.scheduler_wake.clone();
             let current_page_id = self.current_page_id.clone();
             toggle.connect_active_notify(move |switch| {
@@ -1229,6 +1236,7 @@ impl MonitorWindow {
                     drop(config);
 
                     if switch.is_active() {
+                        previous_results.borrow_mut().remove(&card.id);
                         if let Some(page) = pages.borrow_mut().get_mut(&card.page) {
                             if !page.metric_cards.contains_key(&card.id) {
                                 let model = CardModel {
@@ -1274,6 +1282,7 @@ impl MonitorWindow {
                             }
                         }
                     } else if let Some(page) = pages.borrow_mut().get_mut(&card.page) {
+                        previous_results.borrow_mut().remove(&card.id);
                         if let Some(metric_card) = page.metric_cards.remove(&card.id) {
                             page.metric_flow.remove(&metric_card.card);
                         }
@@ -1524,6 +1533,9 @@ impl MonitorWindow {
                     let max_output = config.borrow().config().app.max_output_bytes;
 
                     let source = card_cfg.source.clone();
+                    let needs_initial_follow_up = source.as_ref().is_some_and(|source| {
+                        source.source_type == "builtin" && source.metric.as_deref() == Some("cpu")
+                    });
                     let cache_ttl = card_cfg.cache_ttl_seconds;
                     let schedule = card_cfg
                         .schedule
@@ -1537,6 +1549,7 @@ impl MonitorWindow {
                                 page_id: meta.page_id,
                                 result: MetricResult::error(error),
                                 interval_secs: meta.interval_secs,
+                                next_delay: None,
                             });
                             continue;
                         }
@@ -1556,6 +1569,7 @@ impl MonitorWindow {
                                 page_id: meta.page_id,
                                 result,
                                 interval_secs: schedule.next_delay_seconds,
+                                next_delay: None,
                             });
                             continue;
                         }
@@ -1565,6 +1579,7 @@ impl MonitorWindow {
                                 page_id: meta.page_id,
                                 result: MetricResult::unavailable("等待第一个计划更新时间"),
                                 interval_secs: schedule.next_delay_seconds,
+                                next_delay: None,
                             });
                             continue;
                         }
@@ -1576,6 +1591,7 @@ impl MonitorWindow {
                             page_id: meta.page_id,
                             result,
                             interval_secs: meta.interval_secs,
+                            next_delay: None,
                         });
                         continue;
                     }
@@ -1624,6 +1640,13 @@ impl MonitorWindow {
                         let _ = tx.try_send(MetricUpdate {
                             card_id,
                             page_id,
+                            next_delay: if needs_initial_follow_up
+                                && result.state == MetricState::Loading
+                            {
+                                Some(Duration::from_millis(250))
+                            } else {
+                                None
+                            },
                             result,
                             interval_secs: interval,
                         });
@@ -1699,10 +1722,11 @@ impl MonitorWindow {
                     // A persisted response (including a persisted API error) is a
                     // completed round and must not trigger short retry wakeups.
                     let success = update.result.cached || update.result.state != MetricState::Error;
-                    scheduler.borrow_mut().mark_done(
+                    scheduler.borrow_mut().mark_done_after(
                         &update.card_id,
                         update.interval_secs,
                         success,
+                        update.next_delay,
                     );
                     let _ = scheduler_wake.try_send(());
                 }
@@ -2177,6 +2201,14 @@ fn apply_metric_result(card: &mut crate::ui::metric_card::MetricCard, result: &M
     };
 
     card.set_model(&model);
+    if let Some(level) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("value_level"))
+        .and_then(serde_json::Value::as_str)
+    {
+        card.set_value_level(Some(level));
+    }
 }
 
 fn execute_action_async(

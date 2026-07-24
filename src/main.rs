@@ -20,7 +20,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .max_blocking_threads(2)
+        .max_blocking_threads(4)
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")

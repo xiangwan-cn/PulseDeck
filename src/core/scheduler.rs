@@ -179,7 +179,14 @@ impl Scheduler {
             }
             let interval = effective_interval(mode, runtime, self.idle_strength);
             runtime.generation += 1;
-            if let Some(interval) = interval {
+            if mode != RefreshMode::Suspended && runtime.last_started.is_none() {
+                runtime.next_run = now;
+                self.heap.push(Reverse(ScheduledTask {
+                    next_run: now,
+                    card_id: card_id.clone(),
+                    generation: runtime.generation,
+                }));
+            } else if let Some(interval) = interval {
                 let anchor = runtime.last_success.or(runtime.last_started).unwrap_or(now);
                 runtime.next_run = anchor + std::time::Duration::from_secs(interval);
                 if runtime.next_run < now {
@@ -374,6 +381,16 @@ impl Scheduler {
 
     #[allow(dead_code)]
     pub fn mark_done(&mut self, card_id: &str, interval_secs: u64, success: bool) {
+        self.mark_done_after(card_id, interval_secs, success, None);
+    }
+
+    pub fn mark_done_after(
+        &mut self,
+        card_id: &str,
+        interval_secs: u64,
+        success: bool,
+        next_delay: Option<std::time::Duration>,
+    ) {
         if let Some(rt) = self.runtimes.get_mut(card_id) {
             rt.running = false;
             if success {
@@ -398,7 +415,8 @@ impl Scheduler {
                     .saturating_mul(2u64.pow(rt.failure_count.min(6)))
                     .min(policy_interval.saturating_mul(64).max(120))
             };
-            rt.next_run = Instant::now() + std::time::Duration::from_secs(backoff);
+            rt.next_run = Instant::now()
+                + next_delay.unwrap_or_else(|| std::time::Duration::from_secs(backoff));
             rt.generation += 1;
             self.heap.push(Reverse(ScheduledTask {
                 next_run: rt.next_run,
@@ -532,5 +550,78 @@ mod tests {
         scheduler.mark_done("card", 5, true);
         scheduler.set_refresh_mode(RefreshMode::Suspended);
         assert!(scheduler.next_task().is_none());
+    }
+
+    #[test]
+    fn one_time_follow_up_does_not_change_the_base_interval() {
+        let mut scheduler = Scheduler::new();
+        scheduler.register("card", 5, "monitor");
+        scheduler.poll();
+        scheduler.mark_started("card");
+        scheduler.mark_done_after("card", 5, true, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(scheduler.runtimes["card"].base_interval_secs, 5);
+        assert!(
+            scheduler.runtimes["card"].next_run
+                < Instant::now() + std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn first_collection_runs_immediately_after_window_resumes() {
+        for mode in [RefreshMode::Normal, RefreshMode::Realtime] {
+            let mut scheduler = Scheduler::new();
+            scheduler.register("card", 60, "monitor");
+            scheduler.set_active_page("monitor");
+            scheduler.set_window_active(false);
+            scheduler.set_refresh_mode(RefreshMode::Suspended);
+            assert!(scheduler.next_task().is_none());
+
+            scheduler.set_window_active(true);
+            scheduler.set_refresh_mode(mode);
+            assert_eq!(scheduler.poll(), vec!["card"]);
+        }
+    }
+
+    #[test]
+    fn event_driven_cards_keep_their_first_collection_after_resume() {
+        for class in [TaskClass::File, TaskClass::NetworkStatus] {
+            let mut scheduler = Scheduler::new();
+            scheduler.register_with_policy(
+                "card",
+                60,
+                "monitor",
+                TaskPolicy {
+                    class,
+                    ..TaskPolicy::default()
+                },
+            );
+            scheduler.set_active_page("monitor");
+            scheduler.set_window_active(false);
+            scheduler.set_refresh_mode(RefreshMode::Suspended);
+            scheduler.set_window_active(true);
+            scheduler.set_refresh_mode(RefreshMode::Normal);
+            assert_eq!(scheduler.poll(), vec!["card"]);
+
+            scheduler.mark_started("card");
+            scheduler.mark_done("card", 60, true);
+            assert!(scheduler.next_task().is_none());
+        }
+    }
+
+    #[test]
+    fn completed_collection_keeps_its_interval_after_resume() {
+        let mut scheduler = Scheduler::new();
+        scheduler.register("card", 60, "monitor");
+        assert_eq!(scheduler.poll(), vec!["card"]);
+        scheduler.mark_started("card");
+        scheduler.mark_done("card", 60, true);
+
+        scheduler.set_window_active(false);
+        scheduler.set_refresh_mode(RefreshMode::Suspended);
+        scheduler.set_window_active(true);
+        scheduler.set_refresh_mode(RefreshMode::Normal);
+
+        assert!(scheduler.poll().is_empty());
+        assert!(scheduler.next_task().is_some());
     }
 }
