@@ -7,6 +7,11 @@ Linux phones, tablets, and desktops. Pages, metric cards, refresh schedules,
 parsers, and actions are described in TOML or JSON, so most dashboard changes
 do not require recompiling the application.
 
+![PulseDeck default dashboard](docs/images/pulsedeck-default.png)
+
+_Default build with no optional Cargo features in dark mode: normal layout
+(left) and compact layout (right)._
+
 ## Features
 
 - Native CPU, memory, battery, power, network, uptime, filesystem, process,
@@ -25,9 +30,47 @@ do not require recompiling the application.
 - Bounded subprocess output, HTTP response size, and execution time.
 - Optional, separately compiled ScrcpyForge device-control page.
 - Optional, separately compiled event-driven Codex/OpenCode/pi PetCard with
-  animated status, remembered sizing, and a completion sound.
-- A remembered toolbar toggle between the normal grid and a compact six-column
-  layout.
+  animated lifecycle states, remembered presentation, and completion sound.
+- A page-wide toolbar toggle between the configured normal grid and a compact
+  six-column grid, with the last choice remembered across launches.
+
+## Runtime and low-power modes
+
+PulseDeck has one event-driven runtime manager shared by ordinary cards and
+optional plugins. Only real input such as a click, touch, key press, scroll,
+page change, or manual refresh resets user-idle time; automatic refreshes,
+animations, file events, and network responses do not.
+When conditions overlap, priority is background, external power, important
+agent attention, new-task protection, stable idle, then foreground normal.
+
+| Mode | Entry condition | Display and work policy |
+| --- | --- | --- |
+| Foreground normal | The window is mapped and no higher-priority mode applies. | Uses configured card schedules, normal animation rates, and full plugin presentation. |
+| Idle power saving | No real input for `idle_timeout_seconds`, followed by `idle_stability_seconds`. | Throttles refresh by card cost, reduces PetCard to 1 FPS, and lets ScrcpyForge request metadata without preview frames. The `dim` or OLED-friendly `minimal` overlay affects PulseDeck only; it never changes system brightness. |
+| External-power realtime | A power supply reports online and `external_realtime` is enabled. | Eligible cards may refresh faster and external power may prevent idle. Command and HTTP cards keep their original interval unless their card policy explicitly opts in. PulseDeck never changes the CPU governor. |
+| Agent protection / attention | A new agent task starts, or a distinct completion, failure, cancellation, waiting-input, confirmation, or abort event arrives. | A new task keeps normal visual brightness for its original protection deadline; waiting does not extend it. An important event may play one sound and restore the normal display/refresh policy for the configured attention window. |
+| Background | The application window is unmapped. | Releases the screen inhibitor, pauses ordinary card work, removes PetCard frame timers, and stops ScrcpyForge preview work. Fixed lifecycle monitoring and configured notifications remain available. |
+
+Warm or hotter thermal diagnostics reduce expensive plugin presentation work
+without changing the external-power verdict: ScrcpyForge slows preview/health
+updates, while hot or throttled states freeze PetCard on its current frame.
+Any real input restores the foreground UI immediately.
+
+## Page layout modes
+
+The grid button at the right of the page toolbar controls the generic
+metric/action card layout:
+
+| Layout | Behavior |
+| --- | --- |
+| Normal | Uses `[ui].card_columns` (three by default) plus the configured global and per-card dimensions. |
+| Compact | Reflows metric and action cards into six columns and uses denser padding, typography, and controls. |
+
+This toolbar choice is stored under
+`${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/compact-grid` and restored on
+the next launch. It is a page-grid preference, not a PetCard presentation
+choice. Switching it immediately reflows an enlarged PetCard, whose own
+normal/four-cell/six-cell/fullscreen preference is described below.
 
 ## Requirements
 
@@ -87,9 +130,10 @@ are documented in [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md).
 The top-level sections are:
 
 - `[app]`: title, logging, output limits, and config reload.
-- `[runtime]`: foreground inhibition, idle display, refresh policy, external
-  power policy, and agent protection/notification policy.
-- `[ui]`: default page, columns, card dimensions, and compact layout.
+- `[runtime]`: foreground inhibition, low-power display/refresh policy,
+  external-power behavior, and agent protection/notification policy.
+- `[ui]`: default page plus normal-grid columns and card dimensions; the live
+  normal/compact toolbar choice is stored separately as UI state.
 - `[[pages]]`: ordered navigation pages.
 - `[[cards]]`: rendered values supplied by a configurable source.
 - `[[actions]]`: explicit user-triggered commands with optional confirmation.
@@ -136,9 +180,17 @@ feature and append the generic configuration from
 `src/plugins/scrcpy_forge/config.example.toml` to your local TOML file. It
 connects to a separately installed ScrcpyForge daemon; PulseDeck does not own
 ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable.
-Its preview and health loops consume the shared runtime mode: hidden/background
-pages stop preview work, idle mode requests metadata only, and unchanged images
-reuse an ETag/hash cache.
+Its preview and health loops consume the shared runtime mode:
+
+- Foreground normal mode uses the configured preview interval.
+- Idle mode keeps lightweight device/script metadata but omits preview frames.
+- Hidden pages and background mode stop preview work instead of polling.
+- Thermal pressure reduces preview/health frequency, while unchanged frames
+  reuse an ETag/content-hash cache.
+
+ScrcpyForge (SF) is a multi-device Android automation project built around ADB
+and scrcpy, with device control, previews, and script automation. See the
+[ScrcpyForge project](https://github.com/xiangwan-cn/ScrcpyForge) for details.
 
 ## Optional Codex/OpenCode/pi PetCard
 
@@ -146,12 +198,43 @@ The `pet-card` feature adds a generic plugin card without adding agent-specific
 state or timers to the core. The separately installable Codex hook, OpenCode
 plugin, and pi extension under `integrations/pulsedeck-pet` publish fixed
 lifecycle states through an atomic runtime file and never read prompt, message,
-or tool contents. Active tasks keep
-the foreground out of the idle overlay for their original protection period,
-including while waiting for input or confirmation. Offline mode is static,
-animations stop while unmapped or in the background, and the global runtime
-setting controls completion sound. See
-[docs/PET_CARD.md](docs/PET_CARD.md).
+or tool contents.
+
+PetCard-only presentation behavior:
+
+- Double-click cycles through normal, four-cell, six-cell, and fullscreen
+  presentation; long-press opens a menu for direct selection.
+
+| PetCard presentation | Behavior |
+| --- | --- |
+| Normal | Keeps PetCard in its original single FlowBox cell. |
+| Four cells | Places PetCard across the left two columns and two logical rows; remaining cards fill the columns beside it. |
+| Six cells | Places PetCard across the left two columns and three logical rows. |
+| Fullscreen | Fills the current page below the toolbar; `Escape` or the restore button returns to the grid. |
+
+- A manual choice is saved outside `config.toml` at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/pet-card-presentation`.
+  Any later active state, including `thinking`, `working`, `coding`, or
+  `waiting`, restores that last choice automatically.
+- After continuous offline time reaches
+  `offline_normal_after_seconds` (five minutes by default), PetCard temporarily
+  returns to one normal cell. Offline fallback does not overwrite the saved
+  choice, so the next active state expands it again.
+- Four/six-cell presentation follows the current three- or six-column page
+  grid, so changing the toolbar layout immediately reflows the surrounding
+  cards.
+
+PetCard is also mode-aware: active tasks use the configured animation rate
+(capped at 12 FPS), idle mode uses 1 FPS, hidden/background cards remove their
+frame timer, and offline/single-frame states have no animation timer. Agent
+tasks retain only their original brightness-protection deadline, including
+while waiting for input or confirmation. Completion sound is controlled by the
+global runtime setting. See [docs/PET_CARD.md](docs/PET_CARD.md).
+
+![PetCard working in quad presentation](docs/images/pulsedeck-petcard-working.png)
+
+_A complete dark dashboard with PetCard in the working state and four-cell
+presentation._
 
 ## Project layout
 
