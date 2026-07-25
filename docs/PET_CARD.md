@@ -140,8 +140,10 @@ modes. Long-press it to choose a specific mode directly:
 The four/six-cell calculation follows the current page grid. In the normal
 three-column layout, remaining cards fill the right column. In compact
 six-column mode, PetCard still spans only the left two columns and remaining
-cards fill the other four. Changing the toolbar grid mode immediately reflows
-an enlarged PetCard.
+cards fill the other four. Both layouts derive three row heights from the
+currently visible page, so the enlarged PetCard and its companion cards fill
+the same 3×3 or 6×3 viewport. Changing the toolbar grid mode immediately
+reflows an enlarged PetCard.
 
 Use the restore button or `Escape` to leave fullscreen. Presentation preference
 is persisted outside `config.toml`. Offline fallback does not overwrite that

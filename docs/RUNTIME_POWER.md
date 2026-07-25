@@ -105,6 +105,14 @@ is zero or unknown, or the thermal verdict is elevated. When
 `external_prevents_idle` is enabled, the same online signal prevents foreground
 idle. PulseDeck never changes the CPU governor.
 
+On systems with UPower, `PropertiesChanged` signals trigger an immediate sysfs
+resample, so plugging or unplugging does not wait for the periodic fallback.
+The sysfs directory monitor remains useful for supply add/remove events. While
+a supply is online, fallback sampling is capped at five seconds for systems
+without usable UPower signals; battery-only idle/background sampling remains
+slow to avoid unnecessary wakeups. A confirmed `online=0` edge leaves external
+mode immediately without exit hysteresis.
+
 Thermal diagnostics do not change the external-power verdict. They separately
 reduce expensive presentation work: warm or hotter states slow ScrcpyForge
 preview/health intervals, while hot or throttled states freeze PetCard on its

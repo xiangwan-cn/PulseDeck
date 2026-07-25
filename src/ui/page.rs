@@ -8,6 +8,10 @@ use crate::ui::action_card::ActionCard;
 use crate::ui::metric_card::CardLayout;
 use crate::ui::metric_card::MetricCard;
 
+const GRID_ROWS: i32 = 3;
+const FLOW_VERTICAL_MARGIN: i32 = 8;
+const FLOW_ROW_SPACING: i32 = 6;
+
 pub struct Page {
     pub container: gtk::Overlay,
     pub metric_flow: FlowBox,
@@ -18,6 +22,8 @@ pub struct Page {
     pub has_metrics: bool,
     pub has_actions: bool,
     card_layout: CardLayout,
+    available_height: i32,
+    metric_min_heights: std::collections::HashMap<String, i32>,
     normal_columns: u32,
     compact_grid: bool,
     settings_page: bool,
@@ -32,6 +38,7 @@ pub struct Page {
 struct PluginCardEntry {
     widget: gtk::Widget,
     normal_width: Option<i32>,
+    minimum_height: i32,
     normal_height: i32,
     fixed: bool,
     flow_position: i32,
@@ -42,7 +49,7 @@ struct PluginCardEntry {
 impl Page {
     pub fn new(page_id: &str, ui: &UiSection) -> Self {
         let settings_page = page_id == "settings";
-        let flow_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let flow_box = gtk::Box::new(gtk::Orientation::Vertical, FLOW_ROW_SPACING);
         flow_box.set_margin_top(4);
         flow_box.set_margin_bottom(4);
         flow_box.set_valign(Align::Fill);
@@ -66,6 +73,7 @@ impl Page {
         flow_box.append(&featured_area);
 
         let metric_flow = Self::create_flow(columns);
+        metric_flow.set_visible(false);
         if settings_page {
             metric_flow.set_min_children_per_line(1);
         }
@@ -75,7 +83,11 @@ impl Page {
         sep.set_visible(false);
         flow_box.append(&sep);
 
-        let action_flow = Self::create_flow(3);
+        let action_flow = Self::create_flow(columns);
+        action_flow.set_visible(false);
+        if settings_page {
+            action_flow.set_min_children_per_line(1);
+        }
         // An empty action section must not consume half of the vertical space on
         // metric-only pages; otherwise the third metric row becomes scrollable.
         action_flow.set_vexpand(false);
@@ -155,6 +167,8 @@ impl Page {
                 height: ui.card_height.max(1),
                 fixed: ui.fixed_card_size,
             },
+            available_height: 0,
+            metric_min_heights: std::collections::HashMap::new(),
             normal_columns: columns,
             compact_grid: false,
             settings_page,
@@ -177,20 +191,22 @@ impl Page {
         flow.set_selection_mode(gtk::SelectionMode::None);
         flow.set_margin_start(4);
         flow.set_margin_end(4);
+        flow.add_css_class("pulsedeck-flow");
         flow.set_valign(Align::Start);
         flow.set_vexpand(false);
         flow
     }
 
     pub fn add_metric_card(&mut self, model: &CardModel, display: Option<&DisplayConfig>) {
+        let minimum_height = display
+            .and_then(|d| d.card_height)
+            .unwrap_or(self.card_layout.height)
+            .max(1);
         let layout = CardLayout {
             width: display
                 .and_then(|d| d.card_width)
                 .or(self.card_layout.width),
-            height: display
-                .and_then(|d| d.card_height)
-                .unwrap_or(self.card_layout.height)
-                .max(1),
+            height: self.fitted_card_height().max(minimum_height),
             fixed: display
                 .and_then(|d| d.fixed_size)
                 .unwrap_or(self.card_layout.fixed),
@@ -198,6 +214,9 @@ impl Page {
         let mut card = MetricCard::new(model, layout);
         card.set_compact(self.compact_grid);
         self.metric_flow.append(&card.card);
+        self.metric_flow.set_visible(true);
+        self.metric_min_heights
+            .insert(model.id.clone(), minimum_height);
         self.metric_cards.insert(model.id.clone(), card);
         self.has_metrics = true;
     }
@@ -212,22 +231,20 @@ impl Page {
         let width = display
             .and_then(|value| value.card_width)
             .or(self.card_layout.width);
-        let height = display
+        let minimum_height = display
             .and_then(|value| value.card_height)
             .unwrap_or(self.card_layout.height)
             .max(1);
+        let height = self.fitted_card_height().max(minimum_height);
         let fixed = display
             .and_then(|value| value.fixed_size)
             .unwrap_or(self.card_layout.fixed);
-        if fixed {
-            widget.set_size_request(width.unwrap_or(-1), height);
-        } else if let Some(width) = width {
-            widget.set_size_request(width, -1);
-        }
+        widget.set_size_request(width.unwrap_or(-1), height);
         if self.compact_grid {
             widget.add_css_class("compact-card");
         }
         self.metric_flow.append(widget);
+        self.metric_flow.set_visible(true);
         let flow_position = self.metric_flow.child_at_index(0).map_or(0, |_| {
             self.metric_flow
                 .observe_children()
@@ -239,6 +256,7 @@ impl Page {
             PluginCardEntry {
                 widget: widget.clone(),
                 normal_width: width,
+                minimum_height,
                 normal_height: height,
                 fixed,
                 flow_position,
@@ -342,6 +360,7 @@ impl Page {
                 self.fullscreen_area.set_visible(true);
             }
         }
+        self.sync_flow_visibility();
         entry.presentation = presentation;
         self.plugin_cards.insert(card_id.to_string(), entry);
     }
@@ -381,6 +400,7 @@ impl Page {
                 card.card.remove_css_class("compact-card");
             }
         }
+        self.apply_card_heights();
         let featured = self
             .plugin_cards
             .iter()
@@ -405,6 +425,63 @@ impl Page {
             self.metric_flow.insert(&widget, position);
         }
         self.featured_area.set_visible(false);
+        self.sync_flow_visibility();
+    }
+
+    fn sync_flow_visibility(&self) {
+        self.metric_flow
+            .set_visible(self.metric_flow.observe_children().n_items() > 0);
+        self.action_flow
+            .set_visible(self.action_flow.observe_children().n_items() > 0);
+    }
+
+    pub fn set_available_height(&mut self, height: i32) {
+        let height = height.max(0);
+        if self.available_height == height {
+            return;
+        }
+        self.available_height = height;
+        self.apply_card_heights();
+    }
+
+    fn fitted_card_height(&self) -> i32 {
+        if self.settings_page {
+            return self.card_layout.height;
+        }
+        adaptive_card_height(self.available_height, self.card_layout.height)
+    }
+
+    fn apply_card_heights(&mut self) {
+        let fitted = self.fitted_card_height();
+        for (id, card) in &self.metric_cards {
+            let height = fitted.max(
+                self.metric_min_heights
+                    .get(id)
+                    .copied()
+                    .unwrap_or(self.card_layout.height),
+            );
+            card.card
+                .set_size_request(card.card.width_request(), height);
+        }
+        for card in self.action_cards.values() {
+            card.card.set_size_request(-1, fitted);
+        }
+        for entry in self.plugin_cards.values_mut() {
+            entry.normal_height = fitted.max(entry.minimum_height);
+            match entry.presentation {
+                CardPresentation::Normal => entry
+                    .widget
+                    .set_size_request(entry.normal_width.unwrap_or(-1), entry.normal_height),
+                CardPresentation::Quad => entry
+                    .widget
+                    .set_size_request(-1, entry.normal_height.saturating_mul(2) + FLOW_ROW_SPACING),
+                CardPresentation::Expanded => entry.widget.set_size_request(
+                    -1,
+                    entry.normal_height.saturating_mul(3) + FLOW_ROW_SPACING * 2,
+                ),
+                CardPresentation::Fullscreen => {}
+            }
+        }
     }
 
     pub fn add_action_card(
@@ -432,16 +509,19 @@ impl Page {
             on_dialog_open,
             on_dialog_response,
         );
+        card.card.set_size_request(-1, self.fitted_card_height());
         if self.compact_grid {
             card.card.add_css_class("compact-card");
         }
         self.action_flow.append(&card.card);
+        self.action_flow.set_visible(true);
         self.action_cards.insert(action_id.to_string(), card);
         self.has_actions = true;
     }
 
     pub fn flow_insert(&self, widget: &impl IsA<gtk::Widget>) {
         self.metric_flow.append(widget);
+        self.metric_flow.set_visible(true);
     }
 
     pub fn get_metric_card(&mut self, card_id: &str) -> Option<&mut MetricCard> {
@@ -451,6 +531,17 @@ impl Page {
     pub fn get_action_card(&mut self, card_id: &str) -> Option<&mut ActionCard> {
         self.action_cards.get_mut(card_id)
     }
+}
+
+fn adaptive_card_height(available_height: i32, minimum_height: i32) -> i32 {
+    if available_height <= 0 {
+        return minimum_height.max(1);
+    }
+    let spacing = FLOW_ROW_SPACING * (GRID_ROWS - 1);
+    let usable = available_height
+        .saturating_sub(FLOW_VERTICAL_MARGIN)
+        .saturating_sub(spacing);
+    (usable / GRID_ROWS).max(minimum_height.max(1))
 }
 
 fn flow_position(widget: &gtk::Widget) -> Option<i32> {
@@ -492,5 +583,23 @@ fn detach_widget(widget: &gtk::Widget) {
         grid.remove(widget);
     } else {
         widget.unparent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adaptive_card_height;
+
+    #[test]
+    fn adaptive_height_fills_three_visible_rows() {
+        let height = adaptive_card_height(668, 133);
+        assert_eq!(height, 216);
+        assert_eq!(height * 3 + 8 + 6 * 2, 668);
+    }
+
+    #[test]
+    fn adaptive_height_preserves_configured_minimum() {
+        assert_eq!(adaptive_card_height(360, 133), 133);
+        assert_eq!(adaptive_card_height(0, 160), 160);
     }
 }

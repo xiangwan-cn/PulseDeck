@@ -28,6 +28,7 @@ const APP_CSS: &str = r#"
 .tab-bar-area { padding: 5px 6px; }
 .tab-bar-area tab { border-radius: 10px; min-height: 32px; font-size: 13px; }
 .compact-grid-button { min-width: 32px; min-height: 32px; padding: 0; }
+.pulsedeck-flow > flowboxchild { padding: 0; }
 .pulsedeck-card { padding: 10px 8px 8px; border-radius: 14px; border: 1px solid alpha(currentColor, 0.12); background: alpha(currentColor, 0.035); box-shadow: 0 2px 8px alpha(black, 0.08); }
 .metric-card { }
 .accent-blue   { border-left: 2px solid #3584e4; }
@@ -327,6 +328,7 @@ impl MonitorWindow {
         };
 
         win.setup_pages();
+        win.setup_adaptive_layout();
         win.setup_screen_inhibit(app);
         win.setup_lifecycle();
         win.setup_config_monitor();
@@ -555,6 +557,7 @@ impl MonitorWindow {
             }
             let ui = self.config.borrow().config().ui.clone();
             let mut page = Page::new(&page_cfg.id, &ui);
+            page.set_available_height(self.view_stack.height());
             page.set_compact_grid(self.compact_grid.get());
             self.populate_page(&mut page, &page_cfg.id, &cards, &actions);
 
@@ -578,6 +581,38 @@ impl MonitorWindow {
         self.scheduler
             .borrow_mut()
             .set_active_page(&self.current_page_id.borrow());
+    }
+
+    fn setup_adaptive_layout(&self) {
+        let pages = self.pages.clone();
+        let stack = self.view_stack.clone();
+        let update_pending = Rc::new(Cell::new(false));
+        let schedule_update: Rc<dyn Fn()> = Rc::new(move || {
+            if update_pending.replace(true) {
+                return;
+            }
+            let pages = pages.clone();
+            let stack = stack.clone();
+            let update_pending = update_pending.clone();
+            glib::idle_add_local_once(move || {
+                update_pending.set(false);
+                let height = stack.height();
+                for page in pages.borrow_mut().values_mut() {
+                    page.set_available_height(height);
+                }
+            });
+        });
+        self.window.connect_map({
+            let schedule_update = schedule_update.clone();
+            move |_| schedule_update()
+        });
+        self.window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            let schedule_update = schedule_update.clone();
+            surface.connect_height_notify(move |_| schedule_update());
+        });
     }
 
     fn setup_file_monitors(&self, cards: &[CardConfig]) {

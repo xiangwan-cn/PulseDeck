@@ -27,9 +27,9 @@ idle_display = "dim"
 [ui]
 default_page = "monitor"
 compact = true
-# 默认 3 列 x 3 行；宽度留空时每行等分，横屏九张卡片保持现有铺满效果。
+# 普通模式 3 列 x 3 行、紧凑模式 6 列 x 3 行；宽度等分，高度按可见区自适应。
 card_columns = 3
-card_height = 133
+card_height = 133 # 自适应卡高的下限
 fixed_card_size = true
 # card_width = 180
 

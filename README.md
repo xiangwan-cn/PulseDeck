@@ -63,14 +63,16 @@ metric/action card layout:
 
 | Layout | Behavior |
 | --- | --- |
-| Normal | Uses `[ui].card_columns` (three by default) plus the configured global and per-card dimensions. |
-| Compact | Reflows metric and action cards into six columns and uses denser padding, typography, and controls. |
+| Normal | Uses `[ui].card_columns` (three by default). Card widths share the row and card heights adapt to fit three rows in the visible page. |
+| Compact | Reflows metric and action cards into six columns while retaining three fitted rows, with denser padding, typography, and controls. |
 
 This toolbar choice is stored under
 `${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/compact-grid` and restored on
 the next launch. It is a page-grid preference, not a PetCard presentation
 choice. Switching it immediately reflows an enlarged PetCard, whose own
-normal/four-cell/six-cell/fullscreen preference is described below.
+normal/four-cell/six-cell/fullscreen preference is described below. Global and
+per-card `card_height` values remain minimum heights for small windows or
+deliberately taller cards; explicit widths remain supported.
 
 ## Requirements
 

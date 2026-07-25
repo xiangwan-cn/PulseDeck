@@ -13,6 +13,8 @@ pub struct PowerSupplyMonitor {
     thermal_root: PathBuf,
     source: RefCell<Option<glib::SourceId>>,
     monitor: RefCell<Option<gio::FileMonitor>>,
+    upower_connection: RefCell<Option<gio::DBusConnection>>,
+    upower_subscription: RefCell<Option<gio::SignalSubscriptionId>>,
     positive: Cell<u32>,
     negative: Cell<u32>,
     active: Cell<bool>,
@@ -27,12 +29,15 @@ impl PowerSupplyMonitor {
             thermal_root,
             source: RefCell::new(None),
             monitor: RefCell::new(None),
+            upower_connection: RefCell::new(None),
+            upower_subscription: RefCell::new(None),
             positive: Cell::new(0),
             negative: Cell::new(0),
             active: Cell::new(false),
             last_energy: Cell::new(None),
         });
         Self::install_monitor(&this);
+        Self::install_upower_monitor(&this);
         Self::sample_and_schedule(&this);
         this
     }
@@ -50,6 +55,29 @@ impl PowerSupplyMonitor {
             }
         });
         this.monitor.replace(Some(monitor));
+    }
+
+    fn install_upower_monitor(this: &Rc<Self>) {
+        let Ok(connection) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) else {
+            tracing::debug!("UPower system bus unavailable; using sysfs fallback sampling");
+            return;
+        };
+        let weak = Rc::downgrade(this);
+        let subscription = connection.signal_subscribe(
+            Some("org.freedesktop.UPower"),
+            Some("org.freedesktop.DBus.Properties"),
+            Some("PropertiesChanged"),
+            None,
+            Some("org.freedesktop.UPower.Device"),
+            gio::DBusSignalFlags::NONE,
+            move |_, _, _, _, _, _| {
+                if let Some(this) = weak.upgrade() {
+                    Self::sample_and_schedule(&this);
+                }
+            },
+        );
+        this.upower_subscription.replace(Some(subscription));
+        this.upower_connection.replace(Some(connection));
     }
 
     fn sample_and_schedule(this: &Rc<Self>) {
@@ -100,12 +128,7 @@ impl PowerSupplyMonitor {
         };
         this.runtime.set_power(verdict, thermal);
 
-        let seconds = match this.runtime.snapshot().mode {
-            RuntimeMode::Background | RuntimeMode::ForegroundIdle => {
-                cfg.external_sample_seconds.max(10).saturating_mul(3)
-            }
-            _ => cfg.external_sample_seconds.max(5),
-        };
+        let seconds = fallback_sample_seconds(sample.online, this.runtime.snapshot().mode, &cfg);
         let weak = Rc::downgrade(this);
         let source = glib::timeout_add_local_once(Duration::from_secs(seconds), move || {
             if let Some(this) = weak.upgrade() {
@@ -157,7 +180,34 @@ impl Drop for PowerSupplyMonitor {
         if let Some(source) = self.source.borrow_mut().take() {
             source.remove();
         }
+        if let (Some(connection), Some(subscription)) = (
+            self.upower_connection.borrow().as_ref(),
+            self.upower_subscription.borrow_mut().take(),
+        ) {
+            connection.signal_unsubscribe(subscription);
+        }
+        self.upower_connection.borrow_mut().take();
         self.monitor.borrow_mut().take();
+    }
+}
+
+fn fallback_sample_seconds(
+    online: bool,
+    mode: RuntimeMode,
+    cfg: &crate::core::config::RuntimeConfig,
+) -> u64 {
+    if online {
+        // UPower normally reports the edge immediately. Keep a short fallback
+        // while externally powered for systems that do not expose UPower or
+        // whose sysfs attributes do not generate file-monitor events.
+        cfg.external_sample_seconds.clamp(1, 5)
+    } else {
+        match mode {
+            RuntimeMode::Background | RuntimeMode::ForegroundIdle => {
+                cfg.external_sample_seconds.max(10).saturating_mul(3)
+            }
+            _ => cfg.external_sample_seconds.max(5),
+        }
     }
 }
 
@@ -319,7 +369,9 @@ fn normalize_temp(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_hysteresis, normalize_temp, HysteresisState};
+    use super::{advance_hysteresis, fallback_sample_seconds, normalize_temp, HysteresisState};
+    use crate::core::config::RuntimeConfig;
+    use crate::core::runtime::RuntimeMode;
 
     #[test]
     fn external_power_enters_slowly_and_exits_faster() {
@@ -356,6 +408,22 @@ mod tests {
         );
         assert!(!state.active);
         assert_eq!(state.positive, 0);
+    }
+
+    #[test]
+    fn online_fallback_is_fast_even_when_backgrounded() {
+        let cfg = RuntimeConfig {
+            external_sample_seconds: 10,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(
+            fallback_sample_seconds(true, RuntimeMode::Background, &cfg),
+            5
+        );
+        assert_eq!(
+            fallback_sample_seconds(false, RuntimeMode::Background, &cfg),
+            30
+        );
     }
 
     #[test]
