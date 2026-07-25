@@ -1,8 +1,8 @@
 # PetCard
 
-PetCard is an optional, compile-time PulseDeck card plugin. It displays Codex
-or OpenCode lifecycle state using cached image frames and performs no polling
-while offline.
+PetCard is an optional, compile-time PulseDeck card plugin. It displays Codex,
+OpenCode, or pi lifecycle state using cached image frames and performs no
+polling while offline.
 
 ## Build
 
@@ -83,6 +83,25 @@ output, or real session identifiers. It writes atomically, uses event-driven
 rate-limited heartbeats, and starts no polling timer or helper process. Codex
 and OpenCode share one state file, so the most recent event wins when both are
 active.
+
+## pi integration
+
+pi can publish the same state protocol through the zero-dependency extension at
+`integrations/pulsedeck-pet/pi/pulsedeck-pet.ts`. Install it globally with:
+
+```sh
+install -Dm600 integrations/pulsedeck-pet/pi/pulsedeck-pet.ts \
+  "$HOME/.pi/agent/extensions/pulsedeck-pet.ts"
+```
+
+Run `/reload` or restart pi after installation. The extension observes only pi
+lifecycle event names: session startup, agent startup, tool execution, settled
+completion, and session shutdown. It does not read prompts, messages, tool
+arguments, commands, or tool output. Streaming activity creates only a
+rate-limited, event-driven heartbeat and starts no timer or helper process.
+See `integrations/pulsedeck-pet/pi/README.md` for state mapping and custom path
+details. Codex, OpenCode, and pi share one state file, so the latest event wins
+when clients run concurrently.
 
 ## Runtime behavior
 

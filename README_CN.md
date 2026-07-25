@@ -21,7 +21,7 @@ PulseDeck 是面向 Linux 手机、平板和桌面的轻量 GTK4/Libadwaita 配�
 - 文件和网络状态事件驱动更新，临近刷新合并唤醒，共享系统快照并去重持久缓存写入。
 - 限制子进程输出、HTTP 响应大小和执行时间。
 - 可选、独立编译的 ScrcpyForge 设备控制页面。
-- 可选、独立编译的 Codex/OpenCode PetCard，支持事件驱动动画、尺寸记忆和完成提示音。
+- 可选、独立编译的 Codex/OpenCode/pi PetCard，支持事件驱动动画、尺寸记忆和完成提示音。
 - 页面工具栏可在普通网格与六列紧凑网格间切换，并记忆上次选择。
 
 ## 环境要求
@@ -127,11 +127,11 @@ timeout_seconds = 5
 程序、URL 和脚本均可配置。预览与健康检查使用统一运行模式：页面隐藏或应用后台时
 停止预览，空闲时只取设备元数据，未变化的画面通过 ETag 和内容哈希复用。
 
-## 可选 Codex/OpenCode PetCard
+## 可选 Codex/OpenCode/pi PetCard
 
 `pet-card` feature 通过通用卡片插件接口接入，Agent 专属状态和定时器不会进入主线
-核心。`integrations/pulsedeck-pet` 中可单独安装的 Codex hook 和 OpenCode 插件只通过
-原子状态文件发布固定生命周期状态，不读取提示词或工具内容。活跃任务在原始保护期限内
+核心。`integrations/pulsedeck-pet` 中可单独安装的 Codex hook、OpenCode 插件和 pi
+扩展只通过原子状态文件发布固定生命周期状态，不读取提示词、消息或工具内容。活跃任务在原始保护期限内
 不会进入空闲遮罩，包括等待输入或确认期间。离线状态完全静止，卡片不可见时暂停动画，
 应用后台时彻底停止帧定时器；完成提示音由全局运行设置控制。详见
 [docs/PET_CARD.md](docs/PET_CARD.md)。

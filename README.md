@@ -24,7 +24,7 @@ do not require recompiling the application.
   shared system snapshots, and deduplicated persistent cache writes.
 - Bounded subprocess output, HTTP response size, and execution time.
 - Optional, separately compiled ScrcpyForge device-control page.
-- Optional, separately compiled event-driven Codex/OpenCode PetCard with
+- Optional, separately compiled event-driven Codex/OpenCode/pi PetCard with
   animated status, remembered sizing, and a completion sound.
 - A remembered toolbar toggle between the normal grid and a compact six-column
   layout.
@@ -140,12 +140,13 @@ Its preview and health loops consume the shared runtime mode: hidden/background
 pages stop preview work, idle mode requests metadata only, and unchanged images
 reuse an ETag/hash cache.
 
-## Optional Codex/OpenCode PetCard
+## Optional Codex/OpenCode/pi PetCard
 
 The `pet-card` feature adds a generic plugin card without adding agent-specific
-state or timers to the core. The separately installable Codex hook and OpenCode
-plugin under `integrations/pulsedeck-pet` publish fixed lifecycle states through
-an atomic runtime file and never read prompt or tool contents. Active tasks keep
+state or timers to the core. The separately installable Codex hook, OpenCode
+plugin, and pi extension under `integrations/pulsedeck-pet` publish fixed
+lifecycle states through an atomic runtime file and never read prompt, message,
+or tool contents. Active tasks keep
 the foreground out of the idle overlay for their original protection period,
 including while waiting for input or confirmation. Offline mode is static,
 animations stop while unmapped or in the background, and the global runtime
