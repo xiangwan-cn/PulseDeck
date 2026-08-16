@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::core::config::{CardConfig, CardRuntimeConfig, DisplayConfig};
+use crate::model::card_model::RendererKind;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PetConfig {
     #[serde(default = "default_state_file")]
@@ -94,11 +97,43 @@ impl Default for PetConfig {
     }
 }
 
+/// Card inserted into existing and newly generated configs when this feature
+/// is compiled in. Empty plugin options intentionally select PetConfig's safe
+/// defaults and the built-in emoji artwork fallback.
+pub(crate) fn default_card() -> CardConfig {
+    CardConfig {
+        id: "codex-pet".into(),
+        title: "Codex Pet".into(),
+        page: "monitor".into(),
+        order: 5,
+        renderer: RendererKind::Value,
+        refresh_interval: 60,
+        enabled: true,
+        icon: None,
+        description: Some("Codex 运行状态".into()),
+        source: None,
+        display: Some(DisplayConfig {
+            minimum_change: None,
+            columns_after: None,
+            columns: None,
+            card_width: None,
+            card_height: Some(133),
+            fixed_size: Some(true),
+        }),
+        cache_ttl_seconds: None,
+        schedule: None,
+        click_action: None,
+        kind: Some("pet-card".into()),
+        plugin: Some(toml::Value::Table(Default::default())),
+        runtime: CardRuntimeConfig::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
 
-    use super::PetConfig;
+    use super::{default_card, PetConfig};
 
     #[derive(Deserialize)]
     struct ExampleConfig {
@@ -121,5 +156,16 @@ mod tests {
         assert!(card.plugin.completion_sound_file.is_none());
         assert!(card.plugin.animations.contains_key("offline"));
         assert!(card.plugin.animations.contains_key("done"));
+    }
+
+    #[test]
+    fn compiled_feature_card_uses_self_contained_defaults() {
+        let card = default_card();
+        assert_eq!(card.id, "codex-pet");
+        assert_eq!(card.kind.as_deref(), Some("pet-card"));
+        assert!(card.enabled);
+        let config: PetConfig = card.plugin.unwrap().try_into().unwrap();
+        assert_eq!(config.fps, 12);
+        assert!(config.asset_root.is_none());
     }
 }

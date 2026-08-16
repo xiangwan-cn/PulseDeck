@@ -2,7 +2,7 @@
 //!
 //! This entire module is excluded unless the `scrcpy-forge` Cargo feature is enabled.
 
-mod config;
+pub(crate) mod config;
 mod page;
 mod service;
 

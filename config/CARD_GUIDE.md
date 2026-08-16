@@ -285,6 +285,9 @@ cache_ttl_seconds = 14400
 
 ## 可选 ScrcpyForge 页面
 
+编译 `scrcpy-forge` feature 后会自动加入缺失的默认页面，不需要再手动让 AI 配置；
+已有同 ID 页面保持不变。示例文件仅用于覆盖服务地址、尺寸或端点等默认值。
+
 该页面不属于通用卡片系统，默认不会编译。使用
 `cargo build --release --features scrcpy-forge` 启用，配置见
 `src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
@@ -295,6 +298,7 @@ cache_ttl_seconds = 14400
 
 ## 可选 PetCard
 
-PetCard 默认不编译。使用 `cargo build --release --features pet-card` 启用；配置、
-Codex hook、帧资源、四格/六格/全屏尺寸、离线回落和完成提示音见
+PetCard 默认不编译。使用 `cargo build --release --features pet-card` 启用；编译进该
+feature 后会自动加入缺失的 `codex-pet` 卡片，emoji 回退无需额外配置。自定义帧配置、
+Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 [`docs/PET_CARD.md`](../docs/PET_CARD.md)。

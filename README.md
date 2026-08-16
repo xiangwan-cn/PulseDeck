@@ -177,6 +177,10 @@ built-in metrics already return the appropriate structured value.
 
 ## Optional ScrcpyForge integration
 
+Building with `--features scrcpy-forge` automatically adds the default
+ScrcpyForge page when it is absent. Existing page configuration is preserved;
+the standalone example is only needed for customization.
+
 The integration is excluded from default builds. Enable the `scrcpy-forge`
 feature and append the generic configuration from
 `src/plugins/scrcpy_forge/config.example.toml` to your local TOML file. It
@@ -201,6 +205,10 @@ state or timers to the core. The separately installable Codex hook, OpenCode
 plugin, and pi extension under `integrations/pulsedeck-pet` publish fixed
 lifecycle states through an atomic runtime file and never read prompt, message,
 or tool contents.
+
+Building with `--features pet-card` now adds an enabled `codex-pet` card to any
+configuration that does not already define one. The zero-config card uses the
+emoji fallback; custom frame paths remain optional.
 
 PetCard-only presentation behavior:
 

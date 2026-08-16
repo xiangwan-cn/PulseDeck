@@ -43,6 +43,25 @@ pub fn build_app(app: &adw::Application) {
             changed = true;
         }
     }
+    #[cfg(feature = "pet-card")]
+    if !cfg.config().cards.iter().any(|card| card.id == "codex-pet") {
+        cfg.config_mut()
+            .cards
+            .push(crate::plugins::pet_card::config::default_card());
+        changed = true;
+    }
+    #[cfg(feature = "scrcpy-forge")]
+    if !cfg
+        .config()
+        .pages
+        .iter()
+        .any(|page| page.id == "scrcpy-forge")
+    {
+        cfg.config_mut()
+            .pages
+            .push(crate::plugins::scrcpy_forge::config::default_page());
+        changed = true;
+    }
     if changed {
         let _ = cfg.save();
     }

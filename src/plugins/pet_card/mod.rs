@@ -1,6 +1,6 @@
 //! Low-power, event-driven Codex pet card.
 
-mod config;
+pub(crate) mod config;
 mod runtime;
 
 use crate::core::error::AppError;

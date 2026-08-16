@@ -1,6 +1,6 @@
 {
   "name": "pulsedeck-pet",
-  "version": "0.1.0+codex.20260724172618",
+  "version": "0.1.0+codex.20260816074349",
   "description": "Publishes Codex lifecycle state to the PulseDeck PetCard.",
   "author": {
     "name": "PulseDeck contributors"

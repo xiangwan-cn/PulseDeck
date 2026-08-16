@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::config::PageConfig as AppPageConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageConfig {
     #[serde(default = "default_api_url")]
@@ -125,6 +127,35 @@ fn default_preview_height() -> i32 {
 fn default_true() -> bool {
     true
 }
+
+fn default_cards() -> Vec<CardConfig> {
+    vec![
+        CardConfig {
+            role: "backend".into(),
+            title: "ScrcpyForge".into(),
+            order: 10,
+            enabled: true,
+            icon: None,
+            description: Some("后端运行状态与启停开关".into()),
+        },
+        CardConfig {
+            role: "devices".into(),
+            title: "设备预览".into(),
+            order: 20,
+            enabled: true,
+            icon: None,
+            description: Some("每台设备生成一张独立预览卡".into()),
+        },
+        CardConfig {
+            role: "scripts".into(),
+            title: "设备脚本".into(),
+            order: 30,
+            enabled: true,
+            icon: None,
+            description: Some("每台设备生成一张对应脚本卡".into()),
+        },
+    ]
+}
 fn health() -> String {
     "health".into()
 }
@@ -182,8 +213,19 @@ impl Default for PageConfig {
             card_height: default_card_height(),
             preview_height: default_preview_height(),
             endpoints: Endpoints::default(),
-            cards: vec![],
+            cards: default_cards(),
         }
+    }
+}
+
+pub(crate) fn default_page() -> AppPageConfig {
+    AppPageConfig {
+        id: "scrcpy-forge".into(),
+        title: "设备".into(),
+        icon: Some("phone-symbolic".into()),
+        order: 25,
+        kind: Some("scrcpy-forge".into()),
+        plugin: Some(toml::Value::try_from(PageConfig::default()).expect("SF defaults serialize")),
     }
 }
 
@@ -191,7 +233,7 @@ impl Default for PageConfig {
 mod tests {
     use serde::Deserialize;
 
-    use super::PageConfig;
+    use super::{default_page, PageConfig};
 
     #[derive(Deserialize)]
     struct ExampleConfig {
@@ -211,5 +253,15 @@ mod tests {
         assert_eq!(page.kind, "scrcpy-forge");
         assert_eq!(page.plugin.endpoints.tasks, "scripts");
         assert_eq!(page.plugin.cards.len(), 3);
+    }
+
+    #[test]
+    fn compiled_feature_page_is_ready_without_manual_configuration() {
+        let page = default_page();
+        assert_eq!(page.id, "scrcpy-forge");
+        assert_eq!(page.kind.as_deref(), Some("scrcpy-forge"));
+        let config: PageConfig = page.plugin.unwrap().try_into().unwrap();
+        assert_eq!(config.api_url, "http://127.0.0.1:27180/api/v1");
+        assert_eq!(config.cards.len(), 3);
     }
 }

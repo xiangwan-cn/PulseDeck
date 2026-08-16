@@ -161,8 +161,9 @@ timeout_seconds = 5
 
 ## 可选 ScrcpyForge 集成
 
-默认构建不包含该集成。启用 `scrcpy-forge` feature，并将
-`src/plugins/scrcpy_forge/config.example.toml` 中的通用配置追加到本地 TOML 文件。
+默认构建不包含该集成。启用 `scrcpy-forge` feature 后，如果配置中还没有同名页面，
+PulseDeck 会自动写入可用的默认 SF 页面；已有配置不会被覆盖。
+`src/plugins/scrcpy_forge/config.example.toml` 仅用于自定义默认值。
 它连接到单独安装的 ScrcpyForge 后端；PulseDeck 不持有 ADB 或 scrcpy 进程。服务
 程序、URL 和脚本均可配置。预览与健康检查遵循统一运行模式：
 
@@ -180,6 +181,10 @@ ScrcpyForge（简称 SF）是基于 ADB 与 scrcpy 的多设备 Android 自动�
 `pet-card` feature 通过通用卡片插件接口接入，Agent 专属状态和定时器不会进入主线
 核心。`integrations/pulsedeck-pet` 中可单独安装的 Codex hook、OpenCode 插件和 pi
 扩展只通过原子状态文件发布固定生命周期状态，不读取提示词、消息或工具内容。
+
+使用 `--features pet-card` 编译后，如果配置中还没有 `codex-pet`，PulseDeck 会自动
+加入并启用该卡片。零配置时直接使用 emoji 回退，无需再让 AI 手动补配置；自定义帧
+路径仍是可选项。
 
 以下展示行为仅对 PetCard 有效：
 

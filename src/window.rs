@@ -37,32 +37,35 @@ const APP_CSS: &str = r#"
 .accent-orange { border-left: 2px solid #e5a50a; }
 .accent-teal   { border-left: 2px solid #2190a0; }
 .metric-header-icon { opacity: 0.65; }
-.metric-header-name { font-weight: 700; font-size: 13px; }
-.metric-header-sub { font-size: 9px; opacity: 0.62; margin-top: 0px; }
+.metric-header-name { font-weight: 700; font-size: 16px; }
+.metric-header-sub { font-size: 12px; opacity: 0.62; margin-top: 0px; }
 .metric-value-box { margin: 5px 0 2px 0; }
-.metric-value { font-size: 19px; font-weight: 800; font-feature-settings: "tnum"; }
-.content-medium .metric-value { font-size: 15px; }
-.content-dense .metric-value { font-size: 10px; font-weight: 650; }
-.metric-value-placeholder { font-size: 11px; font-weight: 400; opacity: 0.3; }
+.metric-value { font-size: 24px; font-weight: 800; font-feature-settings: "tnum"; }
+.content-medium .metric-value { font-size: 20px; }
+.content-dense .metric-value { font-size: 15px; font-weight: 650; }
+.metric-value-placeholder { font-size: 14px; font-weight: 400; opacity: 0.3; }
 .metric-value-warning  { color: #e5a50a; }
 .metric-value-critical { color: #e01b24; }
 .metric-value-good     { color: #33d17a; }
 .metric-card.click-action-card { transition: background-color 120ms ease; }
 .metric-card.click-action-card:hover { background-color: alpha(@accent_bg_color, 0.12); }
-.metric-footer { font-size: 9px; opacity: 0.7; margin-top: 1px; }
-.content-medium .metric-footer, .content-medium .metric-header-sub { font-size: 8px; }
-.content-dense .metric-footer, .content-dense .metric-header-sub { font-size: 7px; }
+.metric-footer { font-size: 12px; opacity: 0.7; margin-top: 1px; }
+.content-medium .metric-footer, .content-medium .metric-header-sub { font-size: 11px; }
+.content-dense .metric-footer, .content-dense .metric-header-sub { font-size: 10px; }
 .compact-card { padding: 6px 4px; border-radius: 10px; }
-.compact-card .metric-header-name { font-size: 11px; }
+.compact-card .metric-header-name { font-size: 15px; }
 .compact-card .metric-header-icon { opacity: 0; min-width: 0; min-height: 0; }
-.compact-card .metric-header-sub, .compact-card .metric-footer { font-size: 8px; }
+.compact-card .metric-header-sub, .compact-card .metric-footer,
+.compact-card.content-medium .metric-header-sub, .compact-card.content-medium .metric-footer,
+.compact-card.content-dense .metric-header-sub, .compact-card.content-dense .metric-footer { font-size: 12px; }
 .compact-card .metric-value-box { margin: 2px 0 0 0; }
-.compact-card .metric-value { font-size: 16px; }
-.compact-card.content-medium .metric-value { font-size: 15px; }
-.compact-card.content-dense .metric-value { font-size: 13px; }
+.compact-card .metric-value { font-size: 23px; }
+.compact-card.content-medium .metric-value { font-size: 21px; }
+.compact-card.content-dense .metric-value { font-size: 19px; }
 .compact-card .action-icon { opacity: 0; min-width: 0; min-height: 0; }
-.compact-card .action-desc, .compact-card .action-confirm-badge { font-size: 8px; }
-.compact-card .action-name { font-size: 11px; }
+.compact-card .action-desc { font-size: 12px; }
+.compact-card .action-confirm-badge { font-size: 11px; }
+.compact-card .action-name { font-size: 15px; }
 .compact-card .action-run-btn { padding: 2px 4px; min-width: 0; }
 .action-card { }
 .action-icon { opacity: 0.55; }

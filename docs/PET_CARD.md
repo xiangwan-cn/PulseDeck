@@ -16,10 +16,11 @@ To build both optional integrations:
 cargo build --release --features scrcpy-forge,pet-card
 ```
 
-Append `src/plugins/pet_card/config.example.toml` to the local PulseDeck
-configuration and update `asset_root`. If no matching image exists, the card
-uses an emoji fallback, so the event path can be tested before artwork is
-installed.
+When the `pet-card` feature is present, PulseDeck automatically adds an enabled
+`codex-pet` card to a config that does not already contain one. It uses safe
+runtime defaults and emoji artwork without requiring AI or a manual config
+edit. To install custom artwork, copy the animation options from
+`src/plugins/pet_card/config.example.toml` and update `asset_root`.
 
 Set `codex_completion_sound = true` in the global `[runtime]` section to play
 the desktop theme's single `complete` event for a completion, failure,
@@ -36,10 +37,11 @@ the GTK bell.
 ## Codex integration
 
 The installable Codex plugin is under `integrations/pulsedeck-pet`. Its Bash
-hook writes only a fixed state, protocol version and timestamp. A Bash built-in
+hook writes only a fixed state, protocol version and timestamp. A POSIX shell
 read loop drains the event JSON from stdin without parsing it, so prompt text,
 commands, tool arguments, tool output and session ids are neither retained nor
-passed through an extra helper process.
+passed through an extra helper process. Corrupt or partial heartbeat metadata
+is reset instead of surfacing as a hook command error.
 Draining prevents Codex from seeing a broken pipe after the short-lived hook
 publishes its state.
 

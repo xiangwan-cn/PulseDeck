@@ -1,5 +1,5 @@
-# Append this page to ~/.config/pulsedeck/config.toml and build PulseDeck with:
-# cargo build --release --features scrcpy-forge
+# Building with `--features scrcpy-forge` adds these defaults automatically
+# when no `scrcpy-forge` page exists. Copy this example only to customize them.
 
 [[pages]]
 id = "scrcpy-forge"
