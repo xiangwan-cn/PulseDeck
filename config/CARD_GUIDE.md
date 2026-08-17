@@ -2,8 +2,9 @@
 
 编辑 `~/.config/pulsedeck/config.toml`，复制一个 `[[cards]]` 配置块并修改 `id`、
 `title`、`order`、`renderer` 和数据源即可。内置渲染器包括 `value`、
-`progress`、`status`、`text`、`list`、`composite`；数据源包括 `builtin`、
-`file`、`command`、`http` 和 `static_value`。
+`progress`、`status`、`text`、`action`；`list` 和 `composite` 只由插件卡片产出，
+普通数据源卡片选择它们会显示空白（见文末「配置限制与保留字段」）。数据源包括
+`builtin`、`file`、`command`、`http` 和 `static_value`（兼容别名 `static`）。
 
 例如，启用已内置但默认不显示的系统负载：
 
@@ -69,7 +70,9 @@ click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[ac
 
 ```toml
 [cards.runtime]
-class = "command"              # system/network/network-status/battery/command/http/file/static
+class = "command"
+# 可用类别及别名：system/system-realtime、network/network-rate、network-status、
+# battery/thermal/battery-thermal、command、http、file、static；省略时按数据源自动归类。
 idle_behavior = "throttle"     # throttle 或 pause
 idle_multiplier = 8.0
 external_realtime = false      # 高开销命令/HTTP 默认不要打开
@@ -92,6 +95,79 @@ minimum_interval_seconds = 5
 
 需要确认时可使用 `confirm_title` 和 `confirm_detail` 自定义确认页内容。省略后会使用
 action 名称作为标题、action 描述作为说明，因此确认页仍会指出即将执行的操作。
+
+### 卡片点击动作完整实例
+
+把「点击卡片」和「执行命令」组合起来的可复制配置：状态卡展示服务运行状态，点击卡片
+经确认后切换启停；action 设置 `visible = false` 时不占用操作页空间：
+
+```toml
+[[cards]]
+id = "service-status"
+title = "服务状态"
+page = "monitor"
+order = 90
+renderer = "status"
+refresh_interval = 5
+icon = "system-run-symbolic"
+description = "点击卡片切换服务"
+click_action = "toggle-service"
+
+[cards.source]
+type = "command"
+program = "sh"
+args = ["-c", "if pgrep -f '[m]yservice' >/dev/null 2>&1; then echo '● 运行中'; else echo '○ 已停止'; fi"]
+timeout_seconds = 5
+
+[[actions]]
+id = "toggle-service"
+name = "切换服务"
+description = "根据当前状态启动或停止服务"
+icon = "system-run-symbolic"
+page = "actions"
+visible = false
+timeout = 30
+confirm = true
+confirm_title = "切换服务？"
+confirm_detail = "运行中则停止，未运行则启动。"
+command = ["sh", "-c", "if pgrep -f '[m]yservice' >/dev/null 2>&1; then pkill -f '[m]yservice'; echo 已停止; else setsid nohup myservice >>\"$HOME/.local/state/myservice.log\" 2>&1 </dev/null & sleep 1; echo 已启动; fi"]
+```
+
+要点：
+
+- 命令源直接执行 `program`，不经 shell；轻量场景可用 `sh -c` 包一层，复杂逻辑推荐
+  写成独立脚本作为 `program`（见「命令」）。
+- `pgrep -f` 会匹配完整命令行，用 `[m]yservice` 字符类写法可避免匹配到执行检测的
+  `sh -c` 自身，否则状态会恒为“运行中”、停止时还会误杀自己。
+- 后台启动的进程务必 `</dev/null` 并把 stdout/stderr 重定向到日志文件，否则会占住
+action 的输出管道，导致结果对话框迟迟不返回。
+- `renderer = "action"` 的卡片会显示一个“执行”按钮，触发同一个 `click_action`；
+  执行期间按钮禁用并显示 spinner，未配置有效 `click_action` 时按钮保持禁用。
+
+## 页面
+
+页面是卡片与操作的分组容器，顶栏按 `order` 排序展示。默认内置 monitor/actions/settings
+三个页面（配置缺省时自动兜底），新增页面只需追加 `[[pages]]` 块，卡片用 `page` 引用：
+
+```toml
+[[pages]]
+id = "tools"
+title = "工具"
+icon = "utilities-system-monitor-symbolic"  # 可选，顶栏图标
+order = 25
+
+[[cards]]
+id = "my-card"
+title = "我的卡片"
+page = "tools"      # 引用上面的页面 id
+order = 10
+renderer = "value"
+refresh_interval = 30
+icon = "computer-symbolic"
+```
+
+页面 `kind` 字段可挂载编译期插件页面（如 `kind = "scrcpy-forge"`），插件页面由
+`[pages.plugin]` 提供专属配置，不参与通用卡片系统，见「可选 ScrcpyForge 页面」。
 
 ## 数据源示例
 
@@ -161,7 +237,8 @@ type = "json_path"
 path = "data.status"
 ```
 
-HTTP 方法支持 `GET`、`POST`、`PUT`、`DELETE` 和 `PATCH`。真实服务地址、认证请求头
+POST/PUT 等请求可用 `body` 提供请求体。HTTP 方法支持 `GET`、`POST`、`PUT`、`DELETE`
+和 `PATCH`。真实服务地址、认证请求头
 和 token 只应写入被 Git 忽略的本地配置，不要提交到公开仓库。
 HTTP、command 和 file 数据源实例会长期复用；正则解析器只编译一次。
 
@@ -180,10 +257,20 @@ value = "本地仪表盘"
 
 ## HTTP 解析器
 
-- `json_path`：用点号访问对象或数组，如 `data.items.0.value`。
-- `regex`：使用 `pattern` 和可选的 `capture` 提取文本。
+- `json_path`：用点号访问对象或数组，如 `data.items.0.value`；数值文本加
+  `as_percentage = true` 可转为百分比。
+- `regex`：使用 `pattern` 和可选的 `capture`（捕获组索引，默认 1）提取文本。
 - `number`：使用 `multiplier`、`divisor`、`decimal_places` 和 `suffix` 转为数值。
 - `first_line`：只保留第一行，并可追加 `suffix`。
+
+正则提取实例（从 `Load: 0.5` 中提取数字）：
+
+```toml
+[cards.source.parser]
+type = "regex"
+pattern = "Load: ([0-9.]+)"
+capture = 1
+```
 
 数值解析示例：
 
@@ -215,6 +302,12 @@ max_output_bytes = 4096
 会修改系统状态的操作应设置 `confirm = true`。PulseDeck 不会自动提权；若本地操作
 需要管理员权限，应由用户明确配置 `pkexec` 等授权工具。
 
+`[[actions]]` 可用字段：`id`、`name` 必填；`description`、`icon` 可选；`page` 指定
+渲染页面；`visible = false` 时不渲染按钮，仅作为卡片 `click_action` 的隐藏入口；
+`command` 为 `["程序", "参数", ...]`；`timeout` 默认 10 秒；`confirm = true` 时点击
+先弹确认框，可用 `confirm_title`/`confirm_detail` 自定义文案（省略则用 name/description）；
+`max_output_bytes` 可单独覆盖全局输出上限。
+
 ## 卡片尺寸
 
 默认普通模式使用三列、紧凑模式使用六列，两种模式都会根据页面当前可见高度计算
@@ -237,7 +330,13 @@ fixed_card_size = true
 card_width = 220
 card_height = 160
 fixed_size = false # false 表示内容较多时允许卡片继续增高
+minimum_change = 5.0   # 主数值变化低于该阈值时不重绘（省电、防闪烁）
+columns_after = 5      # value 渲染器 + 多行文本时：超过 5 行切换多列
+columns = 2            # 多列模式列数，默认 2
 ```
+
+`columns_after`/`columns` 只对 `renderer = "value"` 且命令输出多行文本生效——这是
+普通数据源唯一能做出“列表”效果的方式（`list` 渲染器本身仅插件可用）。
 
 单卡片尺寸覆盖仍是下限；例如 `card_height = 160` 会阻止该卡片缩到 160 像素以下，
 但不会阻止页面在空间充足时把三行统一增高。
@@ -262,6 +361,8 @@ cache_ttl_seconds = 14400
 ```
 
 该机制不依赖卡片 ID、标题或脚本内容，任意定时联网或命令卡片都可直接复用。
+`schedule` 目前仅支持 `daily@HH:MM,HH:MM` 这一种格式（多时间点用逗号分隔），
+不支持 cron 表达式。
 持久缓存前有进程内缓存；相同结果至少间隔一段时间才重写磁盘，新的计划周期或变化的
 结果仍会原子写入，避免每次成功刷新都产生写放大。
 
@@ -302,3 +403,16 @@ PetCard 默认不编译。使用 `cargo build --release --features pet-card` 启
 feature 后会自动加入缺失的 `codex-pet` 卡片，emoji 回退无需额外配置。自定义帧配置、
 Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 [`docs/PET_CARD.md`](../docs/PET_CARD.md)。
+
+## 配置限制与保留字段
+
+以下字段在配置层面存在但**不生效**，或需要插件才能使用，避免踩坑：
+
+- `renderer = "list"` / `"composite"`：普通数据源（builtin/command/file/http/static_value）
+  无法产出列表或组合值，选择后卡片显示空白；仅插件卡片内部使用。
+- `source.shell = true`：保留字段，不生效；需要 shell 语义时用 `sh -c` 包裹命令，
+  或把脚本写成本地文件作为 `program`。
+- `parser.steps`：保留字段，HTTP 解析器不支持链式解析。
+- `template`、`divide` 解析器：源码占位，未实现，不要使用。
+- `schedule`：仅支持 `daily@HH:MM,HH:MM` 一种格式，没有 cron。
+- 页面与卡片的 `id` 各自类型内唯一；卡片引用的 `page` 必须存在。
