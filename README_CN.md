@@ -116,7 +116,7 @@ PulseDeck 还会自动扫描同级的 `config.d/` 目录。该目录第一层的
 子目录与其他扩展名会被忽略。因此导出卡片或页面只需复制一个文件，不需要维护 include
 列表；把扩展名改为 `.disabled` 即可停用模块。
 
-配置采用严格且不自动迁移的 schema v2。文件根部必须包含 `schema_version = 2`；未知字段、
+配置采用严格且不自动迁移的 schema v3。文件根部必须包含 `schema_version = 3`；未知字段、
 废弃别名和未知枚举值会使配置加载失败，而不是被静默忽略。此后 schema 发生变化时，
 仓库示例与实际使用的本地配置必须同时更新。
 
@@ -130,7 +130,7 @@ PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 
 顶层配置包括：
 
-- `schema_version`：必填的配置接口版本，当前为 `2`。
+- `schema_version`：必填的配置接口版本，当前为 `3`。
 - `[app]`：标题、日志、输出限制和配置重载。
 - `[runtime]`：前台常亮、低功耗显示与刷新、外接供电行为及 Agent 保护/通知。
 - `[ui]`：默认页面、普通网格列数和卡片尺寸；工具栏普通/紧凑选择作为 UI 状态单独保存。
@@ -141,7 +141,7 @@ PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 模块同样以 schema 版本开头，并可提供便于识别的名称：
 
 ```toml
-schema_version = 2
+schema_version = 3
 name = "workstation"
 
 [[cards]]
@@ -149,16 +149,23 @@ name = "workstation"
 ```
 
 默认情况下重复 ID 会直接报错。明确的个人覆盖模块可设置
-`replace_existing = true`，从而替换更早文件中的同 ID 页面、卡片或操作，也可以接管完整
-的 `[app]`、`[ui]` 或 `[runtime]` 段。设置页会写回最后拥有该条目的模块，因此默认
+`replace_existing = true`，从而替换更早文件中的同 ID 页面、卡片或操作，也可以按字段
+覆盖 `[app]`、`[ui]` 或 `[runtime]`。未写字段继续继承主配置；设置页会把发生变化的字段
+写回最后拥有该段的模块，因此默认
 `config.toml` 不会被个人配置改写。可直接复制
 [独立模块示例](config/config.d/50-custom.example.toml)。
 
-可在不打开界面的情况下校验主文件、所有启用模块、重复/覆盖规则及当前构建包含的插件配置：
+可在不打开界面的情况下校验、格式化或生成配置。`add` 未指定 `--module` 时会列出已有
+配置文件，并提供新建文件选项；显式指定时既可选择已有文件，也可创建新名称。已有文件
+保持自己的覆盖属性，新建个人文件自动设置 `replace_existing = true`。因此个人覆盖文件中
+与默认配置同 ID 的定义始终优先，同时工具不会硬编码任何用户专属文件名：
 
 ```sh
-pulsedeck --check-config
-pulsedeck --check-config /path/to/config.toml
+pulsedeck config check
+pulsedeck config check /path/to/config.toml
+pulsedeck config add builtin cpu --id cpu-personal --title "CPU" --renderer progress --refresh 5s
+pulsedeck config add command --id kernel --title "内核" --renderer text --refresh 1h --module 50-workstation.toml -- uname -r
+pulsedeck config format # 规范化主文件及模块；会移除注释
 ```
 
 最小自定义卡片示例：
@@ -169,13 +176,8 @@ id = "kernel"
 title = "内核"
 page = "monitor"
 renderer = "text"
-refresh_interval = 3600
-
-[cards.source]
-type = "command"
-program = "uname"
-args = ["-r"]
-timeout_seconds = 5
+refresh = "1h"
+source = { command = { run = ["uname", "-r"], timeout = "5s" } }
 ```
 
 普通非插件卡片还可从当前值推导命名视觉状态。首条匹配的
@@ -189,13 +191,13 @@ timeout_seconds = 5
 
 ## 数据源与渲染器
 
-| 数据源 | 必填字段 | 用途 |
+| 数据源写法 | 用途 |
 | --- | --- | --- |
-| `builtin` | `metric` | 高效读取 Linux 原生系统指标。 |
-| `file` | `path` | 读取文本、sysfs 或 procfs 文件。 |
-| `command` | `program`，可选 `args` | 不经过 shell，运行有边界的子进程。 |
-| `http` | `url`，可选方法/请求头/正文/解析器 | 获取本地或远程数据。 |
-| `static_value` | `options.value` | 标签和固定信息卡片。 |
+| `{ builtin = "cpu" }` | 高效读取 Linux 原生系统指标。 |
+| `{ file = { path = "/path" } }` | 读取文本、sysfs 或 procfs 文件。 |
+| `{ command = { run = ["program", "arg"] } }` | 不经过 shell，运行有边界的子进程。 |
+| `{ http = { url = "https://…" } }` | 获取本地或远程数据。 |
+| `{ text = "固定内容" }` | 标签和固定信息卡片。 |
 
 渲染器包括 `value`、`progress`、`status`、`text`、`list`、`composite` 和
 `action`。应选择与数据源输出匹配的渲染器；内置指标已经返回相应结构化数值。

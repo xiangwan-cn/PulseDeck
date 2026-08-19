@@ -9,7 +9,7 @@ The generic `[cards.display.colors]`, `[[cards.display.states]]`, and
 non-plugin cards. A PetCard declares `kind = "pet-card"`, so its lifecycle
 artwork, state labels, transitions, and colors remain owned by the plugin
 configuration documented here and are never rewritten by generic card rules.
-The PetCard example is a standalone strict schema v2 module for the automatic
+The PetCard example is a standalone strict schema v3 module for the automatic
 `config.d/` directory; it is not appended to the main configuration.
 
 ## Build

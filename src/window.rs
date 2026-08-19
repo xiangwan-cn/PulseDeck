@@ -627,13 +627,10 @@ impl MonitorWindow {
             let Some(source) = card.source.as_ref() else {
                 continue;
             };
-            if source.source_type != SourceKind::File {
-                continue;
-            }
-            let Some(path) = source.path.as_ref() else {
+            let SourceConfig::File(file_source) = source else {
                 continue;
             };
-            let Ok(monitor) = gio::File::for_path(path)
+            let Ok(monitor) = gio::File::for_path(&file_source.path)
                 .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
             else {
                 continue;
@@ -663,10 +660,7 @@ impl MonitorWindow {
         let config = self.config.clone();
         monitor.connect_network_changed(move |_, _| {
             for card in &config.borrow().config().cards {
-                if card.source.as_ref().is_some_and(|source| {
-                    source.source_type == SourceKind::Builtin
-                        && source.metric.as_deref() == Some("network")
-                }) {
+                if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("network") {
                     scheduler.borrow_mut().request_now(&card.id);
                 }
             }
@@ -1287,7 +1281,7 @@ impl MonitorWindow {
             .filter(|card| {
                 card.source
                     .as_ref()
-                    .map(|source| source.source_type == SourceKind::Builtin)
+                    .map(|source| source.kind() == SourceKind::Builtin)
                     .unwrap_or(false)
             })
             .cloned()
@@ -1320,7 +1314,7 @@ impl MonitorWindow {
             let metric_name = card
                 .source
                 .as_ref()
-                .and_then(|source| source.metric.as_deref())
+                .and_then(SourceConfig::builtin_metric)
                 .unwrap_or("builtin");
             let description = Label::new(Some(metric_name));
             description.set_halign(Align::Start);
@@ -1707,10 +1701,9 @@ impl MonitorWindow {
                     let max_output = config.borrow().config().app.max_output_bytes;
 
                     let source = card_cfg.source.clone();
-                    let needs_initial_follow_up = source.as_ref().is_some_and(|source| {
-                        source.source_type == SourceKind::Builtin
-                            && source.metric.as_deref() == Some("cpu")
-                    });
+                    let needs_initial_follow_up = source
+                        .as_ref()
+                        .is_some_and(|source| source.builtin_metric() == Some("cpu"));
                     let cache_ttl = card_cfg.cache_ttl_seconds;
                     let schedule = card_cfg
                         .schedule
@@ -1860,13 +1853,9 @@ impl MonitorWindow {
                     };
 
                     let card_cfg = cfg.config().cards.iter().find(|c| c.id == update.card_id);
-                    let is_cpu =
-                        card_cfg
-                            .and_then(|card| card.source.as_ref())
-                            .is_some_and(|source| {
-                                source.source_type == SourceKind::Builtin
-                                    && source.metric.as_deref() == Some("cpu")
-                            });
+                    let is_cpu = card_cfg
+                        .and_then(|card| card.source.as_ref())
+                        .is_some_and(|source| source.builtin_metric() == Some("cpu"));
                     if is_cpu {
                         if let CardValue::Percentage(percent) = &update.result.value {
                             runtime.report_cpu_activity(*percent);
@@ -1989,15 +1978,8 @@ fn collect_card_metric(
         }
     };
 
-    match source.source_type {
-        SourceKind::Builtin => {
-            let metric_name = match &source.metric {
-                Some(n) => n.clone(),
-                None => {
-                    return MetricResult::error("未指定内置指标名称");
-                }
-            };
-
+    match source {
+        SourceConfig::Builtin(metric_name) => {
             // Keep registry lookup and insertion under one guard. An `if let`
             // directly on `lock()` keeps its temporary guard alive through the
             // entire expression; trying to lock again in the `else` branch then
@@ -2008,10 +1990,10 @@ fn collect_card_metric(
                 if let Some(metric) = registry.get(card_id).cloned() {
                     metric
                 } else {
-                    let new_metric = match create_builtin_metric(&metric_name) {
+                    let new_metric = match create_builtin_metric(metric_name) {
                         Some(metric) => metric,
                         None => {
-                            return MetricResult::error(format!("未知的内置指标: {}", metric_name));
+                            return MetricResult::error(format!("未知的内置指标: {metric_name}"));
                         }
                     };
                     let metric = Arc::new(Mutex::new(new_metric));
@@ -2023,7 +2005,10 @@ fn collect_card_metric(
             result
         }
 
-        SourceKind::Command | SourceKind::File | SourceKind::Http | SourceKind::StaticValue => {
+        SourceConfig::Command(_)
+        | SourceConfig::File(_)
+        | SourceConfig::Http(_)
+        | SourceConfig::Text(_) => {
             let persistent = {
                 let mut registry = persistent_sources.lock().unwrap();
                 if let Some(source) = registry.get(card_id).cloned() {
@@ -2048,95 +2033,61 @@ fn build_persistent_source(
     source: &SourceConfig,
     max_output: usize,
 ) -> Result<PersistentSource, MetricResult> {
-    match source.source_type {
-        SourceKind::Command => {
-            let program = source.program.as_deref().unwrap_or("echo").to_string();
-            let args = source.args.clone().unwrap_or_default();
-            let timeout = source.timeout_seconds;
-            let max_out = source.max_output_bytes.min(max_output).max(1);
-            let reverse = source
-                .options
-                .as_ref()
-                .and_then(|o| o.get("reverse_lines"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let max_sub = source
-                .options
-                .as_ref()
-                .and_then(|o| o.get("max_subtitle_lines"))
-                .and_then(|v| v.as_integer())
-                .unwrap_or(0) as usize;
+    match source {
+        SourceConfig::Command(command) => {
+            let (program, args) = command
+                .run
+                .split_first()
+                .map(|(program, args)| (program.clone(), args.to_vec()))
+                .ok_or_else(|| MetricResult::error("command.run 至少需要一个程序名"))?;
+            let max_out = command.max_output_bytes.min(max_output).max(1);
 
             Ok(PersistentSource::Command(CommandMetric::new(
-                program, args, timeout, max_out, reverse, max_sub,
+                program,
+                args,
+                command.timeout_seconds,
+                max_out,
+                command.reverse_lines,
+                command.subtitle_lines,
             )))
         }
-        SourceKind::File => {
-            let path = match &source.path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    return Err(MetricResult::error("未指定文件路径"));
-                }
-            };
-
-            let first_line_only = source
-                .options
-                .as_ref()
-                .and_then(|o| o.get("first_line_only"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            Ok(PersistentSource::File(FileMetric::new(
-                path,
-                first_line_only,
-            )))
-        }
-        SourceKind::Http => {
-            let url = match &source.url {
-                Some(u) => u.clone(),
-                None => {
-                    return Err(MetricResult::error("未指定 HTTP URL"));
-                }
-            };
-
-            let method = source.method.clone();
-            let headers = source.headers.clone();
-            let body = source.body.clone();
-            let timeout = source.timeout_seconds;
-            let parser = source.parser.clone();
-            let max_out = source.max_output_bytes.min(max_output).max(1);
+        SourceConfig::File(file) => Ok(PersistentSource::File(FileMetric::new(
+            PathBuf::from(&file.path),
+            file.first_line,
+        ))),
+        SourceConfig::Http(http) => {
+            let max_out = http.max_output_bytes.min(max_output).max(1);
 
             Ok(PersistentSource::Http(HttpMetric::new(
-                url, method, headers, body, timeout, parser, max_out,
+                http.url.clone(),
+                http.method.clone(),
+                http.headers.clone(),
+                http.body.clone(),
+                http.timeout_seconds,
+                http.parser.clone(),
+                max_out,
             )))
         }
-        SourceKind::StaticValue => {
-            let value = source
-                .options
-                .as_ref()
-                .and_then(|o| o.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-
-            Ok(PersistentSource::Static(MetricResult {
-                value: CardValue::Text(value.to_string()),
-                subtitle: None,
-                tooltip: None,
-                state: MetricState::Normal,
-                cached: false,
-                metadata: None,
-            }))
+        SourceConfig::Text(value) => Ok(PersistentSource::Static(MetricResult {
+            value: CardValue::Text(value.clone()),
+            subtitle: None,
+            tooltip: None,
+            state: MetricState::Normal,
+            cached: false,
+            metadata: None,
+        })),
+        SourceConfig::Builtin(_) => {
+            Err(MetricResult::error("内置数据源不能作为通用持久数据源构建"))
         }
-        SourceKind::Builtin => Err(MetricResult::error("内置数据源不能作为通用持久数据源构建")),
     }
 }
 
 fn task_policy(card: &CardConfig) -> TaskPolicy {
-    let source_type = card.source.as_ref().map(|source| source.source_type);
+    let source_type = card.source.as_ref().map(SourceConfig::kind);
     let metric = card
         .source
         .as_ref()
-        .and_then(|source| source.metric.as_deref())
+        .and_then(SourceConfig::builtin_metric)
         .unwrap_or_default();
     let class = match card.runtime.class {
         CardRuntimeClass::SystemRealtime => TaskClass::SystemRealtime,
@@ -2151,7 +2102,7 @@ fn task_policy(card: &CardConfig) -> TaskPolicy {
             Some(SourceKind::Command) => TaskClass::Command,
             Some(SourceKind::Http) => TaskClass::Http,
             Some(SourceKind::File) => TaskClass::File,
-            Some(SourceKind::StaticValue) => TaskClass::Static,
+            Some(SourceKind::Text) => TaskClass::Static,
             Some(SourceKind::Builtin)
                 if matches!(
                     metric,
@@ -2598,7 +2549,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             10,
             "progress",
             5,
-            SourceKind::Builtin,
             "cpu",
             Some("computer-symbolic"),
             Some("处理器总占用"),
@@ -2610,7 +2560,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             20,
             "progress",
             10,
-            SourceKind::Builtin,
             "memory",
             Some("chip-symbolic"),
             Some("已用 / 总量"),
@@ -2622,7 +2571,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             30,
             "progress",
             30,
-            SourceKind::Builtin,
             "battery_capacity",
             Some("battery-level-100-symbolic"),
             Some("当前剩余容量"),
@@ -2634,7 +2582,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             40,
             "value",
             30,
-            SourceKind::Builtin,
             "battery_temperature",
             Some("sensors-temperature-symbolic"),
             Some("电池当前温度"),
@@ -2646,7 +2593,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             50,
             "value",
             60,
-            SourceKind::Builtin,
             "uptime",
             Some("hourglass-symbolic"),
             Some("系统已运行时长"),
@@ -2658,7 +2604,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             60,
             "value",
             15,
-            SourceKind::Builtin,
             "power",
             Some("battery-symbolic"),
             Some("瞬时与平均功耗"),
@@ -2670,7 +2615,6 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             70,
             "status",
             15,
-            SourceKind::Builtin,
             "network",
             Some("network-wireless-signal-excellent-symbolic"),
             Some("连接状态与 IP 地址"),
@@ -2713,7 +2657,6 @@ fn card(
     order: i32,
     renderer: &str,
     interval: u64,
-    source_type: SourceKind,
     metric: &str,
     icon: Option<&str>,
     desc: Option<&str>,
@@ -2733,21 +2676,7 @@ fn card(
         enabled: true,
         icon: icon.map(|s| s.to_string()),
         description: desc.map(|s| s.to_string()),
-        source: Some(SourceConfig {
-            source_type,
-            metric: Some(metric.to_string()),
-            path: None,
-            program: None,
-            args: None,
-            timeout_seconds: 10,
-            max_output_bytes: 20000,
-            method: None,
-            url: None,
-            headers: None,
-            body: None,
-            options: None,
-            parser: None,
-        }),
+        source: Some(SourceConfig::Builtin(metric.to_string())),
         display: None,
         cache_ttl_seconds: None,
         schedule: None,

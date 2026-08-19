@@ -130,7 +130,7 @@ lexical file-name order; subdirectories and other extensions are ignored. This
 makes a card or page exportable by copying one file, with no include list to
 maintain. Rename a module to `.disabled` to turn it off.
 
-Configuration uses the strict, non-migrating schema v2. `schema_version = 2`
+Configuration uses the strict, non-migrating schema v3. `schema_version = 3`
 is required at the document root; unknown fields, obsolete aliases, and unknown
 enum values reject the configuration instead of being ignored. Repository
 examples and the active local configuration must be updated together whenever
@@ -147,7 +147,7 @@ are documented in [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md).
 
 The top-level sections are:
 
-- `schema_version`: required configuration interface version; currently `2`.
+- `schema_version`: required configuration interface version; currently `3`.
 - `[app]`: title, logging, output limits, and config reload.
 - `[runtime]`: foreground inhibition, low-power display/refresh policy,
   external-power behavior, and agent protection/notification policy.
@@ -160,7 +160,7 @@ The top-level sections are:
 A module starts with the same schema version and may have a descriptive name:
 
 ```toml
-schema_version = 2
+schema_version = 3
 name = "workstation"
 
 [[cards]]
@@ -169,17 +169,25 @@ name = "workstation"
 
 Duplicate ids are rejected by default. A deliberate personal overlay can set
 `replace_existing = true`; that module may replace earlier page/card/action ids
-and may own complete `[app]`, `[ui]`, or `[runtime]` sections. Settings are
-saved back to the last module that owns the entry, so the default
+and override individual `[app]`, `[ui]`, or `[runtime]` fields. Omitted fields
+continue to inherit the main file. Changed settings are saved back to the last
+module that owns the section, so the default
 `config.toml` remains unchanged. See
 [the standalone module example](config/config.d/50-custom.example.toml).
 
-Validate the main file, every active module, duplicate/override rules, and
-compiled plugin options without opening the UI:
+Validate, format, or generate configuration without opening the UI. Without
+`--module`, `add` presents the existing module files plus a create-new choice.
+An explicit target may also name an existing file or a new module. Existing
+files retain their replacement policy; new personal modules enable
+`replace_existing`. Thus a personal override wins over a matching default,
+without hard-coding any user-specific destination:
 
 ```sh
-pulsedeck --check-config
-pulsedeck --check-config /path/to/config.toml
+pulsedeck config check
+pulsedeck config check /path/to/config.toml
+pulsedeck config add builtin cpu --id cpu-personal --title CPU --renderer progress --refresh 5s
+pulsedeck config add command --id kernel --title Kernel --renderer text --refresh 1h --module 50-workstation.toml -- uname -r
+pulsedeck config format # canonicalizes the root and modules; comments are removed
 ```
 
 A minimal custom card is:
@@ -190,13 +198,8 @@ id = "kernel"
 title = "Kernel"
 page = "monitor"
 renderer = "text"
-refresh_interval = 3600
-
-[cards.source]
-type = "command"
-program = "uname"
-args = ["-r"]
-timeout_seconds = 5
+refresh = "1h"
+source = { command = { run = ["uname", "-r"], timeout = "5s" } }
 ```
 
 Standard non-plugin cards can also derive named visual states from their current
@@ -212,13 +215,13 @@ the complete page hierarchy can be rebuilt.
 
 ## Sources and renderers
 
-| Source | Required fields | Use |
-| --- | --- | --- |
-| `builtin` | `metric` | Efficient native Linux system metrics. |
-| `file` | `path` | Read a text/sysfs/procfs file. |
-| `command` | `program`, optional `args` | Run a bounded subprocess without a shell. |
-| `http` | `url`, optional method/headers/body/parser | Fetch local or remote data. |
-| `static_value` | `options.value` | Labels and fixed informational cards. |
+| Source syntax | Use |
+| --- | --- |
+| `{ builtin = "cpu" }` | Efficient native Linux system metrics. |
+| `{ file = { path = "/path" } }` | Read a text/sysfs/procfs file. |
+| `{ command = { run = ["program", "arg"] } }` | Run a bounded subprocess without a shell. |
+| `{ http = { url = "https://…" } }` | Fetch local or remote data. |
+| `{ text = "fixed content" }` | Labels and fixed informational cards. |
 
 Renderers are `value`, `progress`, `status`, `text`, `list`, `composite`, and
 `action`. Choose a renderer compatible with the value returned by the source;

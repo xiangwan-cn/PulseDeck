@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 
 [app]
 title = "PulseDeck"
@@ -59,13 +59,11 @@ title = "CPU 使用率"
 page = "monitor"
 order = 10
 renderer = "progress"
-refresh_interval = 5
+refresh = "5s"
 icon = "computer-symbolic"
 description = "处理器总占用"
 
-[cards.source]
-type = "builtin"
-metric = "cpu"
+source = { builtin = "cpu" }
 
 [[cards]]
 id = "memory"
@@ -73,13 +71,11 @@ title = "内存使用"
 page = "monitor"
 order = 20
 renderer = "progress"
-refresh_interval = 10
+refresh = "10s"
 icon = "chip-symbolic"
 description = "已用 / 总量"
 
-[cards.source]
-type = "builtin"
-metric = "memory"
+source = { builtin = "memory" }
 
 [[cards]]
 id = "battery"
@@ -87,13 +83,11 @@ title = "电池电量"
 page = "monitor"
 order = 30
 renderer = "progress"
-refresh_interval = 30
+refresh = "30s"
 icon = "battery-level-100-symbolic"
 description = "当前剩余容量"
 
-[cards.source]
-type = "builtin"
-metric = "battery_capacity"
+source = { builtin = "battery_capacity" }
 
 [[cards]]
 id = "battery-temp"
@@ -101,13 +95,11 @@ title = "电池温度"
 page = "monitor"
 order = 40
 renderer = "value"
-refresh_interval = 30
+refresh = "30s"
 icon = "sensors-temperature-symbolic"
 description = "电池当前温度"
 
-[cards.source]
-type = "builtin"
-metric = "battery_temperature"
+source = { builtin = "battery_temperature" }
 
 # 普通卡片可按数值、文本、状态级别或数据源状态切换视觉状态。
 # 颜色只接受 CSS 十六进制；背景数组会生成低饱和渐变。
@@ -151,13 +143,11 @@ title = "运行时间"
 page = "monitor"
 order = 50
 renderer = "value"
-refresh_interval = 60
+refresh = "1m"
 icon = "hourglass-symbolic"
 description = "系统已运行时长"
 
-[cards.source]
-type = "builtin"
-metric = "uptime"
+source = { builtin = "uptime" }
 
 [[cards]]
 id = "power"
@@ -165,13 +155,11 @@ title = "实时功耗"
 page = "monitor"
 order = 60
 renderer = "value"
-refresh_interval = 15
+refresh = "15s"
 icon = "battery-symbolic"
 description = "瞬时与平均功耗 · 预估剩余时长"
 
-[cards.source]
-type = "builtin"
-metric = "power"
+source = { builtin = "power" }
 
 [[cards]]
 id = "network-status"
@@ -179,13 +167,11 @@ title = "网络状态"
 page = "monitor"
 order = 70
 renderer = "status"
-refresh_interval = 15
+refresh = "15s"
 icon = "network-wireless-signal-excellent-symbolic"
 description = "连接状态与 IP 地址"
 
-[cards.source]
-type = "builtin"
-metric = "network"
+source = { builtin = "network" }
 
 [[cards]]
 id = "scheduled-command-example"
@@ -193,22 +179,18 @@ title = "定时命令示例"
 page = "monitor"
 order = 80
 renderer = "text"
-refresh_interval = 3600
-cache_ttl_seconds = 86400
+refresh = "1h"
+cache_ttl = "1d"
 schedule = "daily@08:00,20:00"
 enabled = false
 icon = "alarm-symbolic"
 description = "每天在配置时间点运行一次"
 
-[cards.source]
-type = "command"
-program = "date"
-args = ["+%F %T"]
-timeout_seconds = 5
+source = { command = { run = ["date", "+%F %T"], timeout = "5s" } }
 
 # 可选原生指标（默认不创建卡片）：load_average、swap、process_count、
 # cpu_temperature、filesystem、network_traffic。
-# 复制任一 [[cards]]，并将 source.type 设为 builtin、metric 设为上述名称即可，
+# 复制任一 [[cards]]，并将 `source = { builtin = "指标名" }` 中的指标名替换即可，
 # 只改配置，无需重新编译。
 
 [[actions]]

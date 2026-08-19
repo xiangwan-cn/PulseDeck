@@ -163,7 +163,7 @@ application visual brightness, balanced refresh saving, external realtime when
 a supply reports `online=1`, agent brightness protection for 60
 minutes, and 15 seconds of attention after an important event.
 
-Both examples use strict `schema_version = 2`. Runtime and card configuration
+Both examples use strict `schema_version = 3`. Runtime and card configuration
 does not carry legacy aliases or ignored placeholder fields: a version mismatch,
 unknown typed field, or unknown enum value rejects the reload and leaves the
 last successfully loaded configuration active. Schema changes therefore update

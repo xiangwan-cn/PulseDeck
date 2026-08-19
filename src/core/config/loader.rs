@@ -13,6 +13,13 @@ struct LoadedFragment {
     config: ConfigFragment,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigModuleInfo {
+    pub file_name: String,
+    pub name: Option<String>,
+    pub replace_existing: bool,
+}
+
 pub struct ConfigManager {
     path: PathBuf,
     config: AppConfig,
@@ -43,6 +50,19 @@ impl ConfigManager {
 
     pub fn loaded_module_count(&self) -> usize {
         self.fragments.len()
+    }
+
+    pub(crate) fn loaded_modules(&self) -> Vec<ConfigModuleInfo> {
+        self.fragments
+            .iter()
+            .filter_map(|fragment| {
+                Some(ConfigModuleInfo {
+                    file_name: fragment.path.file_name()?.to_str()?.to_string(),
+                    name: fragment.config.name.clone(),
+                    replace_existing: fragment.config.replace_existing,
+                })
+            })
+            .collect()
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -79,6 +99,7 @@ impl ConfigManager {
     /// Persist changes back to the document that owns each entry. New entries
     /// are placed in the main file; existing module entries remain modular.
     pub fn save(&mut self) -> Result<(), AppError> {
+        let previous = merge_config(&self.path, &self.root, &self.fragments)?;
         let mut root = self.root.clone();
         let mut fragments = self.fragments.clone();
 
@@ -86,7 +107,11 @@ impl ConfigManager {
             .iter()
             .rposition(|fragment| fragment.config.app.is_some())
         {
-            fragments[owner].config.app = Some(self.config.app.clone());
+            fragments[owner]
+                .config
+                .app
+                .get_or_insert_default()
+                .record_changes(&previous.app, &self.config.app);
         } else {
             root.app = self.config.app.clone();
         }
@@ -94,7 +119,11 @@ impl ConfigManager {
             .iter()
             .rposition(|fragment| fragment.config.ui.is_some())
         {
-            fragments[owner].config.ui = Some(self.config.ui.clone());
+            fragments[owner]
+                .config
+                .ui
+                .get_or_insert_default()
+                .record_changes(&previous.ui, &self.config.ui);
         } else {
             root.ui = self.config.ui.clone();
         }
@@ -102,7 +131,11 @@ impl ConfigManager {
             .iter()
             .rposition(|fragment| fragment.config.runtime.is_some())
         {
-            fragments[owner].config.runtime = Some(self.config.runtime.clone());
+            fragments[owner]
+                .config
+                .runtime
+                .get_or_insert_default()
+                .record_changes(&previous.runtime, &self.config.runtime);
         } else {
             root.runtime = self.config.runtime.clone();
         }
@@ -205,6 +238,65 @@ impl ConfigManager {
         Ok(())
     }
 
+    /// Rewrite the root and every loaded module in the canonical compact
+    /// schema. This is deliberately explicit because formatting removes
+    /// comments while preserving configuration values and module ownership.
+    pub(crate) fn format_documents(&mut self) -> Result<(), AppError> {
+        write_document(&self.path, &self.root)?;
+        for fragment in &self.fragments {
+            write_document(&fragment.path, &fragment.config)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or replace a card in a selected module. Existing modules keep
+    /// their name and replacement policy; a newly generated module is a named
+    /// personal overlay and therefore opts into intentional replacement.
+    pub(crate) fn upsert_module_card(
+        &mut self,
+        file_name: &str,
+        new_module_name: Option<&str>,
+        card: super::CardConfig,
+    ) -> Result<PathBuf, AppError> {
+        validate_module_file_name(file_name)?;
+        let path = self.module_dir().join(file_name);
+        let mut fragments = self.fragments.clone();
+        if let Some(fragment) = fragments.iter_mut().find(|fragment| fragment.path == path) {
+            if let Some(existing) = fragment
+                .config
+                .cards
+                .iter_mut()
+                .find(|existing| existing.id == card.id)
+            {
+                *existing = card;
+            } else {
+                fragment.config.cards.push(card);
+            }
+        } else {
+            fragments.push(LoadedFragment {
+                path: path.clone(),
+                config: ConfigFragment {
+                    name: new_module_name.map(str::to_string),
+                    replace_existing: true,
+                    cards: vec![card],
+                    ..ConfigFragment::default()
+                },
+            });
+            fragments.sort_by(|left, right| left.path.cmp(&right.path));
+        }
+
+        let merged = merge_config(&self.path, &self.root, &fragments)?;
+        let next = fragments
+            .iter()
+            .find(|fragment| fragment.path == path)
+            .expect("personal module is present");
+        std::fs::create_dir_all(self.module_dir())?;
+        write_document(&path, &next.config)?;
+        self.fragments = fragments;
+        self.config = merged;
+        Ok(path)
+    }
+
     /// Add generated plugin defaults to their own module and immediately make
     /// them part of the merged runtime configuration.
     pub(crate) fn ensure_module(
@@ -212,17 +304,8 @@ impl ConfigManager {
         file_name: &str,
         addition: ConfigFragment,
     ) -> Result<(), AppError> {
+        validate_module_file_name(file_name)?;
         let file = Path::new(file_name);
-        if file.components().count() != 1
-            || !matches!(
-                file.extension().and_then(|value| value.to_str()),
-                Some("toml" | "json")
-            )
-        {
-            return Err(AppError::Config(format!(
-                "invalid config module file name: {file_name}"
-            )));
-        }
         validate_schema(addition.schema_version, file)?;
 
         let path = self.module_dir().join(file);
@@ -253,6 +336,22 @@ impl ConfigManager {
         self.fragments = fragments;
         self.config = merged;
         Ok(())
+    }
+}
+
+fn validate_module_file_name(file_name: &str) -> Result<(), AppError> {
+    let file = Path::new(file_name);
+    if file.components().count() == 1
+        && matches!(
+            file.extension().and_then(|value| value.to_str()),
+            Some("toml" | "json")
+        )
+    {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "invalid config module file name: {file_name}"
+        )))
     }
 }
 
@@ -346,13 +445,13 @@ fn merge_config(
                 });
             }
             if let Some(app) = &fragment.config.app {
-                merged.app = app.clone();
+                app.apply_to(&mut merged.app);
             }
             if let Some(ui) = &fragment.config.ui {
-                merged.ui = ui.clone();
+                ui.apply_to(&mut merged.ui);
             }
             if let Some(runtime) = &fragment.config.runtime {
-                merged.runtime = runtime.clone();
+                runtime.apply_to(&mut merged.runtime);
             }
         }
         merge_entries(

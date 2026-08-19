@@ -2,7 +2,7 @@
 # Build with: cargo build --release --features pet-card
 # Frame paths are relative to asset_root. Missing animations fall back to emoji.
 
-schema_version = 2
+schema_version = 3
 
 [[cards]]
 id = "codex-pet"

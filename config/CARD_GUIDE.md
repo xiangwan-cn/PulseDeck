@@ -4,12 +4,13 @@
 `title`、`order`、`renderer` 和数据源即可。内置渲染器包括 `value`、
 `progress`、`status`、`text`、`action`；`list` 和 `composite` 只由插件卡片产出，
 普通数据源卡片选择它们会显示空白（见文末「配置限制与严格字段」）。数据源包括
-`builtin`、`file`、`command`、`http` 和 `static_value`。
+`builtin`、`file`、`command`、`http` 和 `text`。v3 用按类型分组的紧凑数据源，
+不再使用通用的 `type/program/args/options` 字段袋。
 
-当前配置接口固定为 schema v2，文件第一项必须是：
+当前配置接口固定为 schema v3，文件第一项必须是：
 
 ```toml
-schema_version = 2
+schema_version = 3
 ```
 
 PulseDeck 不迁移或忽略旧接口：版本不符、未知字段、旧别名和未知枚举值都会使整份配置
@@ -31,7 +32,7 @@ config.d/
 └── 90-scrcpy-forge.toml
 ```
 
-每个模块都必须有 `schema_version = 2`，可选 `name = "workstation"` 仅用于标识。普通
+每个模块都必须有 `schema_version = 3`，可选 `name = "workstation"` 仅用于标识。普通
 模块可包含任意完整的 `[[pages]]`、`[[cards]]`、`[[actions]]`；因此导出一张卡片时，
 把卡片及其引用的 action 放进同一个文件即可。复制到另一台机器后无需修改主配置。
 示例见 [`config/config.d/50-custom.example.toml`](config.d/50-custom.example.toml)。
@@ -40,27 +41,42 @@ config.d/
 显式设置：
 
 ```toml
-schema_version = 2
+schema_version = 3
 name = "workstation"
 replace_existing = true
 
 [runtime]
-# 完整 runtime 配置；该模块成为此段的保存位置
+idle_power_saving = false     # 只写差异，其余字段继承主配置
 
 [[cards]]
 id = "cpu"                   # 有意替换更早文件中的 cpu
 # ...完整卡片配置...
 ```
 
-只有 `replace_existing = true` 的模块才能包含 `[app]`、`[ui]`、`[runtime]`，这三个段按
-完整段替换而不是逐字段拼接。页面、卡片和操作按 ID 替换。设置页修改会写回最后拥有该
-条目的模块，不会把模块内容摊平到 `config.toml`。把文件改名为 `.disabled` 可临时停用；
+只有 `replace_existing = true` 的模块才能包含 `[app]`、`[ui]`、`[runtime]`；这三个段按
+字段覆盖，未声明字段继续继承主配置。页面、卡片和操作仍按完整 ID 条目替换。设置页修改
+会把发生变化的字段写回最后拥有该段的模块，不会把模块内容摊平到 `config.toml`。把文件改名为 `.disabled` 可临时停用；
 删除、加入模块或改变页面/卡片数量后应重启应用，普通值与颜色修改可热重载。任一模块
 解析失败时整次重载回滚，继续使用上一次成功配置。
 
-修改后可先运行 `pulsedeck --check-config`；它会校验主文件、全部启用模块、覆盖关系以及
+修改后可先运行 `pulsedeck config check`；它会校验主文件、全部启用模块、覆盖关系以及
 当前二进制实际编译进来的插件选项，不启动 GTK 窗口。也可在参数中传入另一个主配置路径，
 其模块目录仍按该文件同级的 `config.d/` 解析。
+
+不想手写完整卡片时可使用生成器。不指定 `--module` 时，它会列出 `config.d` 中的已有
+配置文件，并提供“新建配置文件”；也可在脚本中直接指定已有文件或新名称：
+
+```sh
+pulsedeck config add builtin load_average --id load --title "系统负载" --refresh 30s
+pulsedeck config add command --id kernel --title "内核" --renderer text --refresh 1h --module 50-workstation.toml -- uname -r
+pulsedeck config add file /proc/sys/kernel/hostname --id hostname --title "主机名"
+pulsedeck config add http https://example.invalid/status --id service --title "服务"
+pulsedeck config add text "本地仪表盘" --id note --title "说明"
+```
+
+选择已有文件时保留该文件原有的 `replace_existing` 属性；新建的个人文件会自动设置它。
+所以在个人覆盖文件中重定义默认 ID 时由个人配置优先，但工具不会硬编码用户专属文件名。
+`pulsedeck config format` 会整理主文件和全部模块并移除注释，适合机器生成或导出前使用。
 
 例如，启用已内置但默认不显示的系统负载：
 
@@ -71,13 +87,11 @@ title = "系统负载"
 page = "monitor"
 order = 100
 renderer = "value"
-refresh_interval = 30
+refresh = "30s"
 enabled = true
 icon = "utilities-system-monitor-symbolic"
 
-[cards.source]
-type = "builtin"
-metric = "load_average"
+source = { builtin = "load_average" }
 ```
 
 可用的隐藏原生指标：
@@ -105,16 +119,16 @@ title = "标题"                 # 必填
 page = "monitor"              # 必填，对应 [[pages]].id
 order = 10                    # 数值越小越靠前
 renderer = "value"            # value/progress/status/text/list/composite/action
-refresh_interval = 30         # 秒
+refresh = "30s"               # 支持 5s、2m、1h、1d
 enabled = true
 icon = "computer-symbolic"    # 可选，Freedesktop 图标名
 description = "说明"           # 可选
-cache_ttl_seconds = 300        # 可选
+cache_ttl = "5m"                # 可选
 click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[actions]]
 # schedule = "daily@08:00,20:00"
 ```
 
-`refresh_interval` 控制普通轮询间隔。设置 `schedule` 后，应用按每日固定时间生成独立
+`refresh` 必须带 `s`、`m`、`h` 或 `d` 单位。设置 `schedule` 后，应用按每日固定时间生成独立
 缓存周期。失败任务会进行有上限的退避，避免持续快速重试。
 
 调度器保留这里的原始间隔，再根据统一运行模式计算实际间隔。普通模式使用原值；
@@ -164,16 +178,12 @@ title = "服务状态"
 page = "monitor"
 order = 90
 renderer = "status"
-refresh_interval = 5
+refresh = "5s"
 icon = "system-run-symbolic"
 description = "点击卡片切换服务"
 click_action = "toggle-service"
 
-[cards.source]
-type = "command"
-program = "sh"
-args = ["-c", "if pgrep -f '[m]yservice' >/dev/null 2>&1; then echo '● 运行中'; else echo '○ 已停止'; fi"]
-timeout_seconds = 5
+source = { command = { run = ["sh", "-c", "if pgrep -f '[m]yservice' >/dev/null 2>&1; then echo '● 运行中'; else echo '○ 已停止'; fi"], timeout = "5s" } }
 
 [[actions]]
 id = "toggle-service"
@@ -191,8 +201,8 @@ command = ["sh", "-c", "if pgrep -f '[m]yservice' >/dev/null 2>&1; then pkill -f
 
 要点：
 
-- 命令源直接执行 `program`，不经 shell；轻量场景可用 `sh -c` 包一层，复杂逻辑推荐
-  写成独立脚本作为 `program`（见「命令」）。
+- 命令源直接执行 `run` 数组的第一项，不经 shell；轻量场景可用 `sh -c` 包一层，复杂逻辑推荐
+  写成独立脚本并把路径作为第一项（见「命令」）。
 - `pgrep -f` 会匹配完整命令行，用 `[m]yservice` 字符类写法可避免匹配到执行检测的
   `sh -c` 自身，否则状态会恒为“运行中”、停止时还会误杀自己。
 - 后台启动的进程务必 `</dev/null` 并把 stdout/stderr 重定向到日志文件，否则会占住
@@ -218,7 +228,7 @@ title = "我的卡片"
 page = "tools"      # 引用上面的页面 id
 order = 10
 renderer = "value"
-refresh_interval = 30
+refresh = "30s"
 icon = "computer-symbolic"
 ```
 
@@ -227,14 +237,15 @@ icon = "computer-symbolic"
 
 ## 数据源示例
 
+`source` 是单一类型映射，不能同时声明两种数据源。简单源保持一行即可；HTTP 解析器等
+复杂结构也仍位于对应类型内部。
+
 ### 内置指标
 
 内置指标不启动外部进程，适合系统监控：
 
 ```toml
-[cards.source]
-type = "builtin"
-metric = "filesystem"
+source = { builtin = "filesystem" }
 ```
 
 全部名称：`cpu`、`memory`、`uptime`、`battery_capacity`、
@@ -245,12 +256,8 @@ metric = "filesystem"
 ### 文件
 
 ```toml
-[cards.source]
-type = "file"
-path = "/proc/sys/kernel/hostname"
-
-[cards.source.options]
-first_line_only = true
+source = { file = { path = "/proc/sys/kernel/hostname" } }
+# 需要完整文件时：source = { file = { path = "/path", first_line = false } }
 ```
 
 文件源适合 procfs、sysfs 或普通文本。路径属于运行设备的本地配置；公开示例不要写入
@@ -260,35 +267,26 @@ first_line_only = true
 ### 命令
 
 ```toml
-[cards.source]
-type = "command"
-program = "uname"
-args = ["-r"]
-timeout_seconds = 5
-max_output_bytes = 4096
-
-[cards.source.options]
-reverse_lines = false
-max_subtitle_lines = 3
+source = { command = { run = ["uname", "-r"], timeout = "5s", max_output = 4096, subtitle_lines = 3 } }
 ```
 
-`program` 和 `args` 直接传给子进程，不经过 shell。需要管道、重定向或变量展开时，
-应在自己的本地脚本中实现，并将脚本作为 `program`；不要把未经信任的内容拼入命令。
+`run` 的数组成员直接传给子进程，不经过 shell；`reverse_lines = true` 可反转多行输出。
+需要管道、重定向或变量展开时，应在自己的本地脚本中实现，并将脚本路径作为第一项；
+不要把未经信任的内容拼入命令。
 命令失败时，卡片只显示 stderr 最后一个非空行（例如 Python traceback 最后的
 `RuntimeError` 消息），完整 stderr 保留在 tooltip 中，因此离线错误不会撑高卡片。
 
 ### HTTP
 
 ```toml
-[cards.source]
-type = "http"
+[cards.source.http]
 url = "https://example.invalid/api/status"
 method = "GET"
-timeout_seconds = 10
-max_output_bytes = 65536
+timeout = "10s"
+max_output = 65536
 headers = { Accept = "application/json" }
 
-[cards.source.parser]
+[cards.source.http.parser]
 type = "json_path"
 path = "data.status"
 ```
@@ -301,11 +299,7 @@ HTTP、command 和 file 数据源实例会长期复用；正则解析器只编�
 ### 静态值
 
 ```toml
-[cards.source]
-type = "static_value"
-
-[cards.source.options]
-value = "本地仪表盘"
+source = { text = "本地仪表盘" }
 ```
 
 静态值适合说明、分组提示或暂不需要轮询的数据。
@@ -322,7 +316,7 @@ value = "本地仪表盘"
 正则提取实例（从 `Load: 0.5` 中提取数字）：
 
 ```toml
-[cards.source.parser]
+[cards.source.http.parser]
 type = "regex"
 pattern = "Load: ([0-9.]+)"
 capture = 1
@@ -331,7 +325,7 @@ capture = 1
 数值解析示例：
 
 ```toml
-[cards.source.parser]
+[cards.source.http.parser]
 type = "number"
 divisor = 1000
 decimal_places = 1
@@ -504,7 +498,7 @@ background_opacity = 0.12      # 0.0–1.0，默认 0.12
 
 ```toml
 schedule = "daily@08:05,12:05,16:05,20:05"
-cache_ttl_seconds = 14400
+cache_ttl = "4h"
 ```
 
 该机制不依赖卡片 ID、标题或脚本内容，任意定时联网或命令卡片都可直接复用。
@@ -555,14 +549,14 @@ Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 
 ## 配置限制与严格字段
 
-schema v2 使用严格字段解析。以下限制会直接影响配置是否可被加载：
+schema v3 使用严格字段解析。以下限制会直接影响配置是否可被加载：
 
-- `renderer = "list"` / `"composite"`：普通数据源（builtin/command/file/http/static_value）
+- `renderer = "list"` / `"composite"`：普通数据源（builtin/command/file/http/text）
   无法产出列表或组合值，选择后卡片显示空白；仅插件卡片内部使用。
-- 数据源只有 `builtin`、`file`、`command`、`http`、`static_value`；旧的 `static`
+- 数据源只有 `builtin`、`file`、`command`、`http`、`text`；旧的 `static`
   别名会被拒绝。
-- 不存在 `source.shell` 字段；需要 shell 语义时明确设置 `program = "sh"`、
-  `args = ["-c", "..."]`，或把脚本写成本地文件作为 `program`。
+- 不存在 `source.shell` 字段；需要 shell 语义时在 `run` 中明确写
+  `["sh", "-c", "..."]`，或把本地脚本路径作为 `run` 第一项。
 - HTTP 解析器只有 `json_path`、`regex`、`number`、`first_line`；不存在
   `parser.steps`、`template` 或 `divide` 接口。
 - `[cards.runtime].class` 只接受本文列出的精确值，不接受 `system`、`network`、

@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+pub mod config_cli;
 pub mod error;
 pub mod error_limiter;
 pub mod power_debug;

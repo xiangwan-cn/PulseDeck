@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "app": {
     "title": "PulseDeck",
     "reload_on_change": true,
@@ -39,19 +39,18 @@
     {"id":"settings","title":"设置","icon":"preferences-system-symbolic","order":30}
   ],
   "cards": [
-    {"id":"cpu","title":"CPU 使用率","page":"monitor","order":10,"renderer":"progress","refresh_interval":5,"icon":"computer-symbolic","description":"处理器总占用","source":{"type":"builtin","metric":"cpu"}},
-    {"id":"memory","title":"内存使用","page":"monitor","order":20,"renderer":"progress","refresh_interval":10,"icon":"chip-symbolic","description":"已用 / 总量","source":{"type":"builtin","metric":"memory"}},
-    {"id":"battery","title":"电池电量","page":"monitor","order":30,"renderer":"progress","refresh_interval":30,"icon":"battery-level-100-symbolic","description":"当前剩余容量","source":{"type":"builtin","metric":"battery_capacity"}},
+    {"id":"cpu","title":"CPU 使用率","page":"monitor","order":10,"renderer":"progress","refresh":"5s","icon":"computer-symbolic","description":"处理器总占用","source":{"builtin":"cpu"}},
+    {"id":"memory","title":"内存使用","page":"monitor","order":20,"renderer":"progress","refresh":"10s","icon":"chip-symbolic","description":"已用 / 总量","source":{"builtin":"memory"}},
+    {"id":"battery","title":"电池电量","page":"monitor","order":30,"renderer":"progress","icon":"battery-level-100-symbolic","description":"当前剩余容量","source":{"builtin":"battery_capacity"}},
     {
       "id": "battery-temp",
       "title": "电池温度",
       "page": "monitor",
       "order": 40,
       "renderer": "value",
-      "refresh_interval": 30,
       "icon": "sensors-temperature-symbolic",
       "description": "电池当前温度",
-      "source": {"type": "builtin", "metric": "battery_temperature"},
+      "source": {"builtin": "battery_temperature"},
       "display": {
         "transition": {"duration_ms": 220, "easing": "ease-out"},
         "states": [
@@ -85,10 +84,10 @@
         ]
       }
     },
-    {"id":"uptime","title":"运行时间","page":"monitor","order":50,"renderer":"value","refresh_interval":60,"icon":"hourglass-symbolic","description":"系统已运行时长","source":{"type":"builtin","metric":"uptime"}},
-    {"id":"power","title":"实时功耗","page":"monitor","order":60,"renderer":"value","refresh_interval":15,"icon":"battery-symbolic","description":"瞬时与平均功耗 · 预估剩余时长","source":{"type":"builtin","metric":"power"}},
-    {"id":"network-status","title":"网络状态","page":"monitor","order":70,"renderer":"status","refresh_interval":15,"icon":"network-wireless-signal-excellent-symbolic","description":"连接状态与 IP 地址","source":{"type":"builtin","metric":"network"}},
-    {"id":"scheduled-command-example","title":"定时命令示例","page":"monitor","order":80,"renderer":"text","refresh_interval":3600,"cache_ttl_seconds":86400,"schedule":"daily@08:00,20:00","enabled":false,"icon":"alarm-symbolic","description":"每天在配置时间点运行一次","source":{"type":"command","program":"date","args":["+%F %T"],"timeout_seconds":5}}
+    {"id":"uptime","title":"运行时间","page":"monitor","order":50,"refresh":"1m","icon":"hourglass-symbolic","description":"系统已运行时长","source":{"builtin":"uptime"}},
+    {"id":"power","title":"实时功耗","page":"monitor","order":60,"refresh":"15s","icon":"battery-symbolic","description":"瞬时与平均功耗 · 预估剩余时长","source":{"builtin":"power"}},
+    {"id":"network-status","title":"网络状态","page":"monitor","order":70,"renderer":"status","refresh":"15s","icon":"network-wireless-signal-excellent-symbolic","description":"连接状态与 IP 地址","source":{"builtin":"network"}},
+    {"id":"scheduled-command-example","title":"定时命令示例","page":"monitor","order":80,"renderer":"text","refresh":"1h","cache_ttl":"1d","schedule":"daily@08:00,20:00","enabled":false,"icon":"alarm-symbolic","description":"每天在配置时间点运行一次","source":{"command":{"run":["date","+%F %T"],"timeout":"5s"}}}
   ],
   "actions": [
     {"id":"system-summary","name":"查看系统信息","description":"显示当前系统内核和架构","icon":"utilities-system-monitor-symbolic","page":"actions","timeout":5,"confirm":false,"command":["uname","-a"]}
