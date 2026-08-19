@@ -9,8 +9,8 @@ The generic `[cards.display.colors]`, `[[cards.display.states]]`, and
 non-plugin cards. A PetCard declares `kind = "pet-card"`, so its lifecycle
 artwork, state labels, transitions, and colors remain owned by the plugin
 configuration documented here and are never rewritten by generic card rules.
-The PetCard example is a fragment to append to a strict schema v2 PulseDeck
-configuration; it is not a standalone legacy configuration file.
+The PetCard example is a standalone strict schema v2 module for the automatic
+`config.d/` directory; it is not appended to the main configuration.
 
 ## Build
 
@@ -24,11 +24,12 @@ To build both optional integrations:
 cargo build --release --features scrcpy-forge,pet-card
 ```
 
-When the `pet-card` feature is present, PulseDeck automatically adds an enabled
-`codex-pet` card to a config that does not already contain one. It uses safe
-runtime defaults and emoji artwork without requiring AI or a manual config
-edit. To install custom artwork, copy the animation options from
-`src/plugins/pet_card/config.example.toml` and update `asset_root`.
+When the `pet-card` feature is present, PulseDeck creates
+`config.d/80-pet-card.toml` if no `codex-pet` card exists. A build without the
+feature never creates the module. The generated card uses safe runtime defaults
+without requiring AI or a manual edit. To install custom artwork, replace the
+generated module with `src/plugins/pet_card/config.example.toml` and update
+`asset_root`.
 
 Set `codex_completion_sound = true` in the global `[runtime]` section to play
 the desktop theme's single `complete` event for a completion, failure,
@@ -161,7 +162,7 @@ preference.
 
 ## Configuration reference
 
-The example at `src/plugins/pet_card/config.example.toml` is authoritative.
+The standalone module at `src/plugins/pet_card/config.example.toml` is authoritative.
 Important plugin options are:
 
 | Option | Default | Behavior |

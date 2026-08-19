@@ -29,6 +29,38 @@ pub fn tokio_handle() -> tokio::runtime::Handle {
 }
 
 fn main() -> glib::ExitCode {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--check-config")) {
+        let path = arguments
+            .next()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(core::config::config_path);
+        if arguments.next().is_some() {
+            eprintln!("usage: pulsedeck --check-config [CONFIG_FILE]");
+            return glib::ExitCode::FAILURE;
+        }
+        let mut manager = core::config::ConfigManager::new(path.clone());
+        return match manager
+            .load()
+            .and_then(|()| plugins::validate_config(manager.config()))
+        {
+            Ok(()) => {
+                println!(
+                    "configuration valid: {} modules, {} pages, {} cards, {} actions",
+                    manager.loaded_module_count(),
+                    manager.config().pages.len(),
+                    manager.config().cards.len(),
+                    manager.config().actions.len()
+                );
+                glib::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("configuration invalid at {}: {error}", path.display());
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
+
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))

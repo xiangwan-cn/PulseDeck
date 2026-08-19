@@ -1,6 +1,6 @@
 # PulseDeck 卡片配置指南
 
-编辑 `~/.config/pulsedeck/config.toml`，复制一个 `[[cards]]` 配置块并修改 `id`、
+编辑 `~/.config/pulsedeck/config.toml`，或在同级 `config.d/` 中创建独立模块；复制一个 `[[cards]]` 配置块并修改 `id`、
 `title`、`order`、`renderer` 和数据源即可。内置渲染器包括 `value`、
 `progress`、`status`、`text`、`action`；`list` 和 `composite` 只由插件卡片产出，
 普通数据源卡片选择它们会显示空白（见文末「配置限制与严格字段」）。数据源包括
@@ -16,6 +16,51 @@ PulseDeck 不迁移或忽略旧接口：版本不符、未知字段、旧别名�
 加载失败；热重载失败时继续保留上一次成功加载的运行配置。修改 schema 时应同时修改
 实际使用的 `~/.config/pulsedeck/config.toml`，而不是在程序中增加兼容分支。
 启动时被拒绝的配置也不会被默认配置或可选卡片自动写回覆盖。
+
+## 配置目录与模块
+
+PulseDeck 固定扫描 `~/.config/pulsedeck/config.d/`，不再提供另一套 include 列表。
+目录第一层所有扩展名严格为 `.toml` 或 `.json` 的普通文件都会加载，子目录不递归；
+文件名按字典序决定覆盖顺序。推荐用数字前缀表达用途，例如：
+
+```text
+config.toml
+config.d/
+├── 50-workstation.toml
+├── 80-pet-card.toml
+└── 90-scrcpy-forge.toml
+```
+
+每个模块都必须有 `schema_version = 2`，可选 `name = "workstation"` 仅用于标识。普通
+模块可包含任意完整的 `[[pages]]`、`[[cards]]`、`[[actions]]`；因此导出一张卡片时，
+把卡片及其引用的 action 放进同一个文件即可。复制到另一台机器后无需修改主配置。
+示例见 [`config/config.d/50-custom.example.toml`](config.d/50-custom.example.toml)。
+
+重复 ID 默认拒绝，防止多个模块静默争用同一条目。个人配置需要以默认配置为基线时，
+显式设置：
+
+```toml
+schema_version = 2
+name = "workstation"
+replace_existing = true
+
+[runtime]
+# 完整 runtime 配置；该模块成为此段的保存位置
+
+[[cards]]
+id = "cpu"                   # 有意替换更早文件中的 cpu
+# ...完整卡片配置...
+```
+
+只有 `replace_existing = true` 的模块才能包含 `[app]`、`[ui]`、`[runtime]`，这三个段按
+完整段替换而不是逐字段拼接。页面、卡片和操作按 ID 替换。设置页修改会写回最后拥有该
+条目的模块，不会把模块内容摊平到 `config.toml`。把文件改名为 `.disabled` 可临时停用；
+删除、加入模块或改变页面/卡片数量后应重启应用，普通值与颜色修改可热重载。任一模块
+解析失败时整次重载回滚，继续使用上一次成功配置。
+
+修改后可先运行 `pulsedeck --check-config`；它会校验主文件、全部启用模块、覆盖关系以及
+当前二进制实际编译进来的插件选项，不启动 GTK 窗口。也可在参数中传入另一个主配置路径，
+其模块目录仍按该文件同级的 `config.d/` 解析。
 
 例如，启用已内置但默认不显示的系统负载：
 
@@ -488,11 +533,12 @@ cache_ttl_seconds = 14400
 
 ## 可选 ScrcpyForge 页面
 
-编译 `scrcpy-forge` feature 后会自动加入缺失的默认页面，不需要再手动让 AI 配置；
-已有同 ID 页面保持不变。示例文件仅用于覆盖服务地址、尺寸或端点等默认值。
+编译 `scrcpy-forge` feature 后会在缺少同名页面时自动创建
+`config.d/90-scrcpy-forge.toml`，未编译该 feature 时不会复制插件配置；已有同 ID 页面
+保持不变。示例模块仅用于覆盖服务地址、尺寸或端点等默认值。
 
 该页面不属于通用卡片系统，默认不会编译。使用
-`cargo build --release --features scrcpy-forge` 启用，配置见
+`cargo build --release --features scrcpy-forge` 启用，独立配置模块见
 `src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
 重新进入后自动恢复。空闲模式仅更新设备元数据，不下载预览 PNG；服务端支持 ETag
 时未变化图片不传输，客户端内容哈希未变化时不重建纹理。每台设备拥有对应的预览卡和
@@ -502,7 +548,8 @@ cache_ttl_seconds = 14400
 ## 可选 PetCard
 
 PetCard 默认不编译。使用 `cargo build --release --features pet-card` 启用；编译进该
-feature 后会自动加入缺失的 `codex-pet` 卡片，emoji 回退无需额外配置。自定义帧配置、
+feature 后会在缺少同名卡片时创建 `config.d/80-pet-card.toml`，未编译时不会复制。
+默认回退无需额外配置。自定义帧配置、
 Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 [`docs/PET_CARD.md`](../docs/PET_CARD.md)。
 

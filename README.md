@@ -123,6 +123,13 @@ On first launch PulseDeck copies the bundled example to:
 ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 ```
 
+PulseDeck also scans the adjacent `config.d/` directory automatically. Each
+top-level `.toml` or `.json` file there is a standalone module containing
+pages, cards, actions, or an explicit named override. Files are loaded in
+lexical file-name order; subdirectories and other extensions are ignored. This
+makes a card or page exportable by copying one file, with no include list to
+maintain. Rename a module to `.disabled` to turn it off.
+
 Configuration uses the strict, non-migrating schema v2. `schema_version = 2`
 is required at the document root; unknown fields, obsolete aliases, and unknown
 enum values reject the configuration instead of being ignored. Repository
@@ -150,6 +157,31 @@ The top-level sections are:
 - `[[cards]]`: rendered values supplied by a configurable source.
 - `[[actions]]`: explicit user-triggered commands with optional confirmation.
 
+A module starts with the same schema version and may have a descriptive name:
+
+```toml
+schema_version = 2
+name = "workstation"
+
+[[cards]]
+# ...one or more complete cards...
+```
+
+Duplicate ids are rejected by default. A deliberate personal overlay can set
+`replace_existing = true`; that module may replace earlier page/card/action ids
+and may own complete `[app]`, `[ui]`, or `[runtime]` sections. Settings are
+saved back to the last module that owns the entry, so the default
+`config.toml` remains unchanged. See
+[the standalone module example](config/config.d/50-custom.example.toml).
+
+Validate the main file, every active module, duplicate/override rules, and
+compiled plugin options without opening the UI:
+
+```sh
+pulsedeck --check-config
+pulsedeck --check-config /path/to/config.toml
+```
+
 A minimal custom card is:
 
 ```toml
@@ -174,7 +206,7 @@ a restrained gradient, while `[cards.display.transition]` smooths state changes
 without adding a polling or animation timer. See the card guide for numeric,
 text, regex, semantic-level, and source-lifecycle matchers.
 
-When `reload_on_change = true`, value-level configuration changes are reloaded
+When `reload_on_change = true`, changes to the main file and active modules are reloaded
 while the app is running. Reopen the app after adding/removing pages or cards so
 the complete page hierarchy can be rebuilt.
 
@@ -194,13 +226,15 @@ built-in metrics already return the appropriate structured value.
 
 ## Optional ScrcpyForge integration
 
-Building with `--features scrcpy-forge` automatically adds the default
-ScrcpyForge page when it is absent. Existing page configuration is preserved;
-the standalone example is only needed for customization.
+Building with `--features scrcpy-forge` automatically creates
+`config.d/90-scrcpy-forge.toml` when the page is absent. Builds without that
+feature never create the file. Existing page configuration is preserved; the
+standalone example is only needed for customization.
 
 The integration is excluded from default builds. Enable the `scrcpy-forge`
-feature and append the generic configuration from
-`src/plugins/scrcpy_forge/config.example.toml` to your local TOML file. It
+feature and copy the standalone
+`src/plugins/scrcpy_forge/config.example.toml` module into `config.d/` when
+explicit customization is needed. It
 connects to a separately installed ScrcpyForge daemon; PulseDeck does not own
 ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable.
 Its preview and health loops consume the shared runtime mode:
@@ -223,9 +257,10 @@ plugin, and pi extension under `integrations/pulsedeck-pet` publish fixed
 lifecycle states through an atomic runtime file and never read prompt, message,
 or tool contents.
 
-Building with `--features pet-card` now adds an enabled `codex-pet` card to any
-configuration that does not already define one. The zero-config card uses the
-emoji fallback; custom frame paths remain optional.
+Building with `--features pet-card` creates an enabled card in
+`config.d/80-pet-card.toml` when no configuration already defines `codex-pet`.
+Builds without the feature never create that module. The zero-config fallback
+remains available, while custom frame paths stay isolated in the module.
 
 PetCard-only presentation behavior:
 

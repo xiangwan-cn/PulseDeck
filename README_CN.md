@@ -111,6 +111,11 @@ cargo build --release --features power-debug
 ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 ```
 
+PulseDeck 还会自动扫描同级的 `config.d/` 目录。该目录第一层的每个 `.toml` 或 `.json`
+文件都是独立模块，可以包含页面、卡片、操作或显式命名覆盖；文件按名称字典序加载，
+子目录与其他扩展名会被忽略。因此导出卡片或页面只需复制一个文件，不需要维护 include
+列表；把扩展名改为 `.disabled` 即可停用模块。
+
 配置采用严格且不自动迁移的 schema v2。文件根部必须包含 `schema_version = 2`；未知字段、
 废弃别名和未知枚举值会使配置加载失败，而不是被静默忽略。此后 schema 发生变化时，
 仓库示例与实际使用的本地配置必须同时更新。
@@ -132,6 +137,29 @@ PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 - `[[pages]]`：按顺序排列的导航页面。
 - `[[cards]]`：由可配置数据源提供内容的卡片。
 - `[[actions]]`：用户主动触发的命令，可要求二次确认。
+
+模块同样以 schema 版本开头，并可提供便于识别的名称：
+
+```toml
+schema_version = 2
+name = "workstation"
+
+[[cards]]
+# ...一个或多个完整卡片...
+```
+
+默认情况下重复 ID 会直接报错。明确的个人覆盖模块可设置
+`replace_existing = true`，从而替换更早文件中的同 ID 页面、卡片或操作，也可以接管完整
+的 `[app]`、`[ui]` 或 `[runtime]` 段。设置页会写回最后拥有该条目的模块，因此默认
+`config.toml` 不会被个人配置改写。可直接复制
+[独立模块示例](config/config.d/50-custom.example.toml)。
+
+可在不打开界面的情况下校验主文件、所有启用模块、重复/覆盖规则及当前构建包含的插件配置：
+
+```sh
+pulsedeck --check-config
+pulsedeck --check-config /path/to/config.toml
+```
 
 最小自定义卡片示例：
 
@@ -156,7 +184,7 @@ timeout_seconds = 5
 动画定时器的前提下平滑切换状态。数值、文本、正则、语义级别和数据源生命周期匹配方式
 见卡片配置指南。
 
-当 `reload_on_change = true` 时，应用运行期间会重新读取数值类配置。新增或删除页面、
+当 `reload_on_change = true` 时，主文件与启用模块的数值类修改都会在运行期间重新读取。新增或删除页面、
 卡片后应重新打开应用，以重建完整页面结构。
 
 ## 数据源与渲染器
@@ -175,8 +203,9 @@ timeout_seconds = 5
 ## 可选 ScrcpyForge 集成
 
 默认构建不包含该集成。启用 `scrcpy-forge` feature 后，如果配置中还没有同名页面，
-PulseDeck 会自动写入可用的默认 SF 页面；已有配置不会被覆盖。
-`src/plugins/scrcpy_forge/config.example.toml` 仅用于自定义默认值。
+PulseDeck 会自动创建 `config.d/90-scrcpy-forge.toml`；未编译该 feature 时绝不会复制
+此文件，已有配置也不会被覆盖。`src/plugins/scrcpy_forge/config.example.toml` 是可直接
+复制到 `config.d/` 的完整独立模块，仅用于显式自定义默认值。
 它连接到单独安装的 ScrcpyForge 后端；PulseDeck 不持有 ADB 或 scrcpy 进程。服务
 程序、URL 和脚本均可配置。预览与健康检查遵循统一运行模式：
 
@@ -196,8 +225,8 @@ ScrcpyForge（简称 SF）是基于 ADB 与 scrcpy 的多设备 Android 自动�
 扩展只通过原子状态文件发布固定生命周期状态，不读取提示词、消息或工具内容。
 
 使用 `--features pet-card` 编译后，如果配置中还没有 `codex-pet`，PulseDeck 会自动
-加入并启用该卡片。零配置时直接使用 emoji 回退，无需再让 AI 手动补配置；自定义帧
-路径仍是可选项。
+创建并启用 `config.d/80-pet-card.toml`；未编译该 feature 时不会复制此模块。零配置
+回退仍然可用，自定义帧路径则保持在独立模块内。
 
 以下展示行为仅对 PetCard 有效：
 

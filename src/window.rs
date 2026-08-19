@@ -11,8 +11,8 @@ use gtk::{Align, Box as GtkBox, Button, Label, Orientation};
 
 use crate::core::cache;
 use crate::core::config::{
-    config_path, CardConfig, CardIdleBehavior, CardRuntimeClass, ConfigManager, DisplayConfig,
-    SourceConfig, SourceKind,
+    config_modules_dir, config_path, CardConfig, CardIdleBehavior, CardRuntimeClass, ConfigManager,
+    DisplayConfig, SourceConfig, SourceKind,
 };
 use crate::core::runtime::{RuntimeHandle, RuntimeManager, RuntimeMode, UserActivity};
 use crate::core::scheduler::{IdleBehavior, Scheduler, TaskClass, TaskPolicy};
@@ -161,7 +161,7 @@ pub struct MonitorWindow {
     metric_tx: async_channel::Sender<MetricUpdate>,
     action_tx: async_channel::Sender<ActionUpdate>,
     reload_guard: Rc<ConfigReloadGuard>,
-    config_monitor: Option<gio::FileMonitor>,
+    config_monitors: Vec<gio::FileMonitor>,
     scheduler_wake: async_channel::Sender<()>,
     compact_grid: Rc<Cell<bool>>,
     runtime: RuntimeHandle,
@@ -320,7 +320,7 @@ impl MonitorWindow {
             metric_tx,
             action_tx,
             reload_guard: reload_guard.clone(),
-            config_monitor: None,
+            config_monitors: Vec::new(),
             scheduler_wake,
             compact_grid: compact_preference,
             runtime,
@@ -948,7 +948,7 @@ impl MonitorWindow {
         status_icon.add_css_class("status-icon");
         status_card.append(&status_icon);
 
-        let status_label = Label::new(Some("卡片开关会立即生效，并自动保存到配置文件"));
+        let status_label = Label::new(Some("卡片开关会立即生效，并自动保存到所属配置文件"));
         status_label.set_wrap(true);
         status_label.set_xalign(0.0);
         status_label.set_hexpand(true);
@@ -1516,11 +1516,22 @@ impl MonitorWindow {
             return;
         }
 
-        let file = gio::File::for_path(&config_path_buf);
-        let monitor = match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
+        let modules_path_buf = config_modules_dir();
+        let _ = std::fs::create_dir_all(&modules_path_buf);
+        let mut monitors = Vec::new();
+        if let Ok(monitor) = gio::File::for_path(&config_path_buf)
+            .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        {
+            monitors.push(monitor);
+        }
+        if let Ok(monitor) = gio::File::for_path(&modules_path_buf)
+            .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        {
+            monitors.push(monitor);
+        }
+        if monitors.is_empty() {
+            return;
+        }
 
         let config_ref = self.config.clone();
         let reload_guard = self.reload_guard.clone();
@@ -1530,10 +1541,17 @@ impl MonitorWindow {
         let scheduler = self.scheduler.clone();
         let scheduler_wake = self.scheduler_wake.clone();
 
-        monitor.connect_changed(move |_monitor, _file, _other_file, event_type| {
-            if event_type == gio::FileMonitorEvent::ChangesDoneHint
-                || event_type == gio::FileMonitorEvent::Created
-            {
+        let reload: Rc<dyn Fn(gio::FileMonitorEvent)> = Rc::new(move |event_type| {
+            if matches!(
+                event_type,
+                gio::FileMonitorEvent::Changed
+                    | gio::FileMonitorEvent::ChangesDoneHint
+                    | gio::FileMonitorEvent::Created
+                    | gio::FileMonitorEvent::Deleted
+                    | gio::FileMonitorEvent::MovedIn
+                    | gio::FileMonitorEvent::MovedOut
+                    | gio::FileMonitorEvent::Renamed
+            ) {
                 let guard = reload_guard.clone();
                 let cfg = config_ref.clone();
                 let runtime = runtime.clone();
@@ -1599,7 +1617,29 @@ impl MonitorWindow {
                 }
             }
         });
-        self.config_monitor = Some(monitor);
+        for monitor in &monitors {
+            let reload = reload.clone();
+            let config_path = config_path_buf.clone();
+            let modules_path = modules_path_buf.clone();
+            monitor.connect_changed(move |_monitor, file, other_file, event_type| {
+                let relevant = [Some(file), other_file]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|file| file.path())
+                    .any(|path| {
+                        path == config_path
+                            || (path.parent() == Some(modules_path.as_path())
+                                && matches!(
+                                    path.extension().and_then(|value| value.to_str()),
+                                    Some("toml" | "json")
+                                ))
+                    });
+                if relevant {
+                    reload(event_type);
+                }
+            });
+        }
+        self.config_monitors = monitors;
     }
 
     fn start_scheduler_polling(&self, wake_rx: async_channel::Receiver<()>) {

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::core::error::AppError;
 use crate::model::card_model::{CardState, RendererKind, StatusLevel};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
@@ -33,6 +32,78 @@ impl Default for AppConfig {
             pages: Vec::new(),
             cards: Vec::new(),
             actions: Vec::new(),
+        }
+    }
+}
+
+/// A portable configuration module loaded from the `config.d` directory.
+/// Ordinary exports contain entries only; a named overlay must opt into
+/// replacement before it can own global application, UI, or runtime settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigFragment {
+    pub schema_version: u32,
+    /// Human-readable module name used in diagnostics and exported files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Permit this module to replace earlier entries with the same id. Files
+    /// are applied in lexical file-name order.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replace_existing: bool,
+    /// Optional complete global-section overrides. Keeping these optional
+    /// makes ordinary card and page exports self-contained and side-effect free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<AppSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<UiSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PageConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<CardConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionConfig>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for ConfigFragment {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            name: None,
+            replace_existing: false,
+            app: None,
+            ui: None,
+            runtime: None,
+            pages: Vec::new(),
+            cards: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+}
+
+impl ConfigFragment {
+    #[cfg(feature = "pet-card")]
+    pub(crate) fn with_card(card: CardConfig) -> Self {
+        Self::with_cards(vec![card])
+    }
+
+    pub(crate) fn with_cards(cards: Vec<CardConfig>) -> Self {
+        Self {
+            cards,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(feature = "scrcpy-forge")]
+    pub(crate) fn with_page(page: PageConfig) -> Self {
+        Self {
+            pages: vec![page],
+            ..Self::default()
         }
     }
 }
@@ -554,76 +625,8 @@ pub struct ActionConfig {
     pub max_output_bytes: Option<usize>,
 }
 
-pub struct ConfigManager {
-    path: std::path::PathBuf,
-    config: AppConfig,
-}
-
-impl ConfigManager {
-    pub fn new(path: std::path::PathBuf) -> Self {
-        Self {
-            path,
-            config: AppConfig::default(),
-        }
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    pub fn config(&self) -> &AppConfig {
-        &self.config
-    }
-
-    pub fn config_mut(&mut self) -> &mut AppConfig {
-        &mut self.config
-    }
-
-    pub fn load(&mut self) -> Result<(), AppError> {
-        if !self.path.exists() {
-            return Err(AppError::ConfigNotFound(self.path.clone()));
-        }
-
-        let content = std::fs::read_to_string(&self.path).map_err(|e| AppError::ConfigParse {
-            path: self.path.clone(),
-            message: e.to_string(),
-        })?;
-
-        let parsed: AppConfig = if self.path.extension().map_or(false, |e| e == "json") {
-            serde_json::from_str(&content).map_err(|e| AppError::ConfigParse {
-                path: self.path.clone(),
-                message: e.to_string(),
-            })?
-        } else {
-            toml::from_str(&content).map_err(|e| AppError::ConfigParse {
-                path: self.path.clone(),
-                message: e.to_string(),
-            })?
-        };
-
-        if parsed.schema_version != CONFIG_SCHEMA_VERSION {
-            return Err(AppError::ConfigParse {
-                path: self.path.clone(),
-                message: format!(
-                    "unsupported schema_version {}; expected {}",
-                    parsed.schema_version, CONFIG_SCHEMA_VERSION
-                ),
-            });
-        }
-        self.config = parsed;
-
-        Ok(())
-    }
-
-    pub fn save(&self) -> Result<(), AppError> {
-        let tmp = self.path.with_extension("toml.tmp");
-        let content =
-            toml::to_string_pretty(&self.config).map_err(|e| AppError::Config(e.to_string()))?;
-        std::fs::write(&tmp, &content)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
-    }
-}
+mod loader;
+pub use loader::ConfigManager;
 
 pub fn optional_system_cards() -> Vec<CardConfig> {
     let definitions = [
@@ -725,6 +728,10 @@ pub fn config_path() -> std::path::PathBuf {
     config_dir().join("config.toml")
 }
 
+pub fn config_modules_dir() -> std::path::PathBuf {
+    config_dir().join("config.d")
+}
+
 pub fn cache_dir() -> std::path::PathBuf {
     dirs_cache().join("pulsedeck")
 }
@@ -755,7 +762,36 @@ fn dirs_home() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let suffix = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "pulsedeck-config-test-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn current_example_config_is_valid() {
@@ -877,5 +913,163 @@ mod tests {
              [cards.runtime]\nclass='system'\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn config_directory_loads_toml_and_json_modules_in_file_name_order() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let modules = directory.path().join("config.d");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(
+            &root,
+            "schema_version=2\n[[pages]]\nid='monitor'\ntitle='Monitor'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            modules.join("20-second.json"),
+            r#"{"schema_version":2,"cards":[{"id":"second","title":"Second","page":"monitor"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            modules.join("10-first.toml"),
+            "schema_version=2\n[[cards]]\nid='first'\ntitle='First'\npage='monitor'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            modules.join("00-disabled.toml.disabled"),
+            "this file is intentionally ignored",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root);
+        manager.load().unwrap();
+        assert_eq!(
+            manager
+                .config()
+                .cards
+                .iter()
+                .map(|card| card.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn duplicate_module_ids_reject_reload_and_keep_last_good_config() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let modules = directory.path().join("config.d");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(&root, "schema_version=2\n").unwrap();
+        std::fs::write(
+            modules.join("10-card.toml"),
+            "schema_version=2\n[[cards]]\nid='same'\ntitle='First'\npage='monitor'\n",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root);
+        manager.load().unwrap();
+        std::fs::write(
+            modules.join("20-duplicate.toml"),
+            "schema_version=2\n[[cards]]\nid='same'\ntitle='Duplicate'\npage='monitor'\n",
+        )
+        .unwrap();
+
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("duplicate card id: same"));
+        assert_eq!(manager.config().cards.len(), 1);
+        assert_eq!(manager.config().cards[0].title, "First");
+    }
+
+    #[test]
+    fn save_keeps_module_entries_in_their_source_file() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let modules = directory.path().join("config.d");
+        let card_module = modules.join("10-card.toml");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(&root, "schema_version=2\n").unwrap();
+        std::fs::write(
+            &card_module,
+            "schema_version=2\n[[cards]]\nid='module-card'\ntitle='Module'\npage='monitor'\n",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root.clone());
+        manager.load().unwrap();
+        manager.config_mut().runtime.keep_screen_on = false;
+        manager.config_mut().cards[0].enabled = false;
+        manager.save().unwrap();
+
+        let saved_root: AppConfig =
+            toml::from_str(&std::fs::read_to_string(&root).unwrap()).unwrap();
+        let saved_module: ConfigFragment =
+            toml::from_str(&std::fs::read_to_string(&card_module).unwrap()).unwrap();
+        assert!(!saved_root.runtime.keep_screen_on);
+        assert!(saved_root.cards.is_empty());
+        assert!(!saved_module.cards[0].enabled);
+    }
+
+    #[test]
+    fn modules_only_accept_exportable_entry_sections() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let modules = directory.path().join("config.d");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(&root, "schema_version=2\n").unwrap();
+        std::fs::write(
+            modules.join("10-invalid.toml"),
+            "schema_version=2\n[app]\ntitle='Missing explicit replacement'\n",
+        )
+        .unwrap();
+        let mut manager = ConfigManager::new(root);
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("replace_existing = true"));
+    }
+
+    #[test]
+    fn named_override_owns_replaced_entries_and_global_settings() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let modules = directory.path().join("config.d");
+        let override_module = modules.join("50-personal.toml");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(
+            &root,
+            "schema_version=2\n[runtime]\nkeep_screen_on=false\n\
+             [[cards]]\nid='shared'\ntitle='Default'\npage='monitor'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &override_module,
+            "schema_version=2\nname='personal'\nreplace_existing=true\n\
+             [runtime]\nkeep_screen_on=true\n\
+             [[cards]]\nid='shared'\ntitle='Custom'\npage='monitor'\n",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root.clone());
+        manager.load().unwrap();
+        assert_eq!(manager.config().cards[0].title, "Custom");
+        assert!(manager.config().runtime.keep_screen_on);
+        manager.config_mut().cards[0].title = "Saved Custom".into();
+        manager.config_mut().runtime.keep_screen_on = false;
+        manager.save().unwrap();
+
+        let saved_root: AppConfig =
+            toml::from_str(&std::fs::read_to_string(&root).unwrap()).unwrap();
+        let saved_override: ConfigFragment =
+            toml::from_str(&std::fs::read_to_string(&override_module).unwrap()).unwrap();
+        assert_eq!(saved_root.cards[0].title, "Default");
+        assert!(!saved_root.runtime.keep_screen_on);
+        assert_eq!(saved_override.cards[0].title, "Saved Custom");
+        assert_eq!(
+            saved_override
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.keep_screen_on),
+            Some(false)
+        );
     }
 }

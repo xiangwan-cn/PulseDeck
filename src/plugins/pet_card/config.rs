@@ -7,6 +7,7 @@ use crate::core::config::{CardConfig, CardRuntimeConfig, DisplayConfig};
 use crate::model::card_model::RendererKind;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PetConfig {
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,
@@ -33,6 +34,7 @@ pub struct PetConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnimationConfig {
     #[serde(default)]
     pub frames: Vec<PathBuf>,
@@ -97,9 +99,8 @@ impl Default for PetConfig {
     }
 }
 
-/// Card inserted into existing and newly generated configs when this feature
-/// is compiled in. Empty plugin options intentionally select PetConfig's safe
-/// defaults and the built-in emoji artwork fallback.
+/// Card written to a standalone config module when this feature is compiled
+/// in. Empty plugin options select PetConfig's safe defaults.
 pub(crate) fn default_card() -> CardConfig {
     CardConfig {
         id: "codex-pet".into(),
@@ -134,31 +135,20 @@ pub(crate) fn default_card() -> CardConfig {
 
 #[cfg(test)]
 mod tests {
-    use serde::Deserialize;
-
     use super::{default_card, PetConfig};
-
-    #[derive(Deserialize)]
-    struct ExampleConfig {
-        cards: Vec<ExampleCard>,
-    }
-
-    #[derive(Deserialize)]
-    struct ExampleCard {
-        kind: String,
-        plugin: PetConfig,
-    }
 
     #[test]
     fn bundled_example_is_valid() {
-        let config: ExampleConfig = toml::from_str(include_str!("config.example.toml")).unwrap();
+        let config: crate::core::config::ConfigFragment =
+            toml::from_str(include_str!("config.example.toml")).unwrap();
         let card = &config.cards[0];
-        assert_eq!(card.kind, "pet-card");
-        assert_eq!(card.plugin.fps, 12);
-        assert_eq!(card.plugin.offline_normal_after_seconds, 300);
-        assert!(card.plugin.completion_sound_file.is_none());
-        assert!(card.plugin.animations.contains_key("offline"));
-        assert!(card.plugin.animations.contains_key("done"));
+        assert_eq!(card.kind.as_deref(), Some("pet-card"));
+        let plugin: PetConfig = card.plugin.clone().unwrap().try_into().unwrap();
+        assert_eq!(plugin.fps, 12);
+        assert_eq!(plugin.offline_normal_after_seconds, 300);
+        assert!(plugin.completion_sound_file.is_none());
+        assert!(plugin.animations.contains_key("offline"));
+        assert!(plugin.animations.contains_key("done"));
     }
 
     #[test]

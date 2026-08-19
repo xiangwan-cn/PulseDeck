@@ -1,6 +1,8 @@
-# Building with `--features scrcpy-forge` adds these defaults automatically
-# when no `scrcpy-forge` page exists. Append this fragment to a schema v2
-# configuration only to customize them.
+# Building with `--features scrcpy-forge` creates config.d/90-scrcpy-forge.toml
+# when no `scrcpy-forge` page exists. This file is a standalone module that can
+# be copied there to customize every option explicitly.
+
+schema_version = 2
 
 [[pages]]
 id = "scrcpy-forge"

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::PageConfig as AppPageConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PageConfig {
     #[serde(default = "default_api_url")]
     pub api_url: String,
@@ -31,6 +32,7 @@ pub struct PageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Endpoints {
     #[serde(default = "health")]
     pub health: String,
@@ -84,6 +86,7 @@ impl Default for Endpoints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CardConfig {
     pub role: String,
     pub title: String,
@@ -231,28 +234,17 @@ pub(crate) fn default_page() -> AppPageConfig {
 
 #[cfg(test)]
 mod tests {
-    use serde::Deserialize;
-
     use super::{default_page, PageConfig};
-
-    #[derive(Deserialize)]
-    struct ExampleConfig {
-        pages: Vec<ExamplePage>,
-    }
-
-    #[derive(Deserialize)]
-    struct ExamplePage {
-        kind: String,
-        plugin: PageConfig,
-    }
 
     #[test]
     fn bundled_example_is_valid() {
-        let config: ExampleConfig = toml::from_str(include_str!("config.example.toml")).unwrap();
+        let config: crate::core::config::ConfigFragment =
+            toml::from_str(include_str!("config.example.toml")).unwrap();
         let page = &config.pages[0];
-        assert_eq!(page.kind, "scrcpy-forge");
-        assert_eq!(page.plugin.endpoints.tasks, "scripts");
-        assert_eq!(page.plugin.cards.len(), 3);
+        assert_eq!(page.kind.as_deref(), Some("scrcpy-forge"));
+        let plugin: PageConfig = page.plugin.clone().unwrap().try_into().unwrap();
+        assert_eq!(plugin.endpoints.tasks, "scripts");
+        assert_eq!(plugin.cards.len(), 3);
     }
 
     #[test]

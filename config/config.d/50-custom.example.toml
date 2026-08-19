@@ -1,0 +1,19 @@
+# Standalone module example. Copy it into ~/.config/pulsedeck/config.d/
+# and choose a descriptive file name such as 50-workstation.toml.
+schema_version = 2
+name = "custom-cards"
+
+[[cards]]
+id = "kernel-release"
+title = "内核版本"
+page = "monitor"
+order = 85
+renderer = "text"
+refresh_interval = 3600
+icon = "utilities-terminal-symbolic"
+
+[cards.source]
+type = "command"
+program = "uname"
+args = ["-r"]
+timeout_seconds = 5

@@ -70,6 +70,59 @@ pub trait CardPlugin {
     ) -> Result<gtk::Widget, AppError>;
 }
 
+/// Validate plugin-owned options without constructing GTK widgets. This is
+/// used by the configuration checker and keeps plugin schema errors tied to
+/// configuration rather than UI startup.
+pub fn validate_config(config: &crate::core::config::AppConfig) -> Result<(), AppError> {
+    for page in &config.pages {
+        let Some(kind) = page.kind.as_deref() else {
+            continue;
+        };
+        let options = page
+            .plugin
+            .clone()
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        match kind {
+            #[cfg(feature = "scrcpy-forge")]
+            "scrcpy-forge" => {
+                let _: scrcpy_forge::PageConfig = options.try_into().map_err(|error| {
+                    AppError::Plugin(format!("invalid scrcpy-forge config: {error}"))
+                })?;
+            }
+            _ => {
+                let _ = options;
+                return Err(AppError::Unsupported(format!(
+                    "page plugin `{kind}` is not available in this build"
+                )));
+            }
+        }
+    }
+    for card in &config.cards {
+        let Some(kind) = card.kind.as_deref() else {
+            continue;
+        };
+        let options = card
+            .plugin
+            .clone()
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        match kind {
+            #[cfg(feature = "pet-card")]
+            "pet-card" => {
+                let _: pet_card::config::PetConfig = options.try_into().map_err(|error| {
+                    AppError::Plugin(format!("invalid pet-card config: {error}"))
+                })?;
+            }
+            _ => {
+                let _ = options;
+                return Err(AppError::Unsupported(format!(
+                    "card plugin `{kind}` is not available in this build"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn page_plugins() -> Vec<Box<dyn PagePlugin>> {
     #[allow(unused_mut)]
     let mut plugins: Vec<Box<dyn PagePlugin>> = Vec::new();

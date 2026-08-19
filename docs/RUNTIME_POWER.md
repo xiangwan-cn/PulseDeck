@@ -152,8 +152,12 @@ direction continues to come from the battery status.
 
 ## Configuration defaults
 
-The authoritative examples are `config/config.example.toml` and
-`config/config.example.json`. Important defaults are: foreground inhibition
+The authoritative main-file examples are `config/config.example.toml` and
+`config/config.example.json`; a portable module example lives under
+`config/config.d/`. The main file is loaded first, followed by top-level TOML
+and JSON modules in lexical file-name order. Modules reject duplicate ids unless
+they explicitly opt into replacement, and settings are written back to the
+owning document rather than flattening the merged configuration. Important defaults are: foreground inhibition
 enabled, idle power saving after 60 seconds plus 10 seconds stability, 15%
 application visual brightness, balanced refresh saving, external realtime when
 a supply reports `online=1`, agent brightness protection for 60
