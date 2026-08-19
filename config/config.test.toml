@@ -1,3 +1,5 @@
+schema_version = 2
+
 [app]
 title = "PulseDeck"
 reload_on_change = true
@@ -104,6 +106,27 @@ description = "电池当前温度"
 [cards.source]
 type = "builtin"
 metric = "battery_temperature"
+
+[cards.display.transition]
+duration_ms = 220
+easing = "ease-out"
+
+[[cards.display.states]]
+name = "comfortable"
+max = 39.9
+
+[cards.display.states.colors]
+accent = "#33d17a"
+value = "#33d17a"
+
+[[cards.display.states]]
+name = "hot"
+min = 45.0
+label = "温度过高"
+
+[cards.display.states.colors]
+accent = "#e01b24"
+background = ["#e01b24", "#9141ac"]
 
 [[cards]]
 id = "uptime"

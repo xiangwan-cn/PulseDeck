@@ -4,6 +4,14 @@ PetCard is an optional, compile-time PulseDeck card plugin. It displays Codex,
 OpenCode, or pi lifecycle state using cached image frames and performs no
 polling while offline.
 
+The generic `[cards.display.colors]`, `[[cards.display.states]]`, and
+`[cards.display.transition]` options are intentionally limited to standard
+non-plugin cards. A PetCard declares `kind = "pet-card"`, so its lifecycle
+artwork, state labels, transitions, and colors remain owned by the plugin
+configuration documented here and are never rewritten by generic card rules.
+The PetCard example is a fragment to append to a strict schema v2 PulseDeck
+configuration; it is not a standalone legacy configuration file.
+
 ## Build
 
 ```sh

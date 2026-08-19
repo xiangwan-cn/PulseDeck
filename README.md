@@ -18,6 +18,9 @@ _Default build with no optional Cargo features in dark mode: normal layout
   load, swap, temperature, and network-throughput metrics.
 - Built-in, file, command, HTTP, and static-value card sources.
 - Value, progress, status, text, list, composite, and action renderers.
+- Ordered visual-state rules for standard cards, with numeric/text/source-state
+  matching, label and icon overrides, per-region colors, multi-color backgrounds,
+  and timer-free color transitions.
 - Consistent human-readable primary values: compact percentages, natural unit
   spacing, IP-first network cards, and power-first battery summaries.
 - Fixed intervals or schedules such as `daily@08:00,20:00`, with per-slot cache.
@@ -120,6 +123,12 @@ On first launch PulseDeck copies the bundled example to:
 ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 ```
 
+Configuration uses the strict, non-migrating schema v2. `schema_version = 2`
+is required at the document root; unknown fields, obsolete aliases, and unknown
+enum values reject the configuration instead of being ignored. Repository
+examples and the active local configuration must be updated together whenever
+the schema changes.
+
 Start with [config/config.example.toml](config/config.example.toml). A matching
 JSON example is available at [config/config.example.json](config/config.example.json).
 The current TOML schema is documented with practical card recipes in
@@ -131,6 +140,7 @@ are documented in [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md).
 
 The top-level sections are:
 
+- `schema_version`: required configuration interface version; currently `2`.
 - `[app]`: title, logging, output limits, and config reload.
 - `[runtime]`: foreground inhibition, low-power display/refresh policy,
   external-power behavior, and agent protection/notification policy.
@@ -156,6 +166,13 @@ program = "uname"
 args = ["-r"]
 timeout_seconds = 5
 ```
+
+Standard non-plugin cards can also derive named visual states from their current
+value. The first matching `[[cards.display.states]]` rule may override the label,
+icon, accent, value, progress, and background colors. A `background` array creates
+a restrained gradient, while `[cards.display.transition]` smooths state changes
+without adding a polling or animation timer. See the card guide for numeric,
+text, regex, semantic-level, and source-lifecycle matchers.
 
 When `reload_on_change = true`, value-level configuration changes are reloaded
 while the app is running. Reopen the app after adding/removing pages or cards so

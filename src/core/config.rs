@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::AppError;
-use crate::model::card_model::RendererKind;
+use crate::model::card_model::{CardState, RendererKind, StatusLevel};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    pub schema_version: u32,
     #[serde(default)]
     pub app: AppSection,
     #[serde(default)]
@@ -19,7 +23,22 @@ pub struct AppConfig {
     pub actions: Vec<ActionConfig>,
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            app: AppSection::default(),
+            ui: UiSection::default(),
+            runtime: RuntimeConfig::default(),
+            pages: Vec::new(),
+            cards: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_true")]
     pub keep_screen_on: bool,
@@ -116,6 +135,7 @@ impl Default for RuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppSection {
     #[serde(default = "default_title")]
     pub title: String,
@@ -152,6 +172,7 @@ impl Default for AppSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiSection {
     #[serde(default = "default_page")]
     pub default_page: String,
@@ -195,6 +216,7 @@ impl Default for UiSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PageConfig {
     pub id: String,
     pub title: String,
@@ -211,6 +233,7 @@ pub struct PageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CardConfig {
     pub id: String,
     pub title: String,
@@ -249,11 +272,12 @@ pub struct CardConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CardRuntimeConfig {
-    #[serde(default = "default_auto")]
-    pub class: String,
-    #[serde(default = "default_throttle")]
-    pub idle_behavior: String,
+    #[serde(default)]
+    pub class: CardRuntimeClass,
+    #[serde(default)]
+    pub idle_behavior: CardIdleBehavior,
     #[serde(default)]
     pub idle_multiplier: Option<f64>,
     #[serde(default)]
@@ -264,18 +288,34 @@ pub struct CardRuntimeConfig {
     pub minimum_interval_seconds: Option<u64>,
 }
 
-fn default_auto() -> String {
-    "auto".into()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CardRuntimeClass {
+    #[default]
+    Auto,
+    SystemRealtime,
+    NetworkRate,
+    NetworkStatus,
+    BatteryThermal,
+    Command,
+    Http,
+    File,
+    Static,
 }
-fn default_throttle() -> String {
-    "throttle".into()
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CardIdleBehavior {
+    #[default]
+    Throttle,
+    Pause,
 }
 
 impl Default for CardRuntimeConfig {
     fn default() -> Self {
         Self {
-            class: default_auto(),
-            idle_behavior: default_throttle(),
+            class: CardRuntimeClass::Auto,
+            idle_behavior: CardIdleBehavior::Throttle,
             idle_multiplier: None,
             external_realtime: None,
             realtime_multiplier: None,
@@ -292,9 +332,10 @@ fn default_interval() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
-    pub source_type: String,
+    pub source_type: SourceKind,
     #[serde(default)]
     pub metric: Option<String>,
     #[serde(default)]
@@ -316,11 +357,19 @@ pub struct SourceConfig {
     #[serde(default)]
     pub body: Option<String>,
     #[serde(default)]
-    pub shell: Option<bool>,
-    #[serde(default)]
     pub options: Option<toml::Value>,
     #[serde(default)]
     pub parser: Option<ParserConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Builtin,
+    File,
+    Command,
+    Http,
+    StaticValue,
 }
 
 fn default_timeout() -> u64 {
@@ -328,9 +377,10 @@ fn default_timeout() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParserConfig {
     #[serde(rename = "type")]
-    pub parser_type: String,
+    pub parser_type: ParserKind,
     #[serde(default)]
     pub divisor: Option<f64>,
     #[serde(default)]
@@ -347,11 +397,19 @@ pub struct ParserConfig {
     pub decimal_places: Option<u8>,
     #[serde(default)]
     pub as_percentage: Option<bool>,
-    #[serde(default)]
-    pub steps: Option<Vec<ParserConfig>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParserKind {
+    JsonPath,
+    Regex,
+    Number,
+    FirstLine,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
     #[serde(default)]
     pub minimum_change: Option<f64>,
@@ -370,9 +428,105 @@ pub struct DisplayConfig {
     /// Per-card override for fixed versus content-driven height.
     #[serde(default)]
     pub fixed_size: Option<bool>,
+    /// Optional colors for standard (non-plugin) cards. Empty fields preserve
+    /// the application theme and renderer defaults.
+    #[serde(default)]
+    pub colors: CardColorsConfig,
+    /// First matching rule selects the card's named visual state.
+    #[serde(default)]
+    pub states: Vec<CardVisualStateConfig>,
+    /// Smooth color changes without adding an animation timer.
+    #[serde(default)]
+    pub transition: Option<CardTransitionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CardColorsConfig {
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub footer: Option<String>,
+    #[serde(default)]
+    pub progress: Option<String>,
+    /// One color creates a tint; multiple colors create a subtle gradient.
+    #[serde(default)]
+    pub background: Vec<String>,
+    /// Opacity applied to every background color (default: 0.12).
+    #[serde(default)]
+    pub background_opacity: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardTransitionConfig {
+    #[serde(default = "default_card_transition_ms")]
+    pub duration_ms: u32,
+    #[serde(default = "default_card_transition_easing")]
+    pub easing: String,
+}
+
+fn default_card_transition_ms() -> u32 {
+    180
+}
+
+fn default_card_transition_easing() -> String {
+    "ease-out".into()
+}
+
+impl Default for CardTransitionConfig {
+    fn default() -> Self {
+        Self {
+            duration_ms: default_card_transition_ms(),
+            easing: default_card_transition_easing(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardVisualStateConfig {
+    /// Stable, user-defined state name used for diagnostics and CSS switching.
+    pub name: String,
+    /// Match the source lifecycle state before evaluating value conditions.
+    #[serde(default)]
+    pub source_state: Option<CardState>,
+    /// Match the semantic level produced by a status value.
+    #[serde(default)]
+    pub status_level: Option<StatusLevel>,
+    /// Inclusive numeric bounds. Both may be supplied to form a range.
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// Text matchers are combined with the other supplied conditions.
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub ignore_case: bool,
+    /// Optional presentation overrides applied while this rule matches.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub colors: CardColorsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionConfig {
     pub id: String,
     pub name: String,
@@ -435,17 +589,28 @@ impl ConfigManager {
             message: e.to_string(),
         })?;
 
-        if self.path.extension().map_or(false, |e| e == "json") {
-            self.config = serde_json::from_str(&content).map_err(|e| AppError::ConfigParse {
+        let parsed: AppConfig = if self.path.extension().map_or(false, |e| e == "json") {
+            serde_json::from_str(&content).map_err(|e| AppError::ConfigParse {
                 path: self.path.clone(),
                 message: e.to_string(),
-            })?;
+            })?
         } else {
-            self.config = toml::from_str(&content).map_err(|e| AppError::ConfigParse {
+            toml::from_str(&content).map_err(|e| AppError::ConfigParse {
                 path: self.path.clone(),
                 message: e.to_string(),
-            })?;
+            })?
+        };
+
+        if parsed.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(AppError::ConfigParse {
+                path: self.path.clone(),
+                message: format!(
+                    "unsupported schema_version {}; expected {}",
+                    parsed.schema_version, CONFIG_SCHEMA_VERSION
+                ),
+            });
         }
+        self.config = parsed;
 
         Ok(())
     }
@@ -526,7 +691,7 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                 icon: Some(icon.into()),
                 description: Some("可选原生系统指标".into()),
                 source: Some(SourceConfig {
-                    source_type: "builtin".into(),
+                    source_type: SourceKind::Builtin,
                     metric: Some(metric.into()),
                     path: None,
                     program: None,
@@ -537,7 +702,6 @@ pub fn optional_system_cards() -> Vec<CardConfig> {
                     url: None,
                     headers: None,
                     body: None,
-                    shell: None,
                     options: None,
                     parser: None,
                 }),
@@ -597,6 +761,7 @@ mod tests {
     fn current_example_config_is_valid() {
         let config: AppConfig =
             toml::from_str(include_str!("../../config/config.example.toml")).unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert!(config
             .cards
             .iter()
@@ -605,15 +770,23 @@ mod tests {
                 && card
                     .source
                     .as_ref()
-                    .is_some_and(|source| source.source_type == "command")));
+                    .is_some_and(|source| source.source_type == SourceKind::Command)));
     }
 
     #[test]
     fn current_json_example_is_valid() {
         let config: AppConfig =
             serde_json::from_str(include_str!("../../config/config.example.json")).unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(config.app.title, "PulseDeck");
         assert!(config.cards.iter().any(|card| card.id == "cpu"));
+        assert!(config.cards.iter().any(|card| {
+            card.id == "battery-temp"
+                && card
+                    .display
+                    .as_ref()
+                    .is_some_and(|display| display.states.len() == 3)
+        }));
         assert!(config
             .actions
             .iter()
@@ -623,7 +796,7 @@ mod tests {
     #[test]
     fn plugin_page_options_are_generic() {
         let config: AppConfig = toml::from_str(
-            "[[pages]]\nid='plugin-page'\ntitle='Plugin'\nkind='example'\n[pages.plugin]\nvalue=7\n",
+            "schema_version=2\n[[pages]]\nid='plugin-page'\ntitle='Plugin'\nkind='example'\n[pages.plugin]\nvalue=7\n",
         )
         .unwrap();
         let page = &config.pages[0];
@@ -635,7 +808,7 @@ mod tests {
     #[test]
     fn cards_can_reference_hidden_click_actions() {
         let config: AppConfig = toml::from_str(
-            "[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle-service'\n\
+            "schema_version=2\n[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle-service'\n\
              [[actions]]\nid='toggle-service'\nname='Toggle'\npage='actions'\nvisible=false\nconfirm=true\n\
              confirm_title='Confirm toggle?'\nconfirm_detail='Changes the service state.'\n",
         )
@@ -657,10 +830,52 @@ mod tests {
     }
 
     #[test]
-    fn old_ui_config_receives_layout_defaults() {
-        let config: AppConfig = toml::from_str("[ui]\ndefault_page='monitor'\n").unwrap();
+    fn omitted_optional_ui_fields_receive_current_defaults() {
+        let config: AppConfig =
+            toml::from_str("schema_version=2\n[ui]\ndefault_page='monitor'\n").unwrap();
         assert_eq!(config.ui.card_columns, 3);
         assert_eq!(config.ui.card_height, 133);
         assert!(config.ui.fixed_card_size);
+    }
+
+    #[test]
+    fn standard_cards_decode_visual_states_and_multicolor_backgrounds() {
+        let config: AppConfig = toml::from_str(
+            "schema_version=2\n[[cards]]\nid='thermal'\ntitle='Thermal'\npage='monitor'\n\
+             [cards.display.transition]\nduration_ms=240\n\
+             [[cards.display.states]]\nname='hot'\nmin=45.0\nlabel='Too hot'\n\
+             [cards.display.states.colors]\naccent='#e01b24'\nbackground=['#e01b24','#9141ac']\n",
+        )
+        .unwrap();
+        let display = config.cards[0].display.as_ref().unwrap();
+        assert_eq!(display.transition.as_ref().unwrap().duration_ms, 240);
+        assert_eq!(display.states[0].name, "hot");
+        assert_eq!(display.states[0].min, Some(45.0));
+        assert_eq!(display.states[0].colors.background.len(), 2);
+    }
+
+    #[test]
+    fn obsolete_generic_card_fields_are_rejected() {
+        assert!(toml::from_str::<AppConfig>("[app]\ntitle='missing version'\n").is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "schema_version=2\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+             [cards.source]\ntype='command'\nshell=true\n"
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "schema_version=2\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+             [cards.source]\ntype='http'\n[cards.source.parser]\ntype='number'\nsteps=[]\n"
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "schema_version=2\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+             [cards.source]\ntype='static'\n"
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "schema_version=2\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+             [cards.runtime]\nclass='system'\n"
+        )
+        .is_err());
     }
 }

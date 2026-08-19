@@ -16,6 +16,8 @@ _未启用任何可选 Cargo feature 的暗色默认构建：左侧为标准布�
   交换空间、温度及网络吞吐指标。
 - 支持内置指标、文件、命令、HTTP 和静态值数据源。
 - 支持数值、进度、状态、文本、列表、组合和操作渲染器。
+- 普通卡片支持有序视觉状态规则，可按数值、文本或数据源状态匹配，并覆盖文案、图标、
+  分区颜色、多色背景和不增加定时器的颜色过渡。
 - 主数值统一使用直观格式：整百分比不显示无意义小数，单位自然排版，网络卡优先显示
   IP，功耗卡优先显示功率。
 - 支持固定间隔或 `daily@08:00,20:00` 等时间计划，并按时间槽缓存。
@@ -109,6 +111,10 @@ cargo build --release --features power-debug
 ${XDG_CONFIG_HOME:-$HOME/.config}/pulsedeck/config.toml
 ```
 
+配置采用严格且不自动迁移的 schema v2。文件根部必须包含 `schema_version = 2`；未知字段、
+废弃别名和未知枚举值会使配置加载失败，而不是被静默忽略。此后 schema 发生变化时，
+仓库示例与实际使用的本地配置必须同时更新。
+
 建议从 [config/config.example.toml](config/config.example.toml) 开始。仓库同时提供
 内容一致的 [config/config.example.json](config/config.example.json)。当前 TOML schema
 及实用卡片示例见 [config/CARD_GUIDE.md](config/CARD_GUIDE.md)。
@@ -119,6 +125,7 @@ PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 
 顶层配置包括：
 
+- `schema_version`：必填的配置接口版本，当前为 `2`。
 - `[app]`：标题、日志、输出限制和配置重载。
 - `[runtime]`：前台常亮、低功耗显示与刷新、外接供电行为及 Agent 保护/通知。
 - `[ui]`：默认页面、普通网格列数和卡片尺寸；工具栏普通/紧凑选择作为 UI 状态单独保存。
@@ -142,6 +149,12 @@ program = "uname"
 args = ["-r"]
 timeout_seconds = 5
 ```
+
+普通非插件卡片还可从当前值推导命名视觉状态。首条匹配的
+`[[cards.display.states]]` 规则可以覆盖文案、图标、强调边、主值、进度条和背景颜色；
+`background` 数组会生成克制的多色渐变，`[cards.display.transition]` 则在不增加轮询或
+动画定时器的前提下平滑切换状态。数值、文本、正则、语义级别和数据源生命周期匹配方式
+见卡片配置指南。
 
 当 `reload_on_change = true` 时，应用运行期间会重新读取数值类配置。新增或删除页面、
 卡片后应重新打开应用，以重建完整页面结构。

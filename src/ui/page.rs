@@ -211,7 +211,7 @@ impl Page {
                 .and_then(|d| d.fixed_size)
                 .unwrap_or(self.card_layout.fixed),
         };
-        let mut card = MetricCard::new(model, layout);
+        let mut card = MetricCard::new(model, layout, display);
         card.set_compact(self.compact_grid);
         self.metric_flow.append(&card.card);
         self.metric_flow.set_visible(true);

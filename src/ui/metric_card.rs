@@ -1,7 +1,11 @@
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Image, Label, Orientation};
+use regex::{Regex, RegexBuilder};
 
-use crate::model::card_model::{CardModel, CardState, RendererKind};
+use crate::core::config::{
+    CardColorsConfig, CardTransitionConfig, CardVisualStateConfig, DisplayConfig,
+};
+use crate::model::card_model::{CardModel, CardState, CardValue, RendererKind, StatusLevel};
 use crate::rendering::{
     action::ActionWidgets, composite::CompositeWidgets, list::ListWidgets,
     progress::ProgressWidgets, status::StatusWidgets, text::TextWidgets, value::ValueWidgets,
@@ -24,6 +28,18 @@ pub enum RenderWidgets {
     Action(ActionWidgets),
 }
 
+struct VisualRule {
+    config: CardVisualStateConfig,
+    regex: Option<Regex>,
+    css_class: String,
+}
+
+struct MatchedVisual {
+    label: Option<String>,
+    icon: Option<String>,
+    css_class: String,
+}
+
 pub struct MetricCard {
     pub card: GtkBox,
     pub header_description: Label,
@@ -35,10 +51,16 @@ pub struct MetricCard {
     pub footer: Label,
     pub model: Option<CardModel>,
     pub renderer_kind: RendererKind,
+    base_icon: Option<String>,
+    style_class: String,
+    style_provider: Option<gtk::CssProvider>,
+    customization: Option<DisplayConfig>,
+    visual_rules: Vec<VisualRule>,
+    active_state_class: Option<String>,
 }
 
 impl MetricCard {
-    pub fn new(model: &CardModel, layout: CardLayout) -> Self {
+    pub fn new(model: &CardModel, layout: CardLayout, display: Option<&DisplayConfig>) -> Self {
         let card = GtkBox::new(Orientation::Vertical, 0);
         card.add_css_class("card");
         card.add_css_class("pulsedeck-card");
@@ -52,6 +74,8 @@ impl MetricCard {
 
         let accent = accent_for_card(&model.id, &model.renderer);
         card.add_css_class(accent);
+        let style_class = format!("card-theme-{:08x}", stable_hash(&model.id));
+        card.add_css_class(&style_class);
 
         // CenterBox keeps the title at the geometric center of the card even
         // when the icon and refresh button have different natural widths.
@@ -200,13 +224,41 @@ impl MetricCard {
             footer,
             model: Some(model.clone()),
             renderer_kind: model.renderer,
+            base_icon: model.icon.clone(),
+            style_class,
+            style_provider: None,
+            customization: None,
+            visual_rules: Vec::new(),
+            active_state_class: None,
         };
+        result.set_customization(display);
         result.set_model(model);
         result
     }
 
     pub fn set_model(&mut self, model: &CardModel) {
-        let fallback = match &model.value {
+        let matched_rule = self.matching_rule(model);
+        let mut display_model = model.clone();
+        if let Some(rule) = &matched_rule {
+            self.header_icon.set_icon_name(Some(
+                rule.icon
+                    .as_deref()
+                    .or(self.base_icon.as_deref())
+                    .unwrap_or("computer-symbolic"),
+            ));
+        } else {
+            self.header_icon.set_icon_name(Some(
+                self.base_icon.as_deref().unwrap_or("computer-symbolic"),
+            ));
+        }
+        self.set_visual_state(
+            matched_rule
+                .as_ref()
+                .map(|rule| rule.css_class.as_str())
+                .unwrap_or_else(|| source_state_class(model.state)),
+        );
+
+        let fallback = match &display_model.value {
             crate::model::card_model::CardValue::Text(value)
                 if value.lines().count() > 4 || value.chars().count() > 48 =>
             {
@@ -215,27 +267,45 @@ impl MetricCard {
             _ => None,
         };
         self.card
-            .set_tooltip_text(model.tooltip.as_deref().or(fallback));
-        self.set_renderer_visible(matches!(model.state, CardState::Normal | CardState::Cached));
-        if matches!(model.state, CardState::Normal | CardState::Cached) {
+            .set_tooltip_text(display_model.tooltip.as_deref().or(fallback));
+        self.set_renderer_visible(matches!(
+            display_model.state,
+            CardState::Normal | CardState::Cached
+        ));
+        if matches!(display_model.state, CardState::Normal | CardState::Cached) {
             match &mut self.render_widgets {
-                RenderWidgets::Text(w) => crate::rendering::text::apply_text(w, model),
-                RenderWidgets::Value(w) => crate::rendering::value::apply_value(w, model),
-                RenderWidgets::Progress(w) => crate::rendering::progress::apply_progress(w, model),
-                RenderWidgets::Status(w) => crate::rendering::status::apply_status(w, model),
-                RenderWidgets::List(w) => crate::rendering::list::apply_list(w, model),
-                RenderWidgets::Composite(w) => {
-                    crate::rendering::composite::apply_composite(w, model)
+                RenderWidgets::Text(w) => crate::rendering::text::apply_text(w, &display_model),
+                RenderWidgets::Value(w) => crate::rendering::value::apply_value(w, &display_model),
+                RenderWidgets::Progress(w) => {
+                    crate::rendering::progress::apply_progress(w, &display_model)
                 }
-                RenderWidgets::Action(w) => crate::rendering::action::apply_action(w, model),
+                RenderWidgets::Status(w) => {
+                    crate::rendering::status::apply_status(w, &display_model)
+                }
+                RenderWidgets::List(w) => crate::rendering::list::apply_list(w, &display_model),
+                RenderWidgets::Composite(w) => {
+                    crate::rendering::composite::apply_composite(w, &display_model)
+                }
+                RenderWidgets::Action(w) => {
+                    crate::rendering::action::apply_action(w, &display_model)
+                }
+            }
+            if let Some(label) = matched_rule.as_ref().and_then(|rule| rule.label.as_deref()) {
+                self.set_rendered_label(label);
+                display_model.value = CardValue::Text(label.to_string());
             }
         } else {
-            self.state_label.set_label(match model.state {
-                CardState::Loading => "加载中...",
-                CardState::Unavailable => "不可用",
-                CardState::Error => "错误",
-                CardState::Normal | CardState::Cached => "",
-            });
+            self.state_label.set_label(
+                matched_rule
+                    .as_ref()
+                    .and_then(|rule| rule.label.as_deref())
+                    .unwrap_or(match display_model.state {
+                        CardState::Loading => "加载中...",
+                        CardState::Unavailable => "不可用",
+                        CardState::Error => "错误",
+                        CardState::Normal | CardState::Cached => "",
+                    }),
+            );
         }
 
         if let Some(ref sub) = model.subtitle {
@@ -270,7 +340,109 @@ impl MetricCard {
             stored.columns = previous.columns;
         }
         self.model = Some(stored);
-        self.apply_density(model);
+        self.apply_density(&display_model);
+    }
+
+    /// Apply standard-card appearance and state rules. This is separate from
+    /// layout so a value-only config reload can take effect without rebuilding
+    /// the page hierarchy.
+    pub fn set_customization(&mut self, display: Option<&DisplayConfig>) {
+        if self.customization.as_ref() == display {
+            return;
+        }
+        self.customization = display.cloned();
+        let Some(display) = display else {
+            self.visual_rules.clear();
+            if let Some(provider) = &self.style_provider {
+                provider.load_from_data("");
+            }
+            return;
+        };
+
+        self.visual_rules = display
+            .states
+            .iter()
+            .enumerate()
+            .map(|(index, config)| VisualRule {
+                regex: config.regex.as_deref().and_then(|pattern| {
+                    RegexBuilder::new(pattern)
+                        .case_insensitive(config.ignore_case)
+                        .build()
+                        .ok()
+                }),
+                css_class: format!("card-state-rule-{}-{}", index, css_fragment(&config.name)),
+                config: config.clone(),
+            })
+            .collect();
+
+        let css = appearance_css(
+            &self.style_class,
+            &display.colors,
+            &self.visual_rules,
+            display.transition.as_ref(),
+        );
+        if css.is_empty() {
+            if let Some(provider) = &self.style_provider {
+                provider.load_from_data("");
+            }
+            return;
+        }
+        let provider = self.style_provider.get_or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            if let Some(display) = gtk::gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            provider
+        });
+        provider.load_from_data(&css);
+    }
+
+    fn matching_rule(&self, model: &CardModel) -> Option<MatchedVisual> {
+        let text = value_text(&model.value);
+        let number = value_number(&model.value);
+        let level = value_level(&model.value);
+        self.visual_rules
+            .iter()
+            .find(|rule| rule.matches(model.state, &text, number, level.as_ref()))
+            .map(|rule| MatchedVisual {
+                label: rule.config.label.clone(),
+                icon: rule.config.icon.clone(),
+                css_class: rule.css_class.clone(),
+            })
+    }
+
+    fn set_visual_state(&mut self, class: &str) {
+        if self.active_state_class.as_deref() == Some(class) {
+            return;
+        }
+        if let Some(previous) = self.active_state_class.take() {
+            self.card.remove_css_class(&previous);
+        }
+        self.card.add_css_class(class);
+        self.active_state_class = Some(class.to_string());
+    }
+
+    fn set_rendered_label(&self, label: &str) {
+        match &self.render_widgets {
+            RenderWidgets::Text(w) => w.value.set_label(label),
+            RenderWidgets::Value(w) => {
+                w.grid.set_visible(false);
+                w.value.set_visible(true);
+                w.value.set_label(label);
+            }
+            RenderWidgets::Progress(w) => w.value.set_label(label),
+            RenderWidgets::Status(w) => w.value.set_label(label),
+            RenderWidgets::List(w) => w.value.set_label(label),
+            RenderWidgets::Composite(_) => {}
+            RenderWidgets::Action(w) => {
+                w.status.set_label(label);
+                w.status.set_visible(true);
+            }
+        }
     }
 
     pub fn set_compact(&mut self, compact: bool) {
@@ -375,6 +547,83 @@ impl MetricCard {
     }
 }
 
+impl VisualRule {
+    fn matches(
+        &self,
+        source_state: CardState,
+        text: &str,
+        number: Option<f64>,
+        level: Option<&StatusLevel>,
+    ) -> bool {
+        if self
+            .config
+            .source_state
+            .is_some_and(|expected| expected != source_state)
+        {
+            return false;
+        }
+        if self
+            .config
+            .status_level
+            .as_ref()
+            .is_some_and(|expected| Some(expected) != level)
+        {
+            return false;
+        }
+        if self.config.min.is_some() || self.config.max.is_some() {
+            let Some(value) = number else {
+                return false;
+            };
+            if self.config.min.is_some_and(|minimum| value < minimum)
+                || self.config.max.is_some_and(|maximum| value > maximum)
+            {
+                return false;
+            }
+        }
+
+        let normalized_text;
+        let comparable = if self.config.ignore_case {
+            normalized_text = text.to_lowercase();
+            normalized_text.as_str()
+        } else {
+            text
+        };
+        if let Some(expected) = self.config.equals.as_deref() {
+            let normalized_expected;
+            let expected = if self.config.ignore_case {
+                normalized_expected = expected.to_lowercase();
+                normalized_expected.as_str()
+            } else {
+                expected
+            };
+            if comparable != expected {
+                return false;
+            }
+        }
+        if let Some(expected) = self.config.contains.as_deref() {
+            let normalized_expected;
+            let expected = if self.config.ignore_case {
+                normalized_expected = expected.to_lowercase();
+                normalized_expected.as_str()
+            } else {
+                expected
+            };
+            if !comparable.contains(expected) {
+                return false;
+            }
+        }
+        if self.config.regex.is_some() {
+            let Some(regex) = &self.regex else {
+                return false;
+            };
+            if !regex.is_match(text) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 fn value_complexity(value: &crate::model::card_model::CardValue) -> (usize, usize) {
     use crate::model::card_model::CardValue;
     fn text_size(value: &str) -> (usize, usize) {
@@ -401,6 +650,185 @@ fn value_complexity(value: &crate::model::card_model::CardValue) -> (usize, usiz
         ),
         _ => (0, 1),
     }
+}
+
+fn source_state_class(state: CardState) -> &'static str {
+    match state {
+        CardState::Normal => "card-state-normal",
+        CardState::Loading => "card-state-loading",
+        CardState::Unavailable => "card-state-unavailable",
+        CardState::Error => "card-state-error",
+        CardState::Cached => "card-state-cached",
+    }
+}
+
+fn value_text(value: &CardValue) -> String {
+    match value {
+        CardValue::Text(value) => value.clone(),
+        CardValue::Number { value, unit, .. } => unit
+            .as_deref()
+            .map(|unit| format!("{value}{unit}"))
+            .unwrap_or_else(|| value.to_string()),
+        CardValue::Percentage(value) => format!("{value}%"),
+        CardValue::Status { label, .. } => label.clone(),
+        CardValue::List(items) => items
+            .iter()
+            .map(|item| format!("{} {}", item.label, item.value))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        CardValue::Composite(fields) => fields
+            .iter()
+            .map(|field| format!("{} {}", field.label, field.value))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        CardValue::Empty => String::new(),
+    }
+}
+
+fn value_number(value: &CardValue) -> Option<f64> {
+    match value {
+        CardValue::Number { value, .. } | CardValue::Percentage(value) => Some(*value),
+        CardValue::Text(value) => value
+            .trim()
+            .trim_end_matches('%')
+            .trim()
+            .parse::<f64>()
+            .ok(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn value_level(value: &CardValue) -> Option<StatusLevel> {
+    match value {
+        CardValue::Status { level, .. } => Some(level.clone()),
+        _ => None,
+    }
+}
+
+fn appearance_css(
+    style_class: &str,
+    base: &CardColorsConfig,
+    rules: &[VisualRule],
+    transition: Option<&CardTransitionConfig>,
+) -> String {
+    let selector = format!(".{style_class}");
+    let mut css = String::new();
+    append_color_css(&mut css, &selector, base);
+    for rule in rules {
+        append_color_css(
+            &mut css,
+            &format!("{selector}.{}", rule.css_class),
+            &rule.config.colors,
+        );
+    }
+    if let Some(transition) = transition {
+        let duration = transition.duration_ms.min(5_000);
+        if duration > 0 {
+            let easing = match transition.easing.as_str() {
+                "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" => {
+                    transition.easing.as_str()
+                }
+                _ => "ease-out",
+            };
+            css.push_str(&format!(
+                "{selector} {{ transition: background-color {duration}ms {easing}, border-color {duration}ms {easing}; }}\n\
+                 {selector} .metric-value, {selector} .metric-header-name, {selector} .metric-header-icon, {selector} .metric-header-sub, {selector} .metric-footer {{ transition: color {duration}ms {easing}; }}\n\
+                 {selector} levelbar block.filled {{ transition: background-color {duration}ms {easing}, border-color {duration}ms {easing}; }}\n"
+            ));
+        }
+    }
+    css
+}
+
+fn append_color_css(css: &mut String, selector: &str, colors: &CardColorsConfig) {
+    if let Some(color) = colors.accent.as_deref().and_then(css_color) {
+        css.push_str(&format!("{selector} {{ border-left-color: {color}; }}\n"));
+    }
+    append_foreground(css, &format!("{selector} .metric-value"), &colors.value);
+    append_foreground(
+        css,
+        &format!("{selector} .metric-header-name"),
+        &colors.title,
+    );
+    append_foreground(
+        css,
+        &format!("{selector} .metric-header-icon"),
+        &colors.icon,
+    );
+    append_foreground(
+        css,
+        &format!("{selector} .metric-header-sub"),
+        &colors.subtitle,
+    );
+    append_foreground(css, &format!("{selector} .metric-footer"), &colors.footer);
+    if let Some(color) = colors.progress.as_deref().and_then(css_color) {
+        css.push_str(&format!(
+            "{selector} levelbar block.filled {{ background-color: {color}; border-color: {color}; }}\n"
+        ));
+    }
+
+    let background: Vec<_> = colors
+        .background
+        .iter()
+        .filter_map(|color| css_color(color))
+        .collect();
+    if background.is_empty() {
+        return;
+    }
+    let opacity = colors.background_opacity.unwrap_or(0.12).clamp(0.0, 1.0);
+    let stops: Vec<_> = background
+        .iter()
+        .map(|color| format!("alpha({color}, {opacity:.3})"))
+        .collect();
+    if stops.len() == 1 {
+        css.push_str(&format!("{selector} {{ background: {}; }}\n", stops[0]));
+    } else {
+        css.push_str(&format!(
+            "{selector} {{ background: linear-gradient(to bottom right, {}); }}\n",
+            stops.join(", ")
+        ));
+    }
+}
+
+fn append_foreground(css: &mut String, selector: &str, color: &Option<String>) {
+    if let Some(color) = color.as_deref().and_then(css_color) {
+        css.push_str(&format!("{selector} {{ color: {color}; }}\n"));
+    }
+}
+
+/// Keep generated CSS data-only. Supporting the common CSS hex forms avoids
+/// letting a configuration value terminate a declaration and inject rules.
+fn css_color(value: &str) -> Option<&str> {
+    let digits = value.strip_prefix('#')?;
+    matches!(digits.len(), 3 | 4 | 6 | 8)
+        .then_some(())
+        .filter(|_| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|_| value)
+}
+
+fn css_fragment(value: &str) -> String {
+    let fragment: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if fragment.is_empty() {
+        "unnamed".into()
+    } else {
+        fragment
+    }
+}
+
+fn stable_hash(value: &str) -> u32 {
+    value.bytes().fold(2_166_136_261, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
 }
 
 fn accent_for_card(card_id: &str, renderer: &RendererKind) -> &'static str {

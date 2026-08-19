@@ -1,5 +1,6 @@
 # Building with `--features scrcpy-forge` adds these defaults automatically
-# when no `scrcpy-forge` page exists. Copy this example only to customize them.
+# when no `scrcpy-forge` page exists. Append this fragment to a schema v2
+# configuration only to customize them.
 
 [[pages]]
 id = "scrcpy-forge"

@@ -95,6 +95,15 @@ successful content. Confirmation dialogs hold a bounded interaction lease while
 the user reads them; automatically displayed result dialogs only count as
 activity after the user closes them.
 
+Standard-card visual-state rules are evaluated only when one of those existing
+results is applied. Numeric/text/regex matching, label or icon replacement,
+multi-color backgrounds, and CSS color transitions add no scheduler task,
+polling interval, or frame timer. Regexes are compiled when display
+configuration is applied. A live config reload clears result equivalence once,
+requests the card through its existing scheduler, and reapplies the appearance;
+steady-state deduplication and `minimum_change` continue normally afterward.
+Plugin cards retain their own state and animation policies.
+
 ## External power
 
 The power monitor reads charger `online` state plus battery, input-power, and
@@ -149,6 +158,12 @@ enabled, idle power saving after 60 seconds plus 10 seconds stability, 15%
 application visual brightness, balanced refresh saving, external realtime when
 a supply reports `online=1`, agent brightness protection for 60
 minutes, and 15 seconds of attention after an important event.
+
+Both examples use strict `schema_version = 2`. Runtime and card configuration
+does not carry legacy aliases or ignored placeholder fields: a version mismatch,
+unknown typed field, or unknown enum value rejects the reload and leaves the
+last successfully loaded configuration active. Schema changes therefore update
+the repository examples and the active local configuration in the same change.
 
 ## Measurement
 

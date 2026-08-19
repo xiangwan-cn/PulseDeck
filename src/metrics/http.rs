@@ -1,4 +1,4 @@
-use crate::core::config::ParserConfig;
+use crate::core::config::{ParserConfig, ParserKind};
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
 
@@ -27,7 +27,7 @@ impl HttpMetric {
     ) -> Self {
         let compiled_regex = parser
             .as_ref()
-            .filter(|parser| parser.parser_type == "regex")
+            .filter(|parser| parser.parser_type == ParserKind::Regex)
             .and_then(|parser| parser.pattern.as_ref())
             .map(|pattern| regex::Regex::new(pattern).map_err(|error| error.to_string()));
         Self {
@@ -139,8 +139,8 @@ fn parse_response(
     parser: &ParserConfig,
     compiled_regex: Option<&Result<regex::Regex, String>>,
 ) -> MetricResult {
-    match parser.parser_type.as_str() {
-        "json_path" => {
+    match parser.parser_type {
+        ParserKind::JsonPath => {
             let value: serde_json::Value = match serde_json::from_str(body) {
                 Ok(v) => v,
                 Err(e) => {
@@ -189,7 +189,7 @@ fn parse_response(
                 metadata: None,
             }
         }
-        "regex" => {
+        ParserKind::Regex => {
             let pattern = match &parser.pattern {
                 Some(p) => p,
                 None => {
@@ -259,7 +259,7 @@ fn parse_response(
                 metadata: None,
             }
         }
-        "number" => {
+        ParserKind::Number => {
             let multiplier = parser.multiplier.unwrap_or(1.0);
             let divisor = parser.divisor.unwrap_or(1.0);
             let decimals = parser.decimal_places.unwrap_or(1);
@@ -289,7 +289,7 @@ fn parse_response(
                 },
             }
         }
-        "first_line" => {
+        ParserKind::FirstLine => {
             let line = body.lines().next().unwrap_or("").to_string();
             let suffix = parser.suffix.as_deref().unwrap_or("");
             MetricResult {
@@ -301,14 +301,6 @@ fn parse_response(
                 metadata: None,
             }
         }
-        _ => MetricResult {
-            value: CardValue::Text(body.to_string()),
-            subtitle: None,
-            tooltip: Some(format!("未知解析器类型: {}", parser.parser_type)),
-            state: MetricState::Error,
-            cached: false,
-            metadata: None,
-        },
     }
 }
 

@@ -3,8 +3,19 @@
 编辑 `~/.config/pulsedeck/config.toml`，复制一个 `[[cards]]` 配置块并修改 `id`、
 `title`、`order`、`renderer` 和数据源即可。内置渲染器包括 `value`、
 `progress`、`status`、`text`、`action`；`list` 和 `composite` 只由插件卡片产出，
-普通数据源卡片选择它们会显示空白（见文末「配置限制与保留字段」）。数据源包括
-`builtin`、`file`、`command`、`http` 和 `static_value`（兼容别名 `static`）。
+普通数据源卡片选择它们会显示空白（见文末「配置限制与严格字段」）。数据源包括
+`builtin`、`file`、`command`、`http` 和 `static_value`。
+
+当前配置接口固定为 schema v2，文件第一项必须是：
+
+```toml
+schema_version = 2
+```
+
+PulseDeck 不迁移或忽略旧接口：版本不符、未知字段、旧别名和未知枚举值都会使整份配置
+加载失败；热重载失败时继续保留上一次成功加载的运行配置。修改 schema 时应同时修改
+实际使用的 `~/.config/pulsedeck/config.toml`，而不是在程序中增加兼容分支。
+启动时被拒绝的配置也不会被默认配置或可选卡片自动写回覆盖。
 
 例如，启用已内置但默认不显示的系统负载：
 
@@ -71,8 +82,8 @@ click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[ac
 ```toml
 [cards.runtime]
 class = "command"
-# 可用类别及别名：system/system-realtime、network/network-rate、network-status、
-# battery/thermal/battery-thermal、command、http、file、static；省略时按数据源自动归类。
+# 精确取值：auto、system-realtime、network-rate、network-status、battery-thermal、
+# command、http、file、static；省略时为 auto，并按数据源自动归类。
 idle_behavior = "throttle"     # throttle 或 pause
 idle_multiplier = 8.0
 external_realtime = false      # 高开销命令/HTTP 默认不要打开
@@ -341,6 +352,97 @@ columns = 2            # 多列模式列数，默认 2
 单卡片尺寸覆盖仍是下限；例如 `card_height = 160` 会阻止该卡片缩到 160 像素以下，
 但不会阻止页面在空间充足时把三行统一增高。
 
+## 普通卡片的状态与颜色
+
+普通非插件卡片可以把采集结果映射为命名视觉状态。状态规则按配置顺序求值，**首条匹配
+规则生效**；没有规则匹配时保留现有渲染器、主题颜色和数据源状态行为。规则只在已有的
+数据更新中求值，不增加轮询、动画帧或后台工作。
+
+以下温度卡展示数值范围、状态文案、图标、多色背景和颜色过渡的完整组合：
+
+```toml
+[cards.display.transition]
+duration_ms = 220             # 0 表示关闭；最大按 5000 ms 处理
+easing = "ease-out"           # linear/ease/ease-in/ease-out/ease-in-out
+
+[[cards.display.states]]
+name = "comfortable"
+max = 39.9                    # min/max 均为闭区间
+
+[cards.display.states.colors]
+accent = "#33d17a"
+value = "#33d17a"
+
+[[cards.display.states]]
+name = "warm"
+min = 40.0
+max = 44.9
+
+[cards.display.states.colors]
+accent = "#e5a50a"
+value = "#e5a50a"
+background = ["#e5a50a", "#ffbe6f"]
+
+[[cards.display.states]]
+name = "hot"
+min = 45.0
+label = "温度过高"             # 状态期间替换主显示文案
+icon = "dialog-warning-symbolic"
+
+[cards.display.states.colors]
+accent = "#e01b24"
+value = "#e01b24"
+background = ["#e01b24", "#9141ac"]
+background_opacity = 0.16
+```
+
+每条 `[[cards.display.states]]` 支持以下匹配字段：
+
+- `source_state`：数据源生命周期，取值为 `normal`、`loading`、`unavailable`、`error`
+  或 `cached`。它可以让加载、失败、不可用和缓存状态也拥有专属文案与配色。
+- `min` / `max`：主值的闭区间边界，适用于 `Number`、`Percentage`，也适用于内容可直接
+  解析为数字或百分比的文本。
+- `equals` / `contains` / `regex`：匹配主文本；`ignore_case = true` 同时作用于三者。
+  正则只在加载配置时编译一次；无效正则不会匹配。
+- `status_level`：匹配 `status` 值的 `good`、`normal`、`warning`、`critical`、`error`
+  或 `unknown` 语义级别。
+
+同一规则中填写的条件使用“并且”关系；例如 `source_state = "normal"` 加
+`contains = "运行"` 要求两者同时成立。完全不写匹配字段的规则是兜底规则，应放在列表
+末尾。`name` 用于标识状态，同一张卡片内应保持唯一。`label` 与 `icon` 是可选展示覆盖；
+离开该状态后会自动恢复数据值和卡片原图标。
+
+基础颜色放在 `[cards.display.colors]`，状态颜色放在对应的
+`[cards.display.states.colors]`。状态层只覆盖自己声明的区域，其余区域继续继承基础颜色
+或主题默认值：
+
+```toml
+[cards.display.colors]
+accent = "#3584e4"            # 左侧强调边
+value = "#f6f5f4"             # 主值及加载/错误提示
+title = "#ffffff"
+icon = "#99c1f1"
+subtitle = "#deddda"          # 顶部静态说明
+footer = "#c0bfbc"            # 底部动态说明/缓存标记
+progress = "#62a0ea"          # progress 渲染器的填充块
+background = ["#3584e4", "#9141ac", "#2190a0"]
+background_opacity = 0.12      # 0.0–1.0，默认 0.12
+```
+
+颜色只接受 `#RGB`、`#RGBA`、`#RRGGBB` 或 `#RRGGBBAA`，无效值会被忽略，避免把配置
+内容注入 GTK CSS。一个 `background` 颜色生成纯色淡化背景，两个或更多颜色生成从左上
+到右下的渐变；建议保持默认低透明度，以延续 PulseDeck 克制、信息优先的视觉风格。
+没有任何颜色配置时，CPU、内存、电池等原有自动强调色和 status/progress 语义色完全
+不变。自定义 `value` 后会有意覆盖渲染器的默认语义色；需要按状态变化时应把它放到各
+状态的 `colors` 中。
+
+状态切换通过 GTK CSS 完成，只对颜色、背景色和边框色做过渡，不启动逐帧动画。
+`reload_on_change = true` 时，修改规则、颜色、文案或过渡会清除上次显示结果并立即请求
+一次刷新，因此无需重启；新增、删除卡片或改变页面层级仍需重新打开应用。
+
+这些字段只属于普通卡片。带 `kind` 的 PetCard 等插件卡片继续使用各插件自己的视觉与
+状态配置，不会被通用状态规则改写。
+
 页面切换栏右上角的网格按钮可在默认列数和六列紧凑布局间切换。紧凑模式仍保留标题、
 主要数值、顶部说明和底部状态文字，只隐藏占宽明显的图标与刷新按钮。选择通过
 `${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/compact-grid` 原子保存，下次启动
@@ -404,15 +506,19 @@ feature 后会自动加入缺失的 `codex-pet` 卡片，emoji 回退无需额�
 Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 [`docs/PET_CARD.md`](../docs/PET_CARD.md)。
 
-## 配置限制与保留字段
+## 配置限制与严格字段
 
-以下字段在配置层面存在但**不生效**，或需要插件才能使用，避免踩坑：
+schema v2 使用严格字段解析。以下限制会直接影响配置是否可被加载：
 
 - `renderer = "list"` / `"composite"`：普通数据源（builtin/command/file/http/static_value）
   无法产出列表或组合值，选择后卡片显示空白；仅插件卡片内部使用。
-- `source.shell = true`：保留字段，不生效；需要 shell 语义时用 `sh -c` 包裹命令，
-  或把脚本写成本地文件作为 `program`。
-- `parser.steps`：保留字段，HTTP 解析器不支持链式解析。
-- `template`、`divide` 解析器：源码占位，未实现，不要使用。
+- 数据源只有 `builtin`、`file`、`command`、`http`、`static_value`；旧的 `static`
+  别名会被拒绝。
+- 不存在 `source.shell` 字段；需要 shell 语义时明确设置 `program = "sh"`、
+  `args = ["-c", "..."]`，或把脚本写成本地文件作为 `program`。
+- HTTP 解析器只有 `json_path`、`regex`、`number`、`first_line`；不存在
+  `parser.steps`、`template` 或 `divide` 接口。
+- `[cards.runtime].class` 只接受本文列出的精确值，不接受 `system`、`network`、
+  `battery`、`thermal` 等旧别名。
 - `schedule`：仅支持 `daily@HH:MM,HH:MM` 一种格式，没有 cron。
 - 页面与卡片的 `id` 各自类型内唯一；卡片引用的 `page` 必须存在。

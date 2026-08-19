@@ -10,7 +10,10 @@ use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Label, Orientation};
 
 use crate::core::cache;
-use crate::core::config::{config_path, CardConfig, ConfigManager, DisplayConfig, SourceConfig};
+use crate::core::config::{
+    config_path, CardConfig, CardIdleBehavior, CardRuntimeClass, ConfigManager, DisplayConfig,
+    SourceConfig, SourceKind,
+};
 use crate::core::runtime::{RuntimeHandle, RuntimeManager, RuntimeMode, UserActivity};
 use crate::core::scheduler::{IdleBehavior, Scheduler, TaskClass, TaskPolicy};
 use crate::metrics::builtin::create_builtin_metric;
@@ -624,7 +627,7 @@ impl MonitorWindow {
             let Some(source) = card.source.as_ref() else {
                 continue;
             };
-            if source.source_type != "file" {
+            if source.source_type != SourceKind::File {
                 continue;
             }
             let Some(path) = source.path.as_ref() else {
@@ -661,7 +664,8 @@ impl MonitorWindow {
         monitor.connect_network_changed(move |_, _| {
             for card in &config.borrow().config().cards {
                 if card.source.as_ref().is_some_and(|source| {
-                    source.source_type == "builtin" && source.metric.as_deref() == Some("network")
+                    source.source_type == SourceKind::Builtin
+                        && source.metric.as_deref() == Some("network")
                 }) {
                     scheduler.borrow_mut().request_now(&card.id);
                 }
@@ -1283,7 +1287,7 @@ impl MonitorWindow {
             .filter(|card| {
                 card.source
                     .as_ref()
-                    .map(|source| source.source_type == "builtin")
+                    .map(|source| source.source_type == SourceKind::Builtin)
                     .unwrap_or(false)
             })
             .cloned()
@@ -1522,6 +1526,7 @@ impl MonitorWindow {
         let reload_guard = self.reload_guard.clone();
         let runtime = self.runtime.clone();
         let persistent_sources = self.persistent_sources.clone();
+        let previous_results = self.previous_results.clone();
         let scheduler = self.scheduler.clone();
         let scheduler_wake = self.scheduler_wake.clone();
 
@@ -1533,6 +1538,7 @@ impl MonitorWindow {
                 let cfg = config_ref.clone();
                 let runtime = runtime.clone();
                 let sources = persistent_sources.clone();
+                let previous_results = previous_results.clone();
                 let scheduler = scheduler.clone();
                 let scheduler_wake = scheduler_wake.clone();
 
@@ -1554,6 +1560,7 @@ impl MonitorWindow {
                         drop(last);
                         if do_reload_config(&cfg) {
                             sources.lock().unwrap().clear();
+                            previous_results.borrow_mut().clear();
                             for card in &cfg.borrow().config().cards {
                                 scheduler.borrow_mut().request_now(&card.id);
                             }
@@ -1567,6 +1574,7 @@ impl MonitorWindow {
                     let cfg2 = cfg.clone();
                     let runtime2 = runtime.clone();
                     let sources2 = sources.clone();
+                    let previous_results2 = previous_results.clone();
                     let scheduler2 = scheduler.clone();
                     let scheduler_wake2 = scheduler_wake.clone();
                     let sid_cell = guard.source_id.clone();
@@ -1577,6 +1585,7 @@ impl MonitorWindow {
                             guard.pending.replace(false);
                             if do_reload_config(&cfg2) {
                                 sources2.lock().unwrap().clear();
+                                previous_results2.borrow_mut().clear();
                                 for card in &cfg2.borrow().config().cards {
                                     scheduler2.borrow_mut().request_now(&card.id);
                                 }
@@ -1659,7 +1668,8 @@ impl MonitorWindow {
 
                     let source = card_cfg.source.clone();
                     let needs_initial_follow_up = source.as_ref().is_some_and(|source| {
-                        source.source_type == "builtin" && source.metric.as_deref() == Some("cpu")
+                        source.source_type == SourceKind::Builtin
+                            && source.metric.as_deref() == Some("cpu")
                     });
                     let cache_ttl = card_cfg.cache_ttl_seconds;
                     let schedule = card_cfg
@@ -1814,7 +1824,7 @@ impl MonitorWindow {
                         card_cfg
                             .and_then(|card| card.source.as_ref())
                             .is_some_and(|source| {
-                                source.source_type == "builtin"
+                                source.source_type == SourceKind::Builtin
                                     && source.metric.as_deref() == Some("cpu")
                             });
                     if is_cpu {
@@ -1845,7 +1855,7 @@ impl MonitorWindow {
                         );
                         if let Some(page) = pages.borrow_mut().get_mut(&update.page_id) {
                             if let Some(card) = page.get_metric_card(&update.card_id) {
-                                apply_metric_result(card, &update.result);
+                                apply_metric_result(card, &update.result, display.as_ref());
                             }
                         }
                         previous_results
@@ -1939,8 +1949,8 @@ fn collect_card_metric(
         }
     };
 
-    match source.source_type.as_str() {
-        "builtin" => {
+    match source.source_type {
+        SourceKind::Builtin => {
             let metric_name = match &source.metric {
                 Some(n) => n.clone(),
                 None => {
@@ -1973,7 +1983,7 @@ fn collect_card_metric(
             result
         }
 
-        "command" | "file" | "http" | "static_value" | "static" => {
+        SourceKind::Command | SourceKind::File | SourceKind::Http | SourceKind::StaticValue => {
             let persistent = {
                 let mut registry = persistent_sources.lock().unwrap();
                 if let Some(source) = registry.get(card_id).cloned() {
@@ -1991,8 +2001,6 @@ fn collect_card_metric(
             let result = persistent.lock().unwrap().collect(ctx);
             result
         }
-
-        other => MetricResult::error(format!("不支持的数据源类型: {}", other)),
     }
 }
 
@@ -2000,8 +2008,8 @@ fn build_persistent_source(
     source: &SourceConfig,
     max_output: usize,
 ) -> Result<PersistentSource, MetricResult> {
-    match source.source_type.as_str() {
-        "command" => {
+    match source.source_type {
+        SourceKind::Command => {
             let program = source.program.as_deref().unwrap_or("echo").to_string();
             let args = source.args.clone().unwrap_or_default();
             let timeout = source.timeout_seconds;
@@ -2023,7 +2031,7 @@ fn build_persistent_source(
                 program, args, timeout, max_out, reverse, max_sub,
             )))
         }
-        "file" => {
+        SourceKind::File => {
             let path = match &source.path {
                 Some(p) => PathBuf::from(p),
                 None => {
@@ -2043,7 +2051,7 @@ fn build_persistent_source(
                 first_line_only,
             )))
         }
-        "http" => {
+        SourceKind::Http => {
             let url = match &source.url {
                 Some(u) => u.clone(),
                 None => {
@@ -2062,7 +2070,7 @@ fn build_persistent_source(
                 url, method, headers, body, timeout, parser, max_out,
             )))
         }
-        "static_value" | "static" => {
+        SourceKind::StaticValue => {
             let value = source
                 .options
                 .as_ref()
@@ -2079,39 +2087,32 @@ fn build_persistent_source(
                 metadata: None,
             }))
         }
-        other => Err(MetricResult::error(format!(
-            "不支持的持久数据源类型: {other}"
-        ))),
+        SourceKind::Builtin => Err(MetricResult::error("内置数据源不能作为通用持久数据源构建")),
     }
 }
 
 fn task_policy(card: &CardConfig) -> TaskPolicy {
-    let configured = card.runtime.class.as_str();
-    let source_type = card
-        .source
-        .as_ref()
-        .map(|source| source.source_type.as_str())
-        .unwrap_or("other");
+    let source_type = card.source.as_ref().map(|source| source.source_type);
     let metric = card
         .source
         .as_ref()
         .and_then(|source| source.metric.as_deref())
         .unwrap_or_default();
-    let class = match configured {
-        "system" | "system-realtime" => TaskClass::SystemRealtime,
-        "network" | "network-rate" => TaskClass::NetworkRate,
-        "network-status" => TaskClass::NetworkStatus,
-        "battery" | "thermal" | "battery-thermal" => TaskClass::BatteryThermal,
-        "command" => TaskClass::Command,
-        "http" => TaskClass::Http,
-        "file" => TaskClass::File,
-        "static" => TaskClass::Static,
-        _ => match source_type {
-            "command" => TaskClass::Command,
-            "http" => TaskClass::Http,
-            "file" => TaskClass::File,
-            "static" | "static_value" => TaskClass::Static,
-            "builtin"
+    let class = match card.runtime.class {
+        CardRuntimeClass::SystemRealtime => TaskClass::SystemRealtime,
+        CardRuntimeClass::NetworkRate => TaskClass::NetworkRate,
+        CardRuntimeClass::NetworkStatus => TaskClass::NetworkStatus,
+        CardRuntimeClass::BatteryThermal => TaskClass::BatteryThermal,
+        CardRuntimeClass::Command => TaskClass::Command,
+        CardRuntimeClass::Http => TaskClass::Http,
+        CardRuntimeClass::File => TaskClass::File,
+        CardRuntimeClass::Static => TaskClass::Static,
+        CardRuntimeClass::Auto => match source_type {
+            Some(SourceKind::Command) => TaskClass::Command,
+            Some(SourceKind::Http) => TaskClass::Http,
+            Some(SourceKind::File) => TaskClass::File,
+            Some(SourceKind::StaticValue) => TaskClass::Static,
+            Some(SourceKind::Builtin)
                 if matches!(
                     metric,
                     "battery_capacity" | "battery_temperature" | "power" | "cpu_temperature"
@@ -2119,15 +2120,15 @@ fn task_policy(card: &CardConfig) -> TaskPolicy {
             {
                 TaskClass::BatteryThermal
             }
-            "builtin" if metric == "network_traffic" => TaskClass::NetworkRate,
-            "builtin" if metric == "network" => TaskClass::NetworkStatus,
-            "builtin" => TaskClass::SystemRealtime,
+            Some(SourceKind::Builtin) if metric == "network_traffic" => TaskClass::NetworkRate,
+            Some(SourceKind::Builtin) if metric == "network" => TaskClass::NetworkStatus,
+            Some(SourceKind::Builtin) => TaskClass::SystemRealtime,
             _ => TaskClass::Other,
         },
     };
     TaskPolicy {
         class,
-        idle_behavior: if card.runtime.idle_behavior == "pause" {
+        idle_behavior: if card.runtime.idle_behavior == CardIdleBehavior::Pause {
             IdleBehavior::Pause
         } else {
             IdleBehavior::Throttle
@@ -2315,7 +2316,11 @@ fn results_equivalent(
     prev.value == curr.value && prev.subtitle == curr.subtitle && prev.tooltip == curr.tooltip
 }
 
-fn apply_metric_result(card: &mut crate::ui::metric_card::MetricCard, result: &MetricResult) {
+fn apply_metric_result(
+    card: &mut crate::ui::metric_card::MetricCard,
+    result: &MetricResult,
+    display: Option<&DisplayConfig>,
+) {
     let state = match result.state {
         MetricState::Normal => CardState::Normal,
         MetricState::Loading => CardState::Loading,
@@ -2324,6 +2329,7 @@ fn apply_metric_result(card: &mut crate::ui::metric_card::MetricCard, result: &M
         MetricState::Stale => CardState::Cached,
     };
 
+    card.set_customization(display);
     let model = CardModel {
         id: String::new(),
         title: String::new(),
@@ -2552,7 +2558,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             10,
             "progress",
             5,
-            "builtin",
+            SourceKind::Builtin,
             "cpu",
             Some("computer-symbolic"),
             Some("处理器总占用"),
@@ -2564,7 +2570,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             20,
             "progress",
             10,
-            "builtin",
+            SourceKind::Builtin,
             "memory",
             Some("chip-symbolic"),
             Some("已用 / 总量"),
@@ -2576,7 +2582,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             30,
             "progress",
             30,
-            "builtin",
+            SourceKind::Builtin,
             "battery_capacity",
             Some("battery-level-100-symbolic"),
             Some("当前剩余容量"),
@@ -2588,7 +2594,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             40,
             "value",
             30,
-            "builtin",
+            SourceKind::Builtin,
             "battery_temperature",
             Some("sensors-temperature-symbolic"),
             Some("电池当前温度"),
@@ -2600,7 +2606,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             50,
             "value",
             60,
-            "builtin",
+            SourceKind::Builtin,
             "uptime",
             Some("hourglass-symbolic"),
             Some("系统已运行时长"),
@@ -2612,7 +2618,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             60,
             "value",
             15,
-            "builtin",
+            SourceKind::Builtin,
             "power",
             Some("battery-symbolic"),
             Some("瞬时与平均功耗"),
@@ -2624,7 +2630,7 @@ fn default_builtin_cards() -> Vec<CardConfig> {
             70,
             "status",
             15,
-            "builtin",
+            SourceKind::Builtin,
             "network",
             Some("network-wireless-signal-excellent-symbolic"),
             Some("连接状态与 IP 地址"),
@@ -2667,7 +2673,7 @@ fn card(
     order: i32,
     renderer: &str,
     interval: u64,
-    source_type: &str,
+    source_type: SourceKind,
     metric: &str,
     icon: Option<&str>,
     desc: Option<&str>,
@@ -2688,7 +2694,7 @@ fn card(
         icon: icon.map(|s| s.to_string()),
         description: desc.map(|s| s.to_string()),
         source: Some(SourceConfig {
-            source_type: source_type.to_string(),
+            source_type,
             metric: Some(metric.to_string()),
             path: None,
             program: None,
@@ -2699,7 +2705,6 @@ fn card(
             url: None,
             headers: None,
             body: None,
-            shell: None,
             options: None,
             parser: None,
         }),

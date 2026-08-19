@@ -20,14 +20,16 @@ pub fn build_app(app: &adw::Application) {
 
     let mut cfg = ConfigManager::new(config_file);
 
-    match cfg.load() {
+    let config_loaded = match cfg.load() {
         Ok(()) => {
             tracing::info!("config loaded from {:?}", cfg.path());
+            true
         }
         Err(e) => {
             tracing::warn!("config load failed: {}, using defaults", e);
+            false
         }
-    }
+    };
 
     // Make newly added native capabilities discoverable in Settings while
     // keeping them disabled and absent from the monitor page by default.
@@ -62,7 +64,9 @@ pub fn build_app(app: &adw::Application) {
             .push(crate::plugins::scrcpy_forge::config::default_page());
         changed = true;
     }
-    if changed {
+    // A rejected schema is never rewritten as a side effect of falling back.
+    // The user updates the versioned configuration explicitly.
+    if changed && config_loaded {
         let _ = cfg.save();
     }
 

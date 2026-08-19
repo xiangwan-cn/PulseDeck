@@ -1,3 +1,5 @@
+schema_version = 2
+
 [app]
 title = "PulseDeck"
 reload_on_change = true
@@ -106,6 +108,42 @@ description = "电池当前温度"
 [cards.source]
 type = "builtin"
 metric = "battery_temperature"
+
+# 普通卡片可按数值、文本、状态级别或数据源状态切换视觉状态。
+# 颜色只接受 CSS 十六进制；背景数组会生成低饱和渐变。
+[cards.display.transition]
+duration_ms = 220
+easing = "ease-out"
+
+[[cards.display.states]]
+name = "comfortable"
+max = 39.9
+
+[cards.display.states.colors]
+accent = "#33d17a"
+value = "#33d17a"
+
+[[cards.display.states]]
+name = "warm"
+min = 40.0
+max = 44.9
+
+[cards.display.states.colors]
+accent = "#e5a50a"
+value = "#e5a50a"
+background = ["#e5a50a", "#ffbe6f"]
+
+[[cards.display.states]]
+name = "hot"
+min = 45.0
+label = "温度过高"
+icon = "dialog-warning-symbolic"
+
+[cards.display.states.colors]
+accent = "#e01b24"
+value = "#e01b24"
+background = ["#e01b24", "#9141ac"]
+background_opacity = 0.16
 
 [[cards]]
 id = "uptime"

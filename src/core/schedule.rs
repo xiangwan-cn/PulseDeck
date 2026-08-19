@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_legacy_and_generic_schedules() {
+    fn parses_current_daily_schedules() {
         assert_eq!(parse_times("daily@20:00,08:00,20:00").unwrap().len(), 2);
         assert!(parse_times("weekly@08:00").is_err());
         assert!(parse_times("daily@25:00").is_err());

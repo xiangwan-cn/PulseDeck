@@ -1,3 +1,4 @@
+# Append this fragment to a schema v2 config after enabling the pet-card feature.
 # Build with: cargo build --release --features pet-card
 # Frame paths are relative to asset_root. Missing animations fall back to emoji.
 
