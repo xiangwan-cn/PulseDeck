@@ -17,10 +17,12 @@ A project-local installation under `.pi/extensions/` is also supported, but pi
 loads it only after the project is trusted.
 
 The extension maps session startup to `ready`, a new agent run to `thinking`,
-tool execution to `working`, a fully settled run to `done`, and session
-shutdown to `offline`. Streaming activity only produces an event-driven,
-rate-limited heartbeat at most once per minute; it starts no timer, watcher,
-subprocess, or resident helper.
+read-only tool execution to `working`, file edits to `coding`, and a fully
+settled run to `done`. Blocking extension prompts become `waiting` (or
+`confirm` for confirmation prompts), while provider aborts and errors become
+`aborted` and `error`. Streaming activity, including long-running tool output,
+only produces an event-driven, rate-limited heartbeat at most once per minute;
+it starts no timer, watcher, subprocess, or resident helper.
 
 The default state file is:
 

@@ -4,9 +4,34 @@ import { mkdir, open, rename, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
-type PetState = "offline" | "ready" | "thinking" | "working" | "done"
+type PetState =
+  | "offline"
+  | "ready"
+  | "thinking"
+  | "working"
+  | "coding"
+  | "waiting"
+  | "confirm"
+  | "cancelled"
+  | "aborted"
+  | "error"
+  | "done"
 
-const importantStates = new Set<PetState>(["done"])
+const activeStates = new Set<PetState>(["thinking", "working", "coding"])
+const importantStates = new Set<PetState>([
+  "waiting",
+  "confirm",
+  "cancelled",
+  "aborted",
+  "error",
+  "done",
+])
+
+function toolState(toolName: string): PetState {
+  return toolName === "edit" || toolName === "write" || toolName === "apply_patch"
+    ? "coding"
+    : "working"
+}
 
 export default function pulsedeckPet(pi: ExtensionAPI) {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0
@@ -21,6 +46,9 @@ export default function pulsedeckPet(pi: ExtensionAPI) {
   let current: PetState = "offline"
   let lastWrite = 0
   let writes = Promise.resolve()
+  let stateBeforePrompt: PetState = "ready"
+  let promptActive = false
+  let pendingTerminalState: "aborted" | "error" | undefined
 
   const writeState = async (
     state: PetState,
@@ -68,14 +96,59 @@ export default function pulsedeckPet(pi: ExtensionAPI) {
     return writes
   }
 
-  pi.on("session_start", async () => publish("ready"))
-  pi.on("before_agent_start", async () => publish("thinking", { newTask: true }))
-  pi.on("tool_execution_start", async () => publish("working"))
-  pi.on("message_update", async () => {
-    if (current === "thinking" || current === "working") {
+  pi.on("session_start", async () => {
+    promptActive = false
+    pendingTerminalState = undefined
+    await publish("ready")
+  })
+  pi.on("before_agent_start", async () => {
+    promptActive = false
+    pendingTerminalState = undefined
+    await publish("thinking", { newTask: true })
+  })
+  pi.on("agent_start", async () => {
+    pendingTerminalState = undefined
+    await publish("thinking")
+  })
+  pi.on("tool_execution_start", async (event) => publish(toolState(event.toolName)))
+  pi.on("tool_execution_update", async () => {
+    if (activeStates.has(current)) {
       await publish(current, { heartbeat: true })
     }
   })
-  pi.on("agent_settled", async () => publish("done"))
-  pi.on("session_shutdown", async () => publish("offline"))
+  pi.on("tool_execution_end", async () => {
+    if (activeStates.has(current)) {
+      await publish(current, { heartbeat: true })
+    }
+  })
+  pi.on("message_update", async (event) => {
+    if (event.assistantMessageEvent.type === "error") {
+      pendingTerminalState = event.assistantMessageEvent.reason === "aborted" ? "aborted" : "error"
+    }
+    if (activeStates.has(current)) {
+      await publish(current, { heartbeat: true })
+    }
+  })
+  pi.on("ui_prompt_start", async (event) => {
+    if (!promptActive) {
+      stateBeforePrompt = activeStates.has(current) ? current : "ready"
+      promptActive = true
+    }
+    await publish(event.kind === "confirm" ? "confirm" : "waiting")
+  })
+  pi.on("ui_prompt_end", async () => {
+    const next = promptActive ? stateBeforePrompt : "ready"
+    promptActive = false
+    await publish(next === "waiting" ? "ready" : next)
+  })
+  pi.on("agent_settled", async () => {
+    const state = pendingTerminalState ?? "done"
+    pendingTerminalState = undefined
+    await publish(state)
+  })
+  pi.on("session_shutdown", async () => {
+    promptActive = false
+    pendingTerminalState = undefined
+    await publish("offline")
+  })
 }

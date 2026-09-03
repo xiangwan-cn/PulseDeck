@@ -105,10 +105,11 @@ install -Dm600 integrations/pulsedeck-pet/pi/pulsedeck-pet.ts \
   "$HOME/.pi/agent/extensions/pulsedeck-pet.ts"
 ```
 
-Run `/reload` or restart pi after installation. The extension observes only pi
-lifecycle event names: session startup, agent startup, tool execution, settled
-completion, and session shutdown. It does not read prompts, messages, tool
-arguments, commands, or tool output. Streaming activity creates only a
+Run `/reload` or restart pi after installation. The extension observes pi
+lifecycle events for session and agent startup, tool execution, UI prompts,
+streamed response errors, settled completion, and session shutdown. It does
+not read prompts, message content, tool arguments, commands, or tool output.
+Streaming activity, including long-running tool output, creates only a
 rate-limited, event-driven heartbeat and starts no timer or helper process.
 See `integrations/pulsedeck-pet/pi/README.md` for state mapping and custom path
 details. Codex, OpenCode, and pi share one state file, so the latest event wins

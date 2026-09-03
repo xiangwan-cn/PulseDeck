@@ -207,19 +207,18 @@ impl Runtime {
             .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
             .map_err(|error| AppError::Plugin(format!("cannot monitor pet state: {error}")))?;
         let weak = Rc::downgrade(this);
-        monitor.connect_changed(move |_, file, _, event| {
-            if !matches!(
-                event,
-                gio::FileMonitorEvent::Created
-                    | gio::FileMonitorEvent::ChangesDoneHint
-                    | gio::FileMonitorEvent::MovedIn
-            ) {
-                return;
-            }
+        monitor.connect_changed(move |_, file, other_file, event| {
             let Some(runtime) = weak.upgrade() else {
                 return;
             };
-            if file.path().as_deref() == Some(runtime.config.state_file.as_path()) {
+            let file_path = file.path();
+            let other_path = other_file.and_then(|other| other.path());
+            if state_file_event_matches(
+                event,
+                file_path.as_deref(),
+                other_path.as_deref(),
+                runtime.config.state_file.as_path(),
+            ) {
                 runtime.load_state();
             }
         });
@@ -593,6 +592,27 @@ impl Runtime {
     }
 }
 
+fn state_file_event_matches(
+    event: gio::FileMonitorEvent,
+    file_path: Option<&Path>,
+    other_path: Option<&Path>,
+    state_file: &Path,
+) -> bool {
+    if !matches!(
+        event,
+        gio::FileMonitorEvent::Created
+            | gio::FileMonitorEvent::ChangesDoneHint
+            | gio::FileMonitorEvent::Deleted
+            | gio::FileMonitorEvent::Moved
+            | gio::FileMonitorEvent::Renamed
+            | gio::FileMonitorEvent::MovedIn
+            | gio::FileMonitorEvent::MovedOut
+    ) {
+        return false;
+    }
+    file_path == Some(state_file) || other_path == Some(state_file)
+}
+
 fn presentation_name(presentation: CardPresentation) -> &'static str {
     match presentation {
         CardPresentation::Normal => "normal",
@@ -720,7 +740,7 @@ mod tests {
 
     use super::{
         completion_sound_argv, is_active_agent_state, next_presentation, parse_presentation,
-        presentation_name,
+        presentation_name, state_file_event_matches,
     };
     use crate::plugins::CardPresentation;
 
@@ -756,6 +776,37 @@ mod tests {
     #[test]
     fn unknown_presentation_falls_back_to_normal() {
         assert_eq!(parse_presentation("future-mode"), CardPresentation::Normal);
+    }
+
+    #[test]
+    fn atomic_state_replacements_match_both_rename_paths() {
+        let state_file = Path::new("/run/user/10000/pulsedeck/codex-pet.json");
+        let temporary = Path::new("/run/user/10000/pulsedeck/.pi-pet.tmp");
+
+        assert!(state_file_event_matches(
+            gio::FileMonitorEvent::Renamed,
+            Some(temporary),
+            Some(state_file),
+            state_file,
+        ));
+        assert!(state_file_event_matches(
+            gio::FileMonitorEvent::Moved,
+            Some(temporary),
+            Some(state_file),
+            state_file,
+        ));
+        assert!(state_file_event_matches(
+            gio::FileMonitorEvent::Created,
+            Some(state_file),
+            None,
+            state_file,
+        ));
+        assert!(!state_file_event_matches(
+            gio::FileMonitorEvent::Changed,
+            Some(temporary),
+            Some(state_file),
+            state_file,
+        ));
     }
 
     #[test]
