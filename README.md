@@ -207,7 +207,11 @@ value. The first matching `[[cards.display.states]]` rule may override the label
 icon, accent, value, progress, and background colors. A `background` array creates
 a restrained gradient, while `[cards.display.transition]` smooths state changes
 without adding a polling or animation timer. See the card guide for numeric,
-text, regex, semantic-level, and source-lifecycle matchers.
+text, regex, semantic-level, and source-lifecycle matchers. Standard cards may
+also use a static local `[cards.display.background_svg]` plus an overlaid
+top-right `[cards.display.logo_svg]`. The logo replaces the refresh icon without
+moving the centered title; compact mode keeps it as a non-interactive decoration
+while continuing to hide per-card refresh. Neither asset adds a refresh task.
 
 When `reload_on_change = true`, changes to the main file and active modules are reloaded
 while the app is running. Reopen the app after adding/removing pages or cards so

@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::Path;
 
 use crate::model::card_model::{CardValue, StatusLevel};
 use crate::model::metric_result::{MetricResult, MetricState};
@@ -19,12 +20,12 @@ impl NetworkMetric {
     }
 
     pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
-        let (connectivity, connection_name) = self
+        let (connectivity, connection_name, primary_iface) = self
             .connection
             .as_ref()
             .and_then(network_manager_state)
             .unwrap_or_else(fallback_state);
-        let ip = primary_ip();
+        let ip = primary_ip(primary_iface.as_deref());
         let (state_label, level) = match connectivity {
             4 => ("已连接", StatusLevel::Good),
             2 => ("需登录", StatusLevel::Warning),
@@ -72,7 +73,9 @@ fn network_presentation(
     (value, subtitle)
 }
 
-fn network_manager_state(connection: &zbus::blocking::Connection) -> Option<(u32, String)> {
+fn network_manager_state(
+    connection: &zbus::blocking::Connection,
+) -> Option<(u32, String, Option<String>)> {
     let manager = zbus::blocking::Proxy::new(
         connection,
         "org.freedesktop.NetworkManager",
@@ -84,25 +87,45 @@ fn network_manager_state(connection: &zbus::blocking::Connection) -> Option<(u32
     let primary = manager
         .get_property::<zbus::zvariant::OwnedObjectPath>("PrimaryConnection")
         .ok()?;
-    let name = if primary.as_str() == "/" {
-        String::new()
+    let (name, primary_iface) = if primary.as_str() == "/" {
+        (String::new(), None)
     } else {
-        zbus::blocking::Proxy::new(
+        let active = zbus::blocking::Proxy::new(
             connection,
             "org.freedesktop.NetworkManager",
             primary.as_str(),
             "org.freedesktop.NetworkManager.Connection.Active",
         )
-        .ok()
-        .and_then(|proxy| proxy.get_property::<String>("Id").ok())
-        .unwrap_or_default()
+        .ok();
+        let name = active
+            .as_ref()
+            .and_then(|proxy| proxy.get_property::<String>("Id").ok())
+            .unwrap_or_default();
+        let primary_iface = active
+            .and_then(|proxy| {
+                proxy
+                    .get_property::<Vec<zbus::zvariant::OwnedObjectPath>>("Devices")
+                    .ok()
+            })
+            .and_then(|devices| devices.into_iter().next())
+            .and_then(|device| {
+                let proxy = zbus::blocking::Proxy::new(
+                    connection,
+                    "org.freedesktop.NetworkManager",
+                    device.as_str(),
+                    "org.freedesktop.NetworkManager.Device",
+                )
+                .ok()?;
+                proxy.get_property::<String>("Interface").ok()
+            });
+        (name, primary_iface)
     };
-    Some((connectivity, name))
+    Some((connectivity, name, primary_iface))
 }
 
-fn fallback_state() -> (u32, String) {
+fn fallback_state() -> (u32, String, Option<String>) {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return (0, String::new());
+        return (0, String::new(), None);
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -113,19 +136,19 @@ fn fallback_state() -> (u32, String) {
             .ok()
             .is_some_and(|state| state.trim() == "up")
         {
-            return (4, name);
+            return (4, name.clone(), Some(name));
         }
     }
-    (1, String::new())
+    (1, String::new(), None)
 }
 
 /// The main-table default route is a better source hint than a UDP probe:
 /// on systems with a proxy tunnel (e.g. 198.18.0.0/15 virtual stacks) the
 /// kernel picks the tunnel address for outbound packets, while the user
 /// usually wants the physical interface address (e.g. Wi-Fi 192.168.0.x).
-fn primary_ip() -> String {
-    let preferred = default_route_iface();
-    let mut fallback = None;
+fn primary_ip(preferred_iface: Option<&str>) -> String {
+    let route_iface = default_route_iface();
+    let mut addresses = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -138,16 +161,56 @@ fn primary_ip() -> String {
             if is_unwanted_ip(ip) {
                 continue;
             }
-            if preferred.as_deref() == Some(name.as_str()) {
-                return ip.to_string();
-            }
-            fallback.get_or_insert(ip);
+            addresses.push((name.clone(), ip, is_physical_interface(&name)));
         }
     }
-    if let Some(ip) = fallback {
+
+    // Prefer the physical device reported by NetworkManager. This remains
+    // stable when a VPN/proxy tunnel becomes the kernel's default route.
+    if let Some(iface) = preferred_iface {
+        if let Some((_, ip, _)) = addresses
+            .iter()
+            .find(|(name, _, physical)| name == iface && *physical)
+        {
+            return ip.to_string();
+        }
+    }
+    if let Some(iface) = route_iface.as_deref() {
+        if let Some((_, ip, _)) = addresses
+            .iter()
+            .find(|(name, _, physical)| name == iface && *physical)
+        {
+            return ip.to_string();
+        }
+    }
+    if let Some((_, ip, _)) = addresses.iter().find(|(_, _, physical)| *physical) {
+        return ip.to_string();
+    }
+
+    // If sysfs cannot identify a physical device, retain a deterministic
+    // interface preference before falling back to any usable address.
+    if let Some(iface) = preferred_iface {
+        if let Some((_, ip, _)) = addresses.iter().find(|(name, _, _)| name == iface) {
+            return ip.to_string();
+        }
+    }
+    if let Some(iface) = route_iface.as_deref() {
+        if let Some((_, ip, _)) = addresses.iter().find(|(name, _, _)| name == iface) {
+            return ip.to_string();
+        }
+    }
+    if let Some((_, ip, _)) = addresses.first() {
         return ip.to_string();
     }
     udp_probe_ip()
+}
+
+/// Virtual interfaces such as Docker bridges and proxy tunnels do not have a
+/// backing device in sysfs. Real Ethernet/Wi-Fi interfaces do, including
+/// interfaces whose names vary from the usual `eth0`/`wlan0` convention.
+fn is_physical_interface(name: &str) -> bool {
+    let path = Path::new("/sys/class/net").join(name);
+    path.join("device").exists() || path.join("wireless").exists()
 }
 
 /// IPv4 addresses that should never be presented as "the" address:
@@ -169,10 +232,18 @@ fn default_route_iface() -> Option<String> {
 fn default_route_iface_from(contents: &str) -> Option<String> {
     let mut best: Option<(u32, String)> = None;
     for line in contents.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let iface = fields.next()?;
-        let destination = u32::from_str_radix(fields.next()?, 16).ok()?;
-        let metric: u32 = fields.nth(5).and_then(|m| m.parse().ok())?;
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let (Some(&iface), Some(&destination), Some(&metric)) =
+            (fields.first(), fields.get(1), fields.get(6))
+        else {
+            continue;
+        };
+        let Ok(destination) = u32::from_str_radix(destination, 16) else {
+            continue;
+        };
+        let Ok(metric) = metric.parse::<u32>() else {
+            continue;
+        };
         if destination == 0
             && best
                 .as_ref()
@@ -309,5 +380,19 @@ Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMTU\tWindow\tIRTT\n\
 wlan0\t0000A8C0\t00000000\t0001\t0\t0\t600\t0\t0\t0\n";
 
         assert_eq!(default_route_iface_from(route_table), None);
+    }
+
+    #[test]
+    fn malformed_route_rows_do_not_hide_valid_default_route() {
+        let route_table = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMTU\tWindow\tIRTT\n\
+wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t0\t0\t0\n\
+malformed\tnot-hex\n\
+usb0\t00000000\t00000000\t0003\t0\t0\t100\t0\t0\t0\n";
+
+        assert_eq!(
+            default_route_iface_from(route_table).as_deref(),
+            Some("usb0")
+        );
     }
 }

@@ -482,7 +482,62 @@ fn merge_config(
             |action| &action.id,
         )?;
     }
+    validate_card_assets(root_path, &merged)?;
     Ok(merged)
+}
+
+fn validate_card_assets(path: &Path, config: &AppConfig) -> Result<(), AppError> {
+    let config_directory = path.parent().unwrap_or_else(|| Path::new("."));
+    for card in &config.cards {
+        if let Some(background) = card
+            .display
+            .as_ref()
+            .and_then(|display| display.background_svg.as_ref())
+        {
+            if !background.opacity.is_finite() || !(0.0..=1.0).contains(&background.opacity) {
+                return Err(AppError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "card {} background_svg opacity must be between 0.0 and 1.0",
+                        card.id
+                    ),
+                });
+            }
+            background
+                .resolve_path(config_directory)
+                .map_err(|message| AppError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!("card {} background_svg {message}", card.id),
+                })?;
+        }
+        if let Some(logo) = card
+            .display
+            .as_ref()
+            .and_then(|display| display.logo_svg.as_ref())
+        {
+            if !(8..=64).contains(&logo.size) {
+                return Err(AppError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!("card {} logo_svg size must be between 8 and 64", card.id),
+                });
+            }
+            if !logo.opacity.is_finite() || !(0.0..=1.0).contains(&logo.opacity) {
+                return Err(AppError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "card {} logo_svg opacity must be between 0.0 and 1.0",
+                        card.id
+                    ),
+                });
+            }
+            logo.resolve_path(config_directory)
+                .map_err(|message| AppError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!("card {} logo_svg {message}", card.id),
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn merge_entries<T: Clone>(

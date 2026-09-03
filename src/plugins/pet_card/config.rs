@@ -120,6 +120,8 @@ pub(crate) fn default_card() -> CardConfig {
             card_width: None,
             card_height: Some(133),
             fixed_size: Some(true),
+            logo_svg: None,
+            background_svg: None,
             colors: Default::default(),
             states: Vec::new(),
             transition: None,

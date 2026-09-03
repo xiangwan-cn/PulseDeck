@@ -1,9 +1,11 @@
+use gio::prelude::FileExt;
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Image, Label, Orientation};
 use regex::{Regex, RegexBuilder};
 
 use crate::core::config::{
-    CardColorsConfig, CardTransitionConfig, CardVisualStateConfig, DisplayConfig,
+    CardBackgroundSvgConfig, CardColorsConfig, CardLogoSvgConfig, CardTransitionConfig,
+    CardVisualStateConfig, DisplayConfig,
 };
 use crate::model::card_model::{CardModel, CardState, CardValue, RendererKind, StatusLevel};
 use crate::rendering::{
@@ -40,10 +42,19 @@ struct MatchedVisual {
     css_class: String,
 }
 
+struct BackgroundSvgCss {
+    image: String,
+    position: &'static str,
+    size: &'static str,
+}
+
 pub struct MetricCard {
     pub card: GtkBox,
     pub header_description: Label,
     header_icon: Image,
+    logo_picture: gtk::Picture,
+    compact_logo_picture: gtk::Picture,
+    refresh_content: gtk::Stack,
     pub refresh_btn: Button,
     pub render_widgets: RenderWidgets,
     value_box: GtkBox,
@@ -57,6 +68,8 @@ pub struct MetricCard {
     customization: Option<DisplayConfig>,
     visual_rules: Vec<VisualRule>,
     active_state_class: Option<String>,
+    compact: bool,
+    logo_active: bool,
 }
 
 impl MetricCard {
@@ -119,13 +132,48 @@ impl MetricCard {
 
         header.set_center_widget(Some(&text_box));
 
-        let refresh_btn = Button::from_icon_name("view-refresh-symbolic");
+        let refresh_icon = Image::from_icon_name("view-refresh-symbolic");
+
+        let logo_picture = gtk::Picture::new();
+        logo_picture.set_can_shrink(true);
+        logo_picture.set_content_fit(gtk::ContentFit::Contain);
+        logo_picture.set_can_target(false);
+        logo_picture.set_focusable(false);
+        logo_picture.add_css_class("card-logo-svg");
+
+        let refresh_content = gtk::Stack::new();
+        refresh_content.add_named(&refresh_icon, Some("refresh"));
+        refresh_content.add_named(&logo_picture, Some("logo"));
+        refresh_content.set_visible_child_name("refresh");
+
+        let refresh_btn = Button::new();
+        refresh_btn.set_child(Some(&refresh_content));
+        refresh_btn.set_halign(Align::End);
         refresh_btn.set_valign(Align::Center);
         refresh_btn.add_css_class("flat");
         refresh_btn.set_tooltip_text(Some("刷新"));
-        header.set_end_widget(Some(&refresh_btn));
 
-        card.append(&header);
+        let compact_logo_picture = gtk::Picture::new();
+        compact_logo_picture.set_halign(Align::End);
+        compact_logo_picture.set_valign(Align::Start);
+        compact_logo_picture.set_can_shrink(true);
+        compact_logo_picture.set_content_fit(gtk::ContentFit::Contain);
+        compact_logo_picture.set_can_target(false);
+        compact_logo_picture.set_focusable(false);
+        compact_logo_picture.set_visible(false);
+        compact_logo_picture.add_css_class("card-logo-svg");
+
+        // The refresh affordance is a true foreground overlay: it does not
+        // participate in header measurement, so replacing its standard icon
+        // with a custom logo cannot move the centered title. Compact mode hides
+        // the button and shows a separate, non-interactive logo overlay instead.
+        let header_overlay = gtk::Overlay::new();
+        header_overlay.set_child(Some(&header));
+        header_overlay.add_overlay(&refresh_btn);
+        header_overlay.set_measure_overlay(&refresh_btn, false);
+        header_overlay.add_overlay(&compact_logo_picture);
+        header_overlay.set_measure_overlay(&compact_logo_picture, false);
+        card.append(&header_overlay);
 
         let value_box = GtkBox::new(Orientation::Vertical, 1);
         value_box.add_css_class("metric-value-box");
@@ -217,6 +265,9 @@ impl MetricCard {
             card,
             header_description,
             header_icon,
+            logo_picture,
+            compact_logo_picture,
+            refresh_content,
             refresh_btn,
             render_widgets,
             value_box,
@@ -230,6 +281,8 @@ impl MetricCard {
             customization: None,
             visual_rules: Vec::new(),
             active_state_class: None,
+            compact: false,
+            logo_active: false,
         };
         result.set_customization(display);
         result.set_model(model);
@@ -351,6 +404,7 @@ impl MetricCard {
             return;
         }
         self.customization = display.cloned();
+        self.set_logo_svg(display.and_then(|display| display.logo_svg.as_ref()));
         let Some(display) = display else {
             self.visual_rules.clear();
             if let Some(provider) = &self.style_provider {
@@ -375,11 +429,27 @@ impl MetricCard {
             })
             .collect();
 
+        let background_svg = display.background_svg.as_ref().and_then(|background| {
+            match background_svg_css(background) {
+                Ok(background) => Some(background),
+                Err(error) => {
+                    tracing::warn!(
+                        "card {} SVG background is unavailable: {error}",
+                        self.model
+                            .as_ref()
+                            .map(|model| model.id.as_str())
+                            .unwrap_or("unknown")
+                    );
+                    None
+                }
+            }
+        });
         let css = appearance_css(
             &self.style_class,
             &display.colors,
             &self.visual_rules,
             display.transition.as_ref(),
+            background_svg.as_ref(),
         );
         if css.is_empty() {
             if let Some(provider) = &self.style_provider {
@@ -399,6 +469,57 @@ impl MetricCard {
             provider
         });
         provider.load_from_data(&css);
+    }
+
+    fn set_logo_svg(&mut self, config: Option<&CardLogoSvgConfig>) {
+        let Some(config) = config else {
+            self.logo_picture.set_filename(None::<&std::path::Path>);
+            self.compact_logo_picture
+                .set_filename(None::<&std::path::Path>);
+            self.refresh_content.set_visible_child_name("refresh");
+            self.logo_active = false;
+            self.refresh_btn.set_valign(Align::Center);
+            self.update_refresh_visibility();
+            return;
+        };
+        let path = match config.resolve_path(&crate::core::config::config_dir()) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    "card {} SVG logo is unavailable: {error}",
+                    self.model
+                        .as_ref()
+                        .map(|model| model.id.as_str())
+                        .unwrap_or("unknown")
+                );
+                self.logo_picture.set_filename(None::<&std::path::Path>);
+                self.compact_logo_picture
+                    .set_filename(None::<&std::path::Path>);
+                self.refresh_content.set_visible_child_name("refresh");
+                self.logo_active = false;
+                self.refresh_btn.set_valign(Align::Center);
+                self.update_refresh_visibility();
+                return;
+            }
+        };
+        self.logo_picture.set_filename(Some(&path));
+        self.logo_picture.set_size_request(config.size, config.size);
+        self.logo_picture.set_opacity(config.opacity);
+        self.compact_logo_picture.set_filename(Some(&path));
+        self.compact_logo_picture
+            .set_size_request(config.size, config.size);
+        self.compact_logo_picture.set_opacity(config.opacity);
+        self.refresh_content.set_visible_child_name("logo");
+        self.logo_active = true;
+        self.refresh_btn.set_valign(Align::Start);
+        self.update_refresh_visibility();
+    }
+
+    fn update_refresh_visibility(&self) {
+        let (refresh_visible, compact_logo_visible) =
+            refresh_and_logo_visibility(self.compact, self.logo_active);
+        self.refresh_btn.set_visible(refresh_visible);
+        self.compact_logo_picture.set_visible(compact_logo_visible);
     }
 
     fn matching_rule(&self, model: &CardModel) -> Option<MatchedVisual> {
@@ -446,8 +567,9 @@ impl MetricCard {
     }
 
     pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
         self.header_icon.set_visible(!compact);
-        self.refresh_btn.set_visible(!compact);
+        self.update_refresh_visibility();
         let description_visible = !self.header_description.text().is_empty();
         self.header_description.set_visible(description_visible);
         if compact {
@@ -711,15 +833,18 @@ fn appearance_css(
     base: &CardColorsConfig,
     rules: &[VisualRule],
     transition: Option<&CardTransitionConfig>,
+    background_svg: Option<&BackgroundSvgCss>,
 ) -> String {
     let selector = format!(".{style_class}");
     let mut css = String::new();
-    append_color_css(&mut css, &selector, base);
+    append_color_css(&mut css, &selector, base, background_svg, true);
     for rule in rules {
         append_color_css(
             &mut css,
             &format!("{selector}.{}", rule.css_class),
             &rule.config.colors,
+            background_svg,
+            false,
         );
     }
     if let Some(transition) = transition {
@@ -741,7 +866,13 @@ fn appearance_css(
     css
 }
 
-fn append_color_css(css: &mut String, selector: &str, colors: &CardColorsConfig) {
+fn append_color_css(
+    css: &mut String,
+    selector: &str,
+    colors: &CardColorsConfig,
+    background_svg: Option<&BackgroundSvgCss>,
+    include_svg_without_tint: bool,
+) {
     if let Some(color) = colors.accent.as_deref().and_then(css_color) {
         css.push_str(&format!("{selector} {{ border-left-color: {color}; }}\n"));
     }
@@ -768,12 +899,28 @@ fn append_color_css(css: &mut String, selector: &str, colors: &CardColorsConfig)
         ));
     }
 
+    append_background_css(
+        css,
+        selector,
+        colors,
+        background_svg,
+        include_svg_without_tint,
+    );
+}
+
+fn append_background_css(
+    css: &mut String,
+    selector: &str,
+    colors: &CardColorsConfig,
+    background_svg: Option<&BackgroundSvgCss>,
+    include_svg_without_tint: bool,
+) {
     let background: Vec<_> = colors
         .background
         .iter()
         .filter_map(|color| css_color(color))
         .collect();
-    if background.is_empty() {
+    if background.is_empty() && !(include_svg_without_tint && background_svg.is_some()) {
         return;
     }
     let opacity = colors.background_opacity.unwrap_or(0.12).clamp(0.0, 1.0);
@@ -781,14 +928,61 @@ fn append_color_css(css: &mut String, selector: &str, colors: &CardColorsConfig)
         .iter()
         .map(|color| format!("alpha({color}, {opacity:.3})"))
         .collect();
-    if stops.len() == 1 {
-        css.push_str(&format!("{selector} {{ background: {}; }}\n", stops[0]));
-    } else {
-        css.push_str(&format!(
-            "{selector} {{ background: linear-gradient(to bottom right, {}); }}\n",
+
+    let mut images = Vec::new();
+    let mut repeats = Vec::new();
+    let mut positions = Vec::new();
+    let mut sizes = Vec::new();
+    if let Some(background_svg) = background_svg {
+        images.push(background_svg.image.clone());
+        repeats.push("no-repeat");
+        positions.push(background_svg.position);
+        sizes.push(background_svg.size);
+    }
+    if stops.len() > 1 {
+        images.push(format!(
+            "linear-gradient(to bottom right, {})",
             stops.join(", ")
         ));
+        repeats.push("no-repeat");
+        positions.push("center");
+        sizes.push("cover");
     }
+
+    let mut declarations = Vec::new();
+    match stops.as_slice() {
+        [color] => declarations.push(format!("background-color: {color}")),
+        [_, _, ..] => declarations.push("background-color: transparent".into()),
+        [] => {}
+    }
+    if images.is_empty() {
+        declarations.push("background-image: none".into());
+    } else {
+        declarations.push(format!("background-image: {}", images.join(", ")));
+        declarations.push(format!("background-repeat: {}", repeats.join(", ")));
+        declarations.push(format!("background-position: {}", positions.join(", ")));
+        declarations.push(format!("background-size: {}", sizes.join(", ")));
+    }
+    css.push_str(&format!("{selector} {{ {}; }}\n", declarations.join("; ")));
+}
+
+fn background_svg_css(config: &CardBackgroundSvgConfig) -> Result<BackgroundSvgCss, String> {
+    let path = config.resolve_path(&crate::core::config::config_dir())?;
+    let uri = gio::File::for_path(path).uri().to_string();
+    if uri
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+    {
+        return Err("resolved file URI contains unsafe CSS characters".into());
+    }
+    Ok(BackgroundSvgCss {
+        image: format!(
+            "cross-fade({:.3}% url(\"{uri}\"), image(transparent))",
+            config.opacity_percent()
+        ),
+        position: config.position.as_css(),
+        size: config.fit.as_css(),
+    })
 }
 
 fn append_foreground(css: &mut String, selector: &str, color: &Option<String>) {
@@ -844,5 +1038,83 @@ fn accent_for_card(card_id: &str, renderer: &RendererKind) -> &'static str {
             RendererKind::Value => "accent-purple",
             _ => "accent-teal",
         },
+    }
+}
+
+fn refresh_and_logo_visibility(compact: bool, logo_active: bool) -> (bool, bool) {
+    (!compact, compact && logo_active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn svg_css() -> BackgroundSvgCss {
+        BackgroundSvgCss {
+            image: "cross-fade(10.000% url(\"file:///tmp/card.svg\"), image(transparent))".into(),
+            position: "right center",
+            size: "contain",
+        }
+    }
+
+    #[test]
+    fn svg_background_is_emitted_without_replacing_the_theme_tint() {
+        let mut css = String::new();
+        append_background_css(
+            &mut css,
+            ".card-theme-test",
+            &CardColorsConfig::default(),
+            Some(&svg_css()),
+            true,
+        );
+        assert!(css.contains("background-image: cross-fade(10.000%"));
+        assert!(css.contains("background-position: right center"));
+        assert!(css.contains("background-size: contain"));
+        assert!(!css.contains("background-color:"));
+    }
+
+    #[test]
+    fn state_gradient_and_svg_are_kept_as_separate_background_layers() {
+        let mut css = String::new();
+        let colors = CardColorsConfig {
+            background: vec!["#e01b24".into(), "#9141ac".into()],
+            background_opacity: Some(0.16),
+            ..CardColorsConfig::default()
+        };
+        append_background_css(
+            &mut css,
+            ".card-theme-test.card-state-critical",
+            &colors,
+            Some(&svg_css()),
+            false,
+        );
+        assert!(css.contains("background-color: transparent"));
+        assert!(css.contains(
+            "background-image: cross-fade(10.000% url(\"file:///tmp/card.svg\"), image(transparent)), linear-gradient"
+        ));
+        assert!(css.contains("alpha(#e01b24, 0.160), alpha(#9141ac, 0.160)"));
+        assert!(css.contains("background-repeat: no-repeat, no-repeat"));
+        assert!(css.contains("background-size: contain, cover"));
+    }
+
+    #[test]
+    fn empty_state_colors_leave_the_base_svg_and_tint_untouched() {
+        let mut css = String::new();
+        append_background_css(
+            &mut css,
+            ".card-theme-test.card-state-normal",
+            &CardColorsConfig::default(),
+            Some(&svg_css()),
+            false,
+        );
+        assert!(css.is_empty());
+    }
+
+    #[test]
+    fn compact_mode_keeps_the_logo_but_not_the_refresh_affordance() {
+        assert_eq!(refresh_and_logo_visibility(false, false), (true, false));
+        assert_eq!(refresh_and_logo_visibility(false, true), (true, false));
+        assert_eq!(refresh_and_logo_visibility(true, false), (false, false));
+        assert_eq!(refresh_and_logo_visibility(true, true), (false, true));
     }
 }

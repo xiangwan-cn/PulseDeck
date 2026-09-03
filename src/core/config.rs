@@ -876,6 +876,13 @@ pub struct DisplayConfig {
     /// Per-card override for fixed versus content-driven height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_size: Option<bool>,
+    /// Optional SVG replacement for the top-right refresh icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_svg: Option<CardLogoSvgConfig>,
+    /// Optional static SVG decoration behind the card content. Relative paths
+    /// are resolved from the PulseDeck configuration directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_svg: Option<CardBackgroundSvgConfig>,
     /// Optional colors for standard (non-plugin) cards. Empty fields preserve
     /// the application theme and renderer defaults.
     #[serde(default, skip_serializing_if = "is_default_card_colors")]
@@ -886,6 +893,175 @@ pub struct DisplayConfig {
     /// Smooth color changes without adding an animation timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<CardTransitionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardLogoSvgConfig {
+    pub path: String,
+    #[serde(
+        default = "default_card_logo_svg_size",
+        skip_serializing_if = "is_default_card_logo_svg_size"
+    )]
+    pub size: i32,
+    #[serde(
+        default = "default_card_logo_svg_opacity",
+        skip_serializing_if = "is_default_card_logo_svg_opacity"
+    )]
+    pub opacity: f64,
+}
+
+impl CardLogoSvgConfig {
+    pub(crate) fn resolve_path(
+        &self,
+        config_directory: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        resolve_local_svg_path(config_directory, &self.path)
+    }
+}
+
+fn default_card_logo_svg_size() -> i32 {
+    24
+}
+
+fn is_default_card_logo_svg_size(value: &i32) -> bool {
+    *value == default_card_logo_svg_size()
+}
+
+fn default_card_logo_svg_opacity() -> f64 {
+    0.90
+}
+
+fn is_default_card_logo_svg_opacity(value: &f64) -> bool {
+    *value == default_card_logo_svg_opacity()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardBackgroundSvgConfig {
+    pub path: String,
+    #[serde(
+        default = "default_card_background_svg_opacity",
+        skip_serializing_if = "is_default_card_background_svg_opacity"
+    )]
+    pub opacity: f64,
+    #[serde(default, skip_serializing_if = "is_default_card_background_svg_fit")]
+    pub fit: CardBackgroundSvgFit,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_card_background_svg_position"
+    )]
+    pub position: CardBackgroundSvgPosition,
+}
+
+impl CardBackgroundSvgConfig {
+    pub(crate) fn resolve_path(
+        &self,
+        config_directory: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        resolve_local_svg_path(config_directory, &self.path)
+    }
+
+    pub(crate) fn opacity_percent(&self) -> f64 {
+        if self.opacity.is_finite() {
+            self.opacity.clamp(0.0, 1.0) * 100.0
+        } else {
+            default_card_background_svg_opacity() * 100.0
+        }
+    }
+}
+
+fn resolve_local_svg_path(
+    config_directory: &std::path::Path,
+    configured: &str,
+) -> Result<std::path::PathBuf, String> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return Err("path cannot be empty".into());
+    }
+    let path = std::path::Path::new(configured);
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return Err("path must name an .svg file".into());
+    }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_directory.join(path)
+    };
+    let resolved = std::fs::canonicalize(&path)
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    if !resolved.is_file() {
+        return Err(format!("{} is not a regular file", resolved.display()));
+    }
+    Ok(resolved)
+}
+
+fn default_card_background_svg_opacity() -> f64 {
+    0.10
+}
+
+fn is_default_card_background_svg_opacity(value: &f64) -> bool {
+    *value == default_card_background_svg_opacity()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CardBackgroundSvgFit {
+    #[default]
+    Contain,
+    Cover,
+}
+
+impl CardBackgroundSvgFit {
+    pub(crate) fn as_css(self) -> &'static str {
+        match self {
+            Self::Contain => "contain",
+            Self::Cover => "cover",
+        }
+    }
+}
+
+fn is_default_card_background_svg_fit(value: &CardBackgroundSvgFit) -> bool {
+    *value == CardBackgroundSvgFit::default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CardBackgroundSvgPosition {
+    #[default]
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CardBackgroundSvgPosition {
+    pub(crate) fn as_css(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left center",
+            Self::Right => "right center",
+            Self::Top => "center top",
+            Self::Bottom => "center bottom",
+            Self::TopLeft => "left top",
+            Self::TopRight => "right top",
+            Self::BottomLeft => "left bottom",
+            Self::BottomRight => "right bottom",
+        }
+    }
+}
+
+fn is_default_card_background_svg_position(value: &CardBackgroundSvgPosition) -> bool {
+    *value == CardBackgroundSvgPosition::default()
 }
 
 fn is_default_card_colors(value: &CardColorsConfig) -> bool {
@@ -1259,6 +1435,31 @@ mod tests {
     }
 
     #[test]
+    fn standard_cards_decode_restrained_svg_artwork_options() {
+        let config: AppConfig = toml::from_str(
+            "schema_version=3\n[[cards]]\nid='illustrated'\ntitle='Illustrated'\npage='monitor'\n\
+             [cards.display.logo_svg]\npath='logos/card.svg'\nsize=28\nopacity=0.95\n\
+             [cards.display.background_svg]\npath='backgrounds/card.svg'\nopacity=0.16\nfit='cover'\nposition='top-right'\n",
+        )
+        .unwrap();
+        let display = config.cards[0].display.as_ref().unwrap();
+        let logo = display.logo_svg.as_ref().unwrap();
+        assert_eq!(logo.path, "logos/card.svg");
+        assert_eq!(logo.size, 28);
+        assert_eq!(logo.opacity, 0.95);
+        let background = display.background_svg.as_ref().unwrap();
+        assert_eq!(background.path, "backgrounds/card.svg");
+        assert_eq!(background.opacity, 0.16);
+        assert_eq!(background.fit, CardBackgroundSvgFit::Cover);
+        assert_eq!(background.position, CardBackgroundSvgPosition::TopRight);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[cards.display.logo_svg]"));
+        assert!(serialized.contains("[cards.display.background_svg]"));
+        assert!(serialized.contains("position = \"top-right\""));
+    }
+
+    #[test]
     fn obsolete_generic_card_fields_are_rejected() {
         assert!(toml::from_str::<AppConfig>("[app]\ntitle='missing version'\n").is_err());
         assert!(toml::from_str::<AppConfig>(
@@ -1344,6 +1545,79 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
+    }
+
+    #[test]
+    fn config_loader_validates_svg_background_assets_without_losing_last_good_state() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        let backgrounds = directory.path().join("backgrounds");
+        std::fs::create_dir_all(&backgrounds).unwrap();
+        std::fs::write(
+            backgrounds.join("card.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"/>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &root,
+            "schema_version=3\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
+             [cards.display.logo_svg]\npath='backgrounds/card.svg'\n\
+             [cards.display.background_svg]\npath='backgrounds/card.svg'\n",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root.clone());
+        manager.load().unwrap();
+        assert_eq!(manager.config().cards[0].id, "svg-card");
+
+        std::fs::write(
+            &root,
+            "schema_version=3\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
+             [cards.display.background_svg]\npath='backgrounds/missing.svg'\n",
+        )
+        .unwrap();
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("background_svg"));
+        assert!(error.contains("missing.svg"));
+        assert_eq!(manager.config().cards[0].id, "svg-card");
+    }
+
+    #[test]
+    fn config_loader_rejects_non_svg_backgrounds_and_out_of_range_opacity() {
+        let directory = TestDir::new();
+        let root = directory.path().join("config.toml");
+        std::fs::write(
+            &root,
+            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+             [cards.display.background_svg]\npath='card.png'\n",
+        )
+        .unwrap();
+        let mut manager = ConfigManager::new(root.clone());
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("path must name an .svg file"));
+
+        std::fs::write(
+            directory.path().join("card.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &root,
+            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+             [cards.display.background_svg]\npath='card.svg'\nopacity=1.1\n",
+        )
+        .unwrap();
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("opacity must be between 0.0 and 1.0"));
+
+        std::fs::write(
+            &root,
+            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+             [cards.display.logo_svg]\npath='card.svg'\nsize=65\n",
+        )
+        .unwrap();
+        let error = manager.load().unwrap_err().to_string();
+        assert!(error.contains("logo_svg size must be between 8 and 64"));
     }
 
     #[test]

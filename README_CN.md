@@ -184,7 +184,9 @@ source = { command = { run = ["uname", "-r"], timeout = "5s" } }
 `[[cards.display.states]]` 规则可以覆盖文案、图标、强调边、主值、进度条和背景颜色；
 `background` 数组会生成克制的多色渐变，`[cards.display.transition]` 则在不增加轮询或
 动画定时器的前提下平滑切换状态。数值、文本、正则、语义级别和数据源生命周期匹配方式
-见卡片配置指南。
+见卡片配置指南。普通卡片还可配置静态本地 `[cards.display.background_svg]`，并用
+`[cards.display.logo_svg]` 替换右上角刷新图标；Logo 不影响标题居中，在紧凑模式则作为
+不可点击的装饰层保留。两种 SVG 都能与状态颜色共存且不产生额外刷新任务。
 
 当 `reload_on_change = true` 时，主文件与启用模块的数值类修改都会在运行期间重新读取。新增或删除页面、
 卡片后应重新打开应用，以重建完整页面结构。

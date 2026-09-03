@@ -391,6 +391,40 @@ columns = 2            # 多列模式列数，默认 2
 单卡片尺寸覆盖仍是下限；例如 `card_height = 160` 会阻止该卡片缩到 160 像素以下，
 但不会阻止页面在空间充足时把三行统一增高。
 
+## 静态 SVG 装饰
+
+普通卡片可以同时使用一张底层背景 SVG 和一张右上角前景 Logo。二者都是静态本地资源，
+不会增加轮询、动画帧或后台任务。前景 Logo 使用覆盖式布局，不参与标题栏宽度测量，因此
+不会改变标题的几何居中位置，也不会让原有控件为它重新排版。配置 Logo 后，它会直接
+在常规模式替代默认刷新图标并保留点击刷新行为；紧凑模式不提供单卡刷新，但仍显示 Logo。
+
+```toml
+[cards.display.logo_svg]
+path = "artwork/power-logo.svg"
+size = 24                       # 8–64 逻辑像素，默认 24
+opacity = 0.9                   # 0.0–1.0，默认 0.9
+
+[cards.display.background_svg]
+path = "artwork/power-background.svg"
+opacity = 0.1                   # 0.0–1.0，默认 0.1
+fit = "contain"                # contain / cover
+position = "right"             # 见下方可选值
+```
+
+相对路径统一从 PulseDeck 配置目录（通常是 `~/.config/pulsedeck/`）解析，绝对路径也可用。
+只接受存在的普通 `.svg` 文件；路径、透明度、Logo 尺寸或枚举值不合法时，整次配置重载会
+被拒绝并继续使用上一份有效配置。`background_svg.position` 可取 `center`、`left`、
+`right`、`top`、`bottom`、`top-left`、`top-right`、`bottom-left`、`bottom-right`。
+
+背景 SVG 位于文字和控件之下，并会与 `[cards.display.colors].background` 以及各状态的
+渐变背景合成为独立图层；状态只改文字颜色时不会重置 SVG。Logo 位于标题栏最上层并作为
+常规模式下该卡片的刷新按钮；点击它只刷新数据，不触发卡片的 `click_action`。紧凑模式
+中的 Logo 是不可点击的装饰层。建议背景素材保留透明区域并使用较低透明度，Logo 则保持
+小尺寸，以延续信息优先、低干扰的卡片风格。
+
+配置监视器只监视主配置和 `config.d` 模块，不监视 SVG 内容。替换同一路径下的素材后，
+需要触发一次配置重载或重启应用；仅修改规则、路径或显示参数仍可随配置热重载生效。
+
 ## 普通卡片的状态与颜色
 
 普通非插件卡片可以把采集结果映射为命名视觉状态。状态规则按配置顺序求值，**首条匹配
@@ -483,7 +517,8 @@ background_opacity = 0.12      # 0.0–1.0，默认 0.12
 状态配置，不会被通用状态规则改写。
 
 页面切换栏右上角的网格按钮可在默认列数和六列紧凑布局间切换。紧凑模式仍保留标题、
-主要数值、顶部说明和底部状态文字，只隐藏占宽明显的图标与刷新按钮。选择通过
+主要数值、顶部说明和底部状态文字，并隐藏普通图标与默认刷新图标；配置了 `logo_svg`
+的卡片会继续显示不可点击的装饰 Logo。选择通过
 `${XDG_STATE_HOME:-$HOME/.local/state}/pulsedeck/compact-grid` 原子保存，下次启动
 及配置热重载后继续使用上次模式。
 

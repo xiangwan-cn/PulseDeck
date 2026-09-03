@@ -104,6 +104,14 @@ requests the card through its existing scheduler, and reapplies the appearance;
 steady-state deduplication and `minimum_change` continue normally afterward.
 Plugin cards retain their own state and animation policies.
 
+Optional standard-card background and logo SVGs are static local assets. The
+background is composited with existing state tints in GTK CSS. The logo replaces
+the overlaid refresh-button icon without participating in header sizing. Compact
+mode still has no per-card refresh button and renders the logo through a separate,
+non-interactive overlay. The assets are loaded when display configuration is
+applied and create no file watch, decode loop, polling task, or animation timer.
+Replacing an SVG in place requires a config reload or application restart.
+
 ## External power
 
 The power monitor reads charger `online` state plus battery, input-power, and
