@@ -56,6 +56,16 @@ impl BatterySource {
         }
     }
 
+    /// Invalidate the short-lived shared snapshot after a power-supply edge.
+    /// The next consumer performs one fresh read instead of receiving the
+    /// pre-edge value.
+    pub fn invalidate(&mut self) {
+        self.cached_snapshot = None;
+        self.last_read = Instant::now()
+            .checked_sub(self.cache_ttl)
+            .unwrap_or_else(Instant::now);
+    }
+
     pub fn snapshot(&mut self) -> Result<BatterySnapshot, anyhow::Error> {
         let now = Instant::now();
         if let Some(ref snap) = self.cached_snapshot {
@@ -70,56 +80,13 @@ impl BatterySource {
     }
 
     fn discover(&self) -> Option<PathBuf> {
-        let entries = fs::read_dir(&self.root).ok()?;
-        let mut best: Option<(PathBuf, i32)> = None;
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-
-            let type_path = path.join("type");
-            let ty = match fs::read_to_string(&type_path) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ty.trim() != "Battery" {
-                continue;
-            }
-
-            let scope_path = path.join("scope");
-            if let Ok(scope) = fs::read_to_string(&scope_path) {
-                if scope.trim() == "Device" {
-                    continue;
-                }
-            }
-
-            let mut score = 0;
-            if let Ok(present) = fs::read_to_string(path.join("present")) {
-                if present.trim() == "1" {
-                    score = 1;
-                }
-            }
-
-            match best {
-                Some((_, prev_score)) if score <= prev_score => {}
-                _ => best = Some((path, score)),
-            }
-        }
-
-        best.map(|(p, _)| p)
+        select_battery(&self.root)
     }
 
     fn ensure_battery(&mut self) -> Option<PathBuf> {
         if let Some(ref path) = self.battery_path {
-            if path.exists() {
-                if let Ok(p) = fs::read_to_string(path.join("present")) {
-                    if p.trim() == "1" {
-                        if let Ok(t) = fs::read_to_string(path.join("type")) {
-                            if t.trim() == "Battery" {
-                                return Some(path.clone());
-                            }
-                        }
-                    }
-                }
+            if is_usable_battery(path) {
+                return Some(path.clone());
             }
         }
         let new_path = self.discover()?;
@@ -127,12 +94,20 @@ impl BatterySource {
         Some(new_path)
     }
 
+    /// Read only the capacity used by policy evaluation. This helper keeps
+    /// policy sampling independent from any particular display card.
+    pub fn capacity(&mut self) -> Option<f64> {
+        self.ensure_battery()
+            .and_then(|path| read_capacity(&path))
+            .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+    }
+
     fn do_read(&mut self) -> Result<BatterySnapshot, anyhow::Error> {
         let path = self
             .ensure_battery()
             .ok_or_else(|| anyhow::anyhow!("no battery found in sysfs"))?;
 
-        let capacity = read_capacity(&path);
+        let capacity = read_capacity(&path).unwrap_or(0.0);
 
         let status = read_status(&path);
 
@@ -169,21 +144,54 @@ impl BatterySource {
     }
 }
 
+/// Select the same usable system battery for policy and metric consumers.
+/// Explicit `present=0` entries are absent; a missing `present` attribute is
+/// accepted because several platforms expose a battery without that file.
+pub fn select_battery(root: &Path) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| is_usable_battery(path))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn is_usable_battery(path: &Path) -> bool {
+    let Ok(kind) = fs::read_to_string(path.join("type")) else {
+        return false;
+    };
+    if kind.trim() != "Battery" {
+        return false;
+    }
+    if fs::read_to_string(path.join("scope"))
+        .ok()
+        .is_some_and(|scope| scope.trim() == "Device")
+    {
+        return false;
+    }
+    match fs::read_to_string(path.join("present")) {
+        Ok(present) => present.trim() == "1",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 fn read_attr_u64(path: &Path, name: &str) -> Option<u64> {
     let content = fs::read_to_string(path.join(name)).ok()?;
     content.trim().parse().ok()
 }
 
-fn read_capacity(path: &Path) -> f64 {
+fn read_capacity(path: &Path) -> Option<f64> {
     if let Some(cap) = read_attr_u64(path, "capacity") {
-        return cap as f64;
+        return Some(cap as f64);
     }
     if let (Some(now), Some(full)) = (
         read_attr_u64(path, "energy_now"),
         read_attr_u64(path, "energy_full"),
     ) {
         if full > 0 {
-            return (now as f64 / full as f64) * 100.0;
+            return Some((now as f64 / full as f64) * 100.0);
         }
     }
     if let (Some(now), Some(full)) = (
@@ -191,10 +199,10 @@ fn read_capacity(path: &Path) -> f64 {
         read_attr_u64(path, "charge_full"),
     ) {
         if full > 0 {
-            return (now as f64 / full as f64) * 100.0;
+            return Some((now as f64 / full as f64) * 100.0);
         }
     }
-    0.0
+    None
 }
 
 fn read_status(path: &Path) -> BatteryStatus {
@@ -305,12 +313,17 @@ mod tests {
     fn test_cache_window() {
         let dir = std::env::temp_dir().join("pulsedeck_test_battery_cache");
         let _ = fs::remove_dir_all(&dir);
-        setup_sysfs(&dir, "BAT0");
+        let battery = setup_sysfs(&dir, "BAT0");
 
         let mut src = BatterySource::new(dir);
         let s1 = src.snapshot().unwrap();
-        let s2 = src.snapshot().unwrap();
-        assert_eq!(s1.capacity, s2.capacity);
+        fs::write(battery.join("capacity"), "42\n").unwrap();
+        // The short source cache is intentionally retained until an edge
+        // invalidates it.
+        let cached = src.snapshot().unwrap();
+        assert_eq!(s1.capacity, cached.capacity);
+        src.invalidate();
+        assert_eq!(src.snapshot().unwrap().capacity, 42.0);
     }
 
     #[test]
@@ -379,6 +392,91 @@ mod tests {
                 snap.temperature
             );
         }
+    }
+
+    #[test]
+    fn charge_only_battery_feeds_capacity_policy_sample() {
+        let dir = std::env::temp_dir().join(format!(
+            "pulsedeck_test_battery_charge-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let battery = setup_sysfs(&dir, "BAT0");
+        fs::remove_file(battery.join("capacity")).unwrap();
+        fs::remove_file(battery.join("energy_now")).unwrap();
+        let _ = fs::remove_file(battery.join("energy_full"));
+        fs::write(battery.join("charge_now"), "50000000\n").unwrap();
+        fs::write(battery.join("charge_full"), "100000000\n").unwrap();
+
+        let mut source = BatterySource::new(dir.clone());
+        assert_eq!(source.capacity(), Some(50.0));
+        assert_eq!(source.snapshot().unwrap().capacity, 50.0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_absent_batteries_are_not_selected() {
+        let dir = std::env::temp_dir().join(format!(
+            "pulsedeck_test_battery_absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let battery = setup_sysfs(&dir, "BAT0");
+        fs::write(battery.join("present"), "0\n").unwrap();
+
+        assert_eq!(select_battery(&dir), None);
+        let mut source = BatterySource::new(dir.clone());
+        assert_eq!(source.capacity(), None);
+        assert!(source.snapshot().is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_present_attribute_is_accepted() {
+        let dir = std::env::temp_dir().join(format!(
+            "pulsedeck_test_battery_no-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let battery = setup_sysfs(&dir, "BAT0");
+        fs::remove_file(battery.join("present")).unwrap();
+
+        assert_eq!(select_battery(&dir), Some(battery.clone()));
+        let mut source = BatterySource::new(dir.clone());
+        assert_eq!(source.capacity(), Some(85.0));
+        assert_eq!(source.snapshot().unwrap().capacity, 85.0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multiple_batteries_select_the_present_system_battery() {
+        let dir = std::env::temp_dir().join(format!(
+            "pulsedeck_test_battery_multiple-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let absent = setup_sysfs(&dir, "BAT0");
+        fs::write(absent.join("present"), "0\n").unwrap();
+        let present = setup_sysfs(&dir, "BAT1");
+        fs::write(present.join("capacity"), "61\n").unwrap();
+
+        assert_eq!(select_battery(&dir), Some(present.clone()));
+        let mut source = BatterySource::new(dir.clone());
+        assert_eq!(source.capacity(), Some(61.0));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

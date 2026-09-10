@@ -1,31 +1,23 @@
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::path::Path;
-
 use crate::model::card_model::{CardValue, StatusLevel};
 use crate::model::metric_result::{MetricResult, MetricState};
 
 use super::traits::MetricContext;
 
-/// Persistent NetworkManager D-Bus reader. Unlike the previous implementation,
-/// one card refresh never forks three separate `nmcli` processes.
-pub struct NetworkMetric {
-    connection: Option<zbus::blocking::Connection>,
-}
+/// NetworkManager state is shared by all network cards through MetricContext.
+/// The source keeps one connection, signal invalidation, and a bounded
+/// fallback deadline; projections only format the shared snapshot.
+pub struct NetworkMetric;
 
 impl NetworkMetric {
     pub fn new() -> Self {
-        Self {
-            connection: zbus::blocking::Connection::system().ok(),
-        }
+        Self
     }
 
-    pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
-        let (connectivity, connection_name, primary_iface) = self
-            .connection
-            .as_ref()
-            .and_then(network_manager_state)
-            .unwrap_or_else(fallback_state);
-        let ip = primary_ip(primary_iface.as_deref());
+    pub fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
+        let snapshot = ctx.network.lock().unwrap().snapshot();
+        let connectivity = snapshot.connectivity;
+        let connection_name = snapshot.connection_name;
+        let ip = snapshot.primary_ip;
         let (state_label, level) = match connectivity {
             4 => ("已连接", StatusLevel::Good),
             2 => ("需登录", StatusLevel::Warning),
@@ -73,229 +65,6 @@ fn network_presentation(
     (value, subtitle)
 }
 
-fn network_manager_state(
-    connection: &zbus::blocking::Connection,
-) -> Option<(u32, String, Option<String>)> {
-    let manager = zbus::blocking::Proxy::new(
-        connection,
-        "org.freedesktop.NetworkManager",
-        "/org/freedesktop/NetworkManager",
-        "org.freedesktop.NetworkManager",
-    )
-    .ok()?;
-    let connectivity = manager.get_property::<u32>("Connectivity").ok()?;
-    let primary = manager
-        .get_property::<zbus::zvariant::OwnedObjectPath>("PrimaryConnection")
-        .ok()?;
-    let (name, primary_iface) = if primary.as_str() == "/" {
-        (String::new(), None)
-    } else {
-        let active = zbus::blocking::Proxy::new(
-            connection,
-            "org.freedesktop.NetworkManager",
-            primary.as_str(),
-            "org.freedesktop.NetworkManager.Connection.Active",
-        )
-        .ok();
-        let name = active
-            .as_ref()
-            .and_then(|proxy| proxy.get_property::<String>("Id").ok())
-            .unwrap_or_default();
-        let primary_iface = active
-            .and_then(|proxy| {
-                proxy
-                    .get_property::<Vec<zbus::zvariant::OwnedObjectPath>>("Devices")
-                    .ok()
-            })
-            .and_then(|devices| devices.into_iter().next())
-            .and_then(|device| {
-                let proxy = zbus::blocking::Proxy::new(
-                    connection,
-                    "org.freedesktop.NetworkManager",
-                    device.as_str(),
-                    "org.freedesktop.NetworkManager.Device",
-                )
-                .ok()?;
-                proxy.get_property::<String>("Interface").ok()
-            });
-        (name, primary_iface)
-    };
-    Some((connectivity, name, primary_iface))
-}
-
-fn fallback_state() -> (u32, String, Option<String>) {
-    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return (0, String::new(), None);
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "lo" {
-            continue;
-        }
-        if std::fs::read_to_string(entry.path().join("operstate"))
-            .ok()
-            .is_some_and(|state| state.trim() == "up")
-        {
-            return (4, name.clone(), Some(name));
-        }
-    }
-    (1, String::new(), None)
-}
-
-/// The main-table default route is a better source hint than a UDP probe:
-/// on systems with a proxy tunnel (e.g. 198.18.0.0/15 virtual stacks) the
-/// kernel picks the tunnel address for outbound packets, while the user
-/// usually wants the physical interface address (e.g. Wi-Fi 192.168.0.x).
-fn primary_ip(preferred_iface: Option<&str>) -> String {
-    let route_iface = default_route_iface();
-    let mut addresses = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "lo" {
-                continue;
-            }
-            let Some(ip) = iface_ipv4(&name) else {
-                continue;
-            };
-            if is_unwanted_ip(ip) {
-                continue;
-            }
-            addresses.push((name.clone(), ip, is_physical_interface(&name)));
-        }
-    }
-
-    // Prefer the physical device reported by NetworkManager. This remains
-    // stable when a VPN/proxy tunnel becomes the kernel's default route.
-    if let Some(iface) = preferred_iface {
-        if let Some((_, ip, _)) = addresses
-            .iter()
-            .find(|(name, _, physical)| name == iface && *physical)
-        {
-            return ip.to_string();
-        }
-    }
-    if let Some(iface) = route_iface.as_deref() {
-        if let Some((_, ip, _)) = addresses
-            .iter()
-            .find(|(name, _, physical)| name == iface && *physical)
-        {
-            return ip.to_string();
-        }
-    }
-    if let Some((_, ip, _)) = addresses.iter().find(|(_, _, physical)| *physical) {
-        return ip.to_string();
-    }
-
-    // If sysfs cannot identify a physical device, retain a deterministic
-    // interface preference before falling back to any usable address.
-    if let Some(iface) = preferred_iface {
-        if let Some((_, ip, _)) = addresses.iter().find(|(name, _, _)| name == iface) {
-            return ip.to_string();
-        }
-    }
-    if let Some(iface) = route_iface.as_deref() {
-        if let Some((_, ip, _)) = addresses.iter().find(|(name, _, _)| name == iface) {
-            return ip.to_string();
-        }
-    }
-    if let Some((_, ip, _)) = addresses.first() {
-        return ip.to_string();
-    }
-    udp_probe_ip()
-}
-
-/// Virtual interfaces such as Docker bridges and proxy tunnels do not have a
-/// backing device in sysfs. Real Ethernet/Wi-Fi interfaces do, including
-/// interfaces whose names vary from the usual `eth0`/`wlan0` convention.
-fn is_physical_interface(name: &str) -> bool {
-    let path = Path::new("/sys/class/net").join(name);
-    path.join("device").exists() || path.join("wireless").exists()
-}
-
-/// IPv4 addresses that should never be presented as "the" address:
-/// loopback, link-local, unspecified, and the 198.18.0.0/15 benchmarking
-/// block commonly used by proxy tunnel stacks.
-fn is_unwanted_ip(ip: Ipv4Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || matches!(ip.octets(), [198, 18..=19, _, _])
-}
-
-/// Name of the interface owning the main-table default route (lowest metric).
-fn default_route_iface() -> Option<String> {
-    let contents = std::fs::read_to_string("/proc/net/route").ok()?;
-    default_route_iface_from(&contents)
-}
-
-fn default_route_iface_from(contents: &str) -> Option<String> {
-    let mut best: Option<(u32, String)> = None;
-    for line in contents.lines().skip(1) {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        let (Some(&iface), Some(&destination), Some(&metric)) =
-            (fields.first(), fields.get(1), fields.get(6))
-        else {
-            continue;
-        };
-        let Ok(destination) = u32::from_str_radix(destination, 16) else {
-            continue;
-        };
-        let Ok(metric) = metric.parse::<u32>() else {
-            continue;
-        };
-        if destination == 0
-            && best
-                .as_ref()
-                .is_none_or(|(best_metric, _)| metric < *best_metric)
-        {
-            best = Some((metric, iface.to_string()));
-        }
-    }
-    best.map(|(_, iface)| iface)
-}
-
-/// First IPv4 address of an interface via SIOCGIFADDR.
-fn iface_ipv4(name: &str) -> Option<Ipv4Addr> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return None;
-    }
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let bytes = name.as_bytes();
-    if bytes.len() >= libc::IFNAMSIZ {
-        unsafe { libc::close(fd) };
-        return None;
-    }
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(bytes) {
-        *dst = *src as libc::c_char;
-    }
-    let ok = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR.try_into().unwrap(), &mut ifr) } == 0;
-    unsafe { libc::close(fd) };
-    if !ok {
-        return None;
-    }
-    let sin =
-        unsafe { &ifr.ifr_ifru.ifru_addr } as *const libc::sockaddr as *const libc::sockaddr_in;
-    let s_addr = unsafe { (*sin).sin_addr.s_addr };
-    Some(Ipv4Addr::from(u32::from_be(s_addr)))
-}
-
-/// Original route-based probe, kept as a last resort when the interface
-/// enumeration finds nothing usable.
-fn udp_probe_ip() -> String {
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-        return String::new();
-    };
-    if socket.connect("1.1.1.1:80").is_err() {
-        return String::new();
-    }
-    match socket.local_addr() {
-        Ok(SocketAddr::V4(address)) => address.ip().to_string(),
-        _ => String::new(),
-    }
-}
-
 fn connectivity_label(value: u32) -> &'static str {
     match value {
         4 => "full",
@@ -310,9 +79,8 @@ fn connectivity_label(value: u32) -> &'static str {
 mod tests {
     use crate::model::card_model::{CardValue, StatusLevel};
 
-    use super::{
-        connectivity_label, default_route_iface_from, is_unwanted_ip, network_presentation,
-    };
+    use super::{connectivity_label, network_presentation};
+    use crate::sources::network::{default_route_iface_from, is_unwanted_ip};
 
     #[test]
     fn network_manager_connectivity_values_are_stable() {

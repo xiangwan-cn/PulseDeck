@@ -1,4 +1,3 @@
-use std::fs;
 use std::time::Instant;
 
 use crate::model::card_model::{CardValue, StatusLevel};
@@ -22,12 +21,12 @@ pub enum SystemMetric {
 impl SystemMetric {
     pub fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
         match self {
-            Self::LoadAverage => load_average(),
+            Self::LoadAverage => load_average(ctx),
             Self::Swap => swap_usage(ctx),
-            Self::ProcessCount => process_count(),
-            Self::CpuTemperature => cpu_temperature(),
+            Self::ProcessCount => process_count(ctx),
+            Self::CpuTemperature => cpu_temperature(ctx),
             Self::Filesystem => filesystem_usage(),
-            Self::NetworkTraffic { previous } => network_traffic(previous),
+            Self::NetworkTraffic { previous } => network_traffic(ctx, previous),
         }
     }
 }
@@ -43,15 +42,12 @@ fn normal(value: CardValue, subtitle: Option<String>) -> MetricResult {
     }
 }
 
-fn load_average() -> MetricResult {
-    match fs::read_to_string("/proc/loadavg") {
-        Ok(text) => {
-            let values: Vec<_> = text.split_whitespace().take(3).collect();
-            normal(
-                CardValue::Text(values.first().copied().unwrap_or("-").into()),
-                Some(format!("1 / 5 / 15 分钟：{}", values.join(" / "))),
-            )
-        }
+fn load_average(ctx: &MetricContext) -> MetricResult {
+    match ctx.procfs.lock().unwrap().read_load_average() {
+        Ok(values) => normal(
+            CardValue::Text(values.first().cloned().unwrap_or_else(|| "-".into())),
+            Some(format!("1 / 5 / 15 分钟：{}", values.join(" / "))),
+        ),
         Err(e) => MetricResult::error(format!("读取负载失败: {e}")),
     }
 }
@@ -79,79 +75,29 @@ fn swap_usage(ctx: &MetricContext) -> MetricResult {
     )
 }
 
-fn process_count() -> MetricResult {
-    match fs::read_dir("/proc") {
-        Ok(entries) => {
-            let count = entries
-                .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .bytes()
-                        .all(|b| b.is_ascii_digit())
-                })
-                .count();
-            normal(
-                CardValue::Number {
-                    value: count as f64,
-                    unit: Some("个".into()),
-                    decimals: 0,
-                },
-                Some("当前进程数".into()),
-            )
-        }
+fn process_count(ctx: &MetricContext) -> MetricResult {
+    match ctx.procfs.lock().unwrap().process_count() {
+        Ok(count) => normal(
+            CardValue::Number {
+                value: count as f64,
+                unit: Some("个".into()),
+                decimals: 0,
+            },
+            Some("当前进程数".into()),
+        ),
         Err(e) => MetricResult::error(format!("读取进程失败: {e}")),
     }
 }
 
-fn cpu_temperature() -> MetricResult {
-    let zones = match fs::read_dir("/sys/class/thermal") {
-        Ok(v) => v,
-        Err(e) => return MetricResult::unavailable(format!("无温度传感器: {e}")),
-    };
-    let mut readings = Vec::new();
-    for zone in zones.flatten() {
-        let path = zone.path();
-        if !zone
-            .file_name()
-            .to_string_lossy()
-            .starts_with("thermal_zone")
-        {
-            continue;
-        }
-        let kind = fs::read_to_string(path.join("type"))
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let raw = fs::read_to_string(path.join("temp"))
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok());
-        if let Some(raw) = raw {
-            readings.push((
-                kind,
-                if raw.abs() > 1000.0 {
-                    raw / 1000.0
-                } else {
-                    raw
-                },
-            ));
-        }
-    }
-    let selected = readings
-        .iter()
-        .find(|(k, _)| {
-            let k = k.to_ascii_lowercase();
-            k.contains("cpu") || k.contains("soc") || k.contains("package")
-        })
-        .or_else(|| readings.first());
-    match selected {
-        Some((kind, temp)) => normal(
+fn cpu_temperature(ctx: &MetricContext) -> MetricResult {
+    match crate::sources::thermal::select_cpu_temperature(&ctx.thermal_root) {
+        Some(reading) => normal(
             CardValue::Number {
-                value: *temp,
+                value: reading.celsius,
                 unit: Some("°C".into()),
                 decimals: 1,
             },
-            Some(kind.clone()),
+            Some(reading.kind),
         ),
         None => MetricResult::unavailable("未发现可用温度传感器"),
     }
@@ -182,23 +128,14 @@ fn filesystem_usage() -> MetricResult {
     )
 }
 
-fn network_traffic(previous: &mut Option<(Instant, u64, u64)>) -> MetricResult {
-    let text = match fs::read_to_string("/proc/net/dev") {
-        Ok(v) => v,
+fn network_traffic(
+    ctx: &MetricContext,
+    previous: &mut Option<(Instant, u64, u64)>,
+) -> MetricResult {
+    let (rx, tx) = match ctx.procfs.lock().unwrap().network_totals() {
+        Ok(totals) => totals,
         Err(e) => return MetricResult::error(format!("读取网络流量失败: {e}")),
     };
-    let (mut rx, mut tx) = (0u64, 0u64);
-    for line in text.lines().skip(2) {
-        let Some((name, values)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim() == "lo" {
-            continue;
-        }
-        let fields: Vec<_> = values.split_whitespace().collect();
-        rx = rx.saturating_add(fields.first().and_then(|v| v.parse().ok()).unwrap_or(0));
-        tx = tx.saturating_add(fields.get(8).and_then(|v| v.parse().ok()).unwrap_or(0));
-    }
     let now = Instant::now();
     let rates = previous.map(|(at, old_rx, old_tx)| {
         let secs = now.duration_since(at).as_secs_f64().max(0.001);

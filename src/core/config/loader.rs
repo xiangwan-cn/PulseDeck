@@ -69,6 +69,19 @@ impl ConfigManager {
         &self.config
     }
 
+    /// An empty root document may still acquire generated capability modules
+    /// during startup. Those entries are not a replacement for the one parsed
+    /// default-card registry; enabled module cards are layered on top.
+    pub fn uses_default_card_registry(&self) -> bool {
+        self.root.cards.is_empty()
+    }
+
+    /// Generated plugin/capability pages are layered over the shipped default
+    /// pages when the root document does not define its own page registry.
+    pub fn uses_default_page_registry(&self) -> bool {
+        self.root.pages.is_empty()
+    }
+
     pub fn config_mut(&mut self) -> &mut AppConfig {
         &mut self.config
     }
@@ -482,8 +495,49 @@ fn merge_config(
             |action| &action.id,
         )?;
     }
+    validate_runtime(root_path, &merged)?;
     validate_card_assets(root_path, &merged)?;
     Ok(merged)
+}
+
+fn validate_runtime(path: &Path, config: &AppConfig) -> Result<(), AppError> {
+    for (field, value) in [
+        (
+            "quiet_hours_start_hour",
+            config.runtime.quiet_hours_start_hour,
+        ),
+        ("quiet_hours_end_hour", config.runtime.quiet_hours_end_hour),
+    ] {
+        if value > 23 {
+            return Err(AppError::ConfigParse {
+                path: path.to_path_buf(),
+                message: format!("runtime {field} must be between 0 and 23"),
+            });
+        }
+    }
+    if !(1..=crate::core::config::HARD_MAX_OBSERVATION_LEASE_SECONDS)
+        .contains(&config.runtime.observation_lease_seconds)
+    {
+        return Err(AppError::ConfigParse {
+            path: path.to_path_buf(),
+            message: format!(
+                "runtime observation_lease_seconds must be between 1 and {}",
+                crate::core::config::HARD_MAX_OBSERVATION_LEASE_SECONDS
+            ),
+        });
+    }
+    let runtime = &config.runtime;
+    let thresholds_valid = runtime.battery_critical_enter_percent
+        < runtime.battery_critical_exit_percent
+        && runtime.battery_critical_exit_percent <= runtime.battery_low_enter_percent
+        && runtime.battery_low_enter_percent < runtime.battery_low_exit_percent;
+    if !thresholds_valid || runtime.battery_low_exit_percent > 100 {
+        return Err(AppError::ConfigParse {
+            path: path.to_path_buf(),
+            message: "runtime battery thresholds must satisfy critical_enter < critical_exit <= low_enter < low_exit <= 100".into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_card_assets(path: &Path, config: &AppConfig) -> Result<(), AppError> {

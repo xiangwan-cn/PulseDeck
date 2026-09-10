@@ -13,7 +13,10 @@ use serde::Deserialize;
 use super::config::{AnimationConfig, PetConfig};
 use crate::core::config::CardConfig;
 use crate::core::error::AppError;
-use crate::core::runtime::{AnimationPolicy, ImportantEventKind, RuntimeHandle, UserActivity};
+use crate::core::runtime::{
+    ImportantEventKind, RuntimeHandle, RuntimeSnapshot, ThermalVerdict, UserActivity, Visibility,
+    VisualPolicy,
+};
 use crate::plugins::{CardPresentation, CardPresentationHandle};
 
 #[derive(Debug, Deserialize)]
@@ -38,7 +41,7 @@ struct Runtime {
     frame_cache: RefCell<HashMap<String, Vec<gdk::Texture>>>,
     cache_order: RefCell<VecDeque<String>>,
     frame_index: Cell<usize>,
-    animation_policy: Cell<AnimationPolicy>,
+    visual_policy: Cell<VisualPolicy>,
     animation_source: RefCell<Option<glib::SourceId>>,
     offline_source: RefCell<Option<glib::SourceId>>,
     transition_source: RefCell<Option<glib::SourceId>>,
@@ -100,7 +103,7 @@ pub fn build(
         frame_cache: RefCell::new(HashMap::new()),
         cache_order: RefCell::new(VecDeque::new()),
         frame_index: Cell::new(0),
-        animation_policy: Cell::new(AnimationPolicy::Stopped),
+        visual_policy: Cell::new(VisualPolicy::Stopped),
         animation_source: RefCell::new(None),
         offline_source: RefCell::new(None),
         transition_source: RefCell::new(None),
@@ -115,7 +118,7 @@ pub fn build(
     Runtime::setup_presentation_menu(&runtime);
     runtime.set_state("offline", None, true);
     Runtime::watch_state_file(&runtime)?;
-    Runtime::watch_runtime_mode(&runtime);
+    Runtime::watch_visual_policy(&runtime);
     Runtime::watch_mapping(&runtime);
 
     // The signal closure owns the runtime for exactly as long as the widget.
@@ -229,7 +232,7 @@ impl Runtime {
 
     fn load_state(self: &Rc<Self>) {
         let Ok(data) = std::fs::read_to_string(&self.config.state_file) else {
-            self.set_state("offline", None, false);
+            self.set_state("offline", None, true);
             return;
         };
         let Ok(event) = serde_json::from_str::<StateEvent>(&data) else {
@@ -239,7 +242,7 @@ impl Runtime {
         let now = now_ms();
         let max_age = self.config.offline_after_seconds.saturating_mul(1000);
         if now.saturating_sub(event.timestamp_ms) >= max_age {
-            self.set_state("offline", None, false);
+            self.set_state("offline", None, true);
             return;
         }
         if let Some(source) = self.transition_source.borrow_mut().take() {
@@ -249,19 +252,18 @@ impl Runtime {
             .task_id
             .clone()
             .unwrap_or_else(|| format!("legacy-{}", event.timestamp_ms));
-        if is_active_agent_state(&event.state) {
-            self.runtime.report_codex_started(task_id.clone());
-        }
         if let Some(kind) = important_event_kind(&event.state) {
             let event_id = event
                 .event_id
                 .clone()
                 .unwrap_or_else(|| event.timestamp_ms.to_string());
-            if self.runtime.report_codex_event(task_id, event_id, kind)
-                && self.runtime.config().codex_completion_sound
+            if self.runtime.report_agent_event(task_id, event_id, kind)
+                && self.runtime.config().agent_completion_sound
             {
                 self.play_completion_sound();
             }
+        } else if is_active_agent_state(&event.state) {
+            self.runtime.report_agent_started(task_id);
         }
         self.set_state(
             &event.state,
@@ -297,7 +299,7 @@ impl Runtime {
         let source =
             glib::timeout_add_local_once(Duration::from_millis(delay_ms.max(1)), move || {
                 if let Some(runtime) = weak.upgrade() {
-                    runtime.set_state("offline", None, false);
+                    runtime.set_state("offline", None, true);
                     runtime.offline_source.borrow_mut().take();
                 }
             });
@@ -314,7 +316,7 @@ impl Runtime {
         let previous_state = self.current_state.borrow().clone();
         if previous_state == state {
             if state == "offline" && clear_agent_on_offline {
-                self.runtime.clear_codex();
+                self.runtime.clear_agent();
             }
             if let Some(detail) = detail {
                 self.status.set_text(detail);
@@ -324,7 +326,7 @@ impl Runtime {
         self.current_state.replace(state.to_string());
         if state == "offline" {
             if clear_agent_on_offline {
-                self.runtime.clear_codex();
+                self.runtime.clear_agent();
             }
             self.schedule_presentation_reset();
         } else {
@@ -357,7 +359,7 @@ impl Runtime {
             return;
         }
         if self.frames.borrow().len() > 1 {
-            self.apply_animation_policy(self.runtime.snapshot().animation_policy);
+            self.apply_runtime_snapshot(&self.runtime.snapshot());
         }
     }
 
@@ -433,13 +435,15 @@ impl Runtime {
         }
         let interval = Duration::from_millis((1000 / fps) as u64);
         let looping = animation.r#loop;
-        let pause_when_unmapped = self.config.pause_when_unmapped;
         let weak = Rc::downgrade(self);
         let source = glib::timeout_add_local(interval, move || {
             let Some(runtime) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if pause_when_unmapped && !runtime.root.is_mapped() {
+            // B2's unmapped hard stop is unconditional. The retained
+            // compatibility field is decoded below but cannot keep a hidden
+            // animation alive.
+            if !runtime.root.is_mapped() {
                 runtime.animation_source.borrow_mut().take();
                 return glib::ControlFlow::Break;
             }
@@ -468,7 +472,7 @@ impl Runtime {
         }
     }
 
-    fn watch_runtime_mode(this: &Rc<Self>) {
+    fn watch_visual_policy(this: &Rc<Self>) {
         let rx = this.runtime.subscribe();
         let weak = Rc::downgrade(this);
         glib::MainContext::default().spawn_local(async move {
@@ -476,7 +480,7 @@ impl Runtime {
                 let Some(runtime) = weak.upgrade() else {
                     break;
                 };
-                runtime.apply_animation_policy(snapshot.animation_policy);
+                runtime.apply_runtime_snapshot(&snapshot);
             }
         });
     }
@@ -485,7 +489,7 @@ impl Runtime {
         let weak = Rc::downgrade(this);
         this.root.connect_map(move |_| {
             if let Some(runtime) = weak.upgrade() {
-                runtime.apply_animation_policy(runtime.runtime.snapshot().animation_policy);
+                runtime.apply_runtime_snapshot(&runtime.runtime.snapshot());
             }
         });
         let weak = Rc::downgrade(this);
@@ -496,41 +500,47 @@ impl Runtime {
         });
     }
 
-    fn apply_animation_policy(self: &Rc<Self>, policy: AnimationPolicy) {
+    fn apply_runtime_snapshot(self: &Rc<Self>, snapshot: &RuntimeSnapshot) {
+        let state = self.current_state.borrow().clone();
+        let animation = self
+            .config
+            .animations
+            .get(&state)
+            .or_else(|| self.config.animations.get("default"));
+        let policy = animation.map_or(snapshot.visual_policy, |animation| {
+            pet_visual_policy(
+                snapshot.visual_policy,
+                snapshot.visibility,
+                snapshot.thermal_verdict,
+                snapshot.periodic_refresh_paused,
+                &state,
+                animation.r#loop,
+            )
+        });
         let should_animate = self.root.is_mapped()
             && self.frames.borrow().len() > 1
-            && matches!(
-                policy,
-                AnimationPolicy::Normal | AnimationPolicy::Reduced(_)
-            );
-        if self.animation_policy.get() == policy
+            && matches!(policy, VisualPolicy::Full | VisualPolicy::Capped(_));
+        if self.visual_policy.get() == policy
             && ((should_animate && self.animation_source.borrow().is_some()) || !should_animate)
         {
             return;
         }
-        self.animation_policy.set(policy);
+        self.visual_policy.set(policy);
         self.stop_animation();
-        if !self.root.is_mapped()
-            || matches!(policy, AnimationPolicy::Stopped | AnimationPolicy::Frozen)
+        if !self.root.is_mapped() || matches!(policy, VisualPolicy::Stopped | VisualPolicy::Frozen)
         {
             return;
         }
-        let state = self.current_state.borrow().clone();
-        let Some(animation) = self
-            .config
-            .animations
-            .get(&state)
-            .or_else(|| self.config.animations.get("default"))
-        else {
+        let Some(animation) = animation else {
             return;
         };
         if self.frames.borrow().len() < 2 {
             return;
         }
         let cap = match policy {
-            AnimationPolicy::Normal => None,
-            AnimationPolicy::Reduced(fps) => Some(fps),
-            AnimationPolicy::Frozen | AnimationPolicy::Stopped => return,
+            VisualPolicy::Full => None,
+            VisualPolicy::Capped(fps) => Some(fps),
+            VisualPolicy::Frozen | VisualPolicy::Stopped => return,
         };
         self.start_animation(animation, cap);
     }
@@ -682,6 +692,42 @@ fn normalize_state(state: &str) -> &str {
     }
 }
 
+fn pet_visual_policy(
+    policy: VisualPolicy,
+    visibility: Visibility,
+    thermal: ThermalVerdict,
+    periodic_refresh_paused: bool,
+    state: &str,
+    looping: bool,
+) -> VisualPolicy {
+    if visibility == Visibility::Unmapped {
+        return VisualPolicy::Stopped;
+    }
+    if matches!(thermal, ThermalVerdict::Hot | ThermalVerdict::Throttled) {
+        return VisualPolicy::Frozen;
+    }
+    if periodic_refresh_paused && looping {
+        // Quiet hours without an observation lease mean nobody is watching.
+        // Keep consuming Agent state events, but do not spend frames on any
+        // unattended loop. Real input reopens the bounded observation window.
+        return VisualPolicy::Frozen;
+    }
+    if is_active_agent_state(state)
+        && matches!(policy, VisualPolicy::Full | VisualPolicy::Capped(_))
+    {
+        // A mapped daytime/observed Agent state is visible work even when GTK
+        // focus is absent or the local interaction clock is idle.
+        return VisualPolicy::Full;
+    }
+    if looping && !is_active_agent_state(state) {
+        return match policy {
+            VisualPolicy::Full | VisualPolicy::Capped(_) => VisualPolicy::Capped(1),
+            other => other,
+        };
+    }
+    policy
+}
+
 fn is_active_agent_state(state: &str) -> bool {
     matches!(
         state,
@@ -740,8 +786,9 @@ mod tests {
 
     use super::{
         completion_sound_argv, is_active_agent_state, next_presentation, parse_presentation,
-        presentation_name, state_file_event_matches,
+        pet_visual_policy, presentation_name, state_file_event_matches,
     };
+    use crate::core::runtime::{ThermalVerdict, Visibility, VisualPolicy};
     use crate::plugins::CardPresentation;
 
     #[test]
@@ -817,6 +864,122 @@ mod tests {
         for state in ["ready", "done", "error", "offline"] {
             assert!(!is_active_agent_state(state));
         }
+    }
+
+    #[test]
+    fn mapped_active_agent_keeps_configured_rate_unless_thermal_is_hot() {
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(1),
+                Visibility::MappedActive,
+                ThermalVerdict::Normal,
+                false,
+                "working",
+                true,
+            ),
+            VisualPolicy::Full
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(1),
+                Visibility::MappedActive,
+                ThermalVerdict::Normal,
+                true,
+                "working",
+                true,
+            ),
+            VisualPolicy::Frozen
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Full,
+                Visibility::MappedActive,
+                ThermalVerdict::Normal,
+                false,
+                "ready",
+                true,
+            ),
+            VisualPolicy::Capped(1)
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(1),
+                Visibility::MappedActive,
+                ThermalVerdict::Normal,
+                true,
+                "ready",
+                true,
+            ),
+            VisualPolicy::Frozen
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Full,
+                Visibility::MappedActive,
+                ThermalVerdict::Normal,
+                false,
+                "done",
+                false,
+            ),
+            VisualPolicy::Full
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(1),
+                Visibility::MappedInactive,
+                ThermalVerdict::Normal,
+                false,
+                "working",
+                true,
+            ),
+            VisualPolicy::Full
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(2),
+                Visibility::MappedInactive,
+                ThermalVerdict::Unknown,
+                true,
+                "working",
+                true,
+            ),
+            VisualPolicy::Frozen
+        );
+        for thermal in [ThermalVerdict::Hot, ThermalVerdict::Throttled] {
+            assert_eq!(
+                pet_visual_policy(
+                    VisualPolicy::Frozen,
+                    Visibility::MappedInactive,
+                    thermal,
+                    false,
+                    "working",
+                    true,
+                ),
+                VisualPolicy::Frozen
+            );
+        }
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Full,
+                Visibility::Unmapped,
+                ThermalVerdict::Normal,
+                false,
+                "working",
+                true,
+            ),
+            VisualPolicy::Stopped
+        );
+        assert_eq!(
+            pet_visual_policy(
+                VisualPolicy::Capped(2),
+                Visibility::MappedActive,
+                ThermalVerdict::Warm,
+                false,
+                "working",
+                true,
+            ),
+            VisualPolicy::Full
+        );
     }
 
     #[test]

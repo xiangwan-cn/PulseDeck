@@ -26,8 +26,9 @@ _Default build with no optional Cargo features in dark mode: normal layout
 - Fixed intervals or schedules such as `daily@08:00,20:00`, with per-slot cache.
 - Global and per-card responsive sizing for mobile and desktop layouts.
 - Page lifecycle awareness: hidden pages stop polling.
-- Unified foreground, idle-power, external-power, background, and Codex
-  attention state, with live settings and an application-only dim/minimal mode.
+- Pure facts-to-policy runtime model with separate mapped/active/idle state,
+  work and visual levels, screen inhibition, Agent notifications, and optional
+  application-only dim/minimal views.
 - Event-driven file and network-status cards, coalesced refresh deadlines,
   shared system snapshots, and deduplicated persistent cache writes.
 - Bounded subprocess output, HTTP response size, and execution time.
@@ -37,27 +38,52 @@ _Default build with no optional Cargo features in dark mode: normal layout
 - A page-wide toolbar toggle between the configured normal grid and a compact
   six-column grid, with the last choice remembered across launches.
 
-## Runtime and low-power modes
+## Runtime and low-power policy
 
-PulseDeck has one event-driven runtime manager shared by ordinary cards and
-optional plugins. Only real input such as a click, touch, key press, scroll,
-page change, or manual refresh resets user-idle time; automatic refreshes,
-animations, file events, and network responses do not.
-When conditions overlap, priority is background, external power, important
-agent attention, new-task protection, stable idle, then foreground normal.
+PulseDeck separates runtime facts from a pure policy evaluator. The resulting
+snapshot has independent visibility, activity, work, visual, screen-inhibit,
+idle-view, power, thermal, and Agent dimensions. A mapped window that loses
+keyboard focus is therefore distinct from an unmapped/background window.
 
-| Mode | Entry condition | Display and work policy |
-| --- | --- | --- |
-| Foreground normal | The window is mapped and no higher-priority mode applies. | Uses configured card schedules, normal animation rates, and full plugin presentation. |
-| Idle power saving | No real input for `idle_timeout_seconds`, followed by `idle_stability_seconds`. | Throttles refresh by card cost, reduces PetCard to 1 FPS, and lets ScrcpyForge request metadata without preview frames. The `dim` or OLED-friendly `minimal` overlay affects PulseDeck only; it never changes system brightness. |
-| External-power realtime | A power supply reports online and `external_realtime` is enabled. | Eligible cards may refresh faster and external power may prevent idle. Command and HTTP cards keep their original interval unless their card policy explicitly opts in. PulseDeck never changes the CPU governor. |
-| Agent protection / attention | A new agent task starts, or a distinct completion, failure, cancellation, waiting-input, confirmation, or abort event arrives. | A new task keeps normal visual brightness for its original protection deadline; waiting does not extend it. An important event may play one sound and restore the normal display/refresh policy for the configured attention window. |
-| Background | The application window is unmapped. | Releases the screen inhibitor, pauses ordinary card work, removes PetCard frame timers, and stops ScrcpyForge preview work. Fixed lifecycle monitoring and configured notifications remain available. |
+Only real input such as click/touch, key press, scroll, drag, page changes,
+manual refresh, dialog responses, and plugin controls resets user-idle time.
+Automatic refreshes, animations, file events, Agent hooks, and network responses
+do not.
 
-Warm or hotter thermal diagnostics reduce expensive plugin presentation work
-without changing the external-power verdict: ScrcpyForge slows preview/health
-updates, while hot or throttled states freeze PetCard on its current frame.
-Any real input restores the foreground UI immediately.
+| State | B2 default behavior |
+| --- | --- |
+| Mapped and active | Full ordinary monitor work; auto-classified expensive polling uses a 30-minute floor. |
+| Mapped but inactive or locally idle | The same Full daytime monitor policy; focus, idle, and grace are diagnostic/UI facts. |
+| Quiet hours | Ordinary periodic local/remote work pauses by the clock; power, battery, thermal, network, Agent signals, and explicit one-shots remain available. |
+| Unmapped | Ordinary work and plugin polling are suspended; queued manual/event work waits for mapping. |
+
+`profile = "performance" | "balanced" | "eco"` remains a strict v4 compatibility/diagnostic
+field, not an effective Settings control; mapped daytime default work is Full for
+all profiles. Auto-classified command/HTTP work is `expensive`, uses a generic
+30-minute monitor floor, and pauses under Low/Critical safety caps; classify a
+known-cheap source as `normal` or `live` to opt out. Explicit per-card
+`inactive_behavior`/`idle_behavior` remains an intentional override.
+`screen_inhibit = "never" | "while-active" | "while-mapped"` is independent
+from refresh and asks only to inhibit idle blanking, not system suspend.
+`idle_view = "none" | "dim" | "minimal"` affects PulseDeck only and never
+changes system brightness. Quiet hours are local-clock driven, use `[start,end)`,
+and equal hours disable the window; manual/source requests remain allowed.
+
+External power never clears Low/Critical battery stages or promotes mapped
+work above Full; `external_boost` is retained only for strict v4 compatibility/diagnostics,
+not as an effective Settings control, and is disabled by default. Low/critical battery hysteresis defaults to 20/25% and
+10/15%, respectively. Power/thermal signal fallbacks remain bounded
+(15–300 seconds for power, 15–60 seconds for thermal). Warm thermal state is
+diagnostic only; Hot/Throttled state independently caps work and freezes PetCard.
+An observation lease defaults
+to 300 seconds, temporarily resumes due monitoring work during quiet hours,
+and is renewed only by real mapped input—never by Agent, network, file,
+animation, or automatic-refresh events.
+
+Agent state can drive PetCard and deduplicated notifications, but it cannot keep
+ordinary cards, dashboard brightness, or screen inhibition at full policy.
+See [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md) for the full policy, cache,
+action-invalidation, and bounded-resume contracts.
 
 ## Page layout modes
 
@@ -130,11 +156,10 @@ lexical file-name order; subdirectories and other extensions are ignored. This
 makes a card or page exportable by copying one file, with no include list to
 maintain. Rename a module to `.disabled` to turn it off.
 
-Configuration uses the strict, non-migrating schema v3. `schema_version = 3`
-is required at the document root; unknown fields, obsolete aliases, and unknown
-enum values reject the configuration instead of being ignored. Repository
-examples and the active local configuration must be updated together whenever
-the schema changes.
+Configuration uses strict schema v4 and is never migrated during normal
+startup. `schema_version = 4` is required at the document root; unknown fields,
+obsolete aliases, and unknown enum values reject the configuration instead of
+being ignored. Use the explicit `pulsedeck config migrate` command for v3 files.
 
 Start with [config/config.example.toml](config/config.example.toml). A matching
 JSON example is available at [config/config.example.json](config/config.example.json).
@@ -142,15 +167,16 @@ The current TOML schema is documented with practical card recipes in
 [config/CARD_GUIDE.md](config/CARD_GUIDE.md).
 PetCard build, hook, animation, sizing, power, and sound behavior is documented
 in [docs/PET_CARD.md](docs/PET_CARD.md).
-Runtime modes, scheduler policy, plugin integration, and measurement guidance
+Runtime policy, scheduler behavior, plugin integration, and measurement guidance
 are documented in [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md).
 
 The top-level sections are:
 
-- `schema_version`: required configuration interface version; currently `3`.
+- `schema_version`: required configuration interface version; currently `4`.
 - `[app]`: title, logging, output limits, and config reload.
-- `[runtime]`: foreground inhibition, low-power display/refresh policy,
-  external-power behavior, and agent protection/notification policy.
+- `[runtime]`: compatibility diagnostics (`profile`, `external_boost`), mapped/idle
+  behavior, screen inhibition, idle view, quiet hours, observation lease,
+  power/thermal sampling, battery hysteresis, and Agent notification policy.
 - `[ui]`: default page plus normal-grid columns and card dimensions; the live
   normal/compact toolbar choice is stored separately as UI state.
 - `[[pages]]`: ordered navigation pages.
@@ -160,7 +186,7 @@ The top-level sections are:
 A module starts with the same schema version and may have a descriptive name:
 
 ```toml
-schema_version = 3
+schema_version = 4
 name = "workstation"
 
 [[cards]]
@@ -185,6 +211,7 @@ without hard-coding any user-specific destination:
 ```sh
 pulsedeck config check
 pulsedeck config check /path/to/config.toml
+pulsedeck config migrate # explicit v3 -> v4 migration with .v3.bak backups
 pulsedeck config add builtin cpu --id cpu-personal --title CPU --renderer progress --refresh 5s
 pulsedeck config add command --id kernel --title Kernel --renderer text --refresh 1h --module 50-workstation.toml -- uname -r
 pulsedeck config format # canonicalizes the root and modules; comments are removed
@@ -244,13 +271,13 @@ feature and copy the standalone
 explicit customization is needed. It
 connects to a separately installed ScrcpyForge daemon; PulseDeck does not own
 ADB or scrcpy processes. Service programs, URLs, and scripts remain configurable.
-Its preview and health loops consume the shared runtime mode:
+Its preview and health loops map the generic work level locally:
 
-- Foreground normal mode uses the configured preview interval.
-- Idle mode keeps lightweight device/script metadata but omits preview frames.
-- Hidden pages and background mode stop preview work instead of polling.
-- Thermal pressure reduces preview/health frequency, while unchanged frames
-  reuse an ETag/content-hash cache.
+- `Full` uses the configured preview interval.
+- `Reduced` slows preview and health checks.
+- `Minimal` keeps lightweight device/script metadata but omits preview frames.
+- `Suspended` and hidden pages stop preview work instead of polling.
+- Unchanged frames continue to reuse an ETag/content-hash cache.
 
 ScrcpyForge (SF) is a multi-device Android automation project built around ADB
 and scrcpy, with device control, previews, and script automation. See the
@@ -293,12 +320,16 @@ PetCard-only presentation behavior:
   grid, so changing the toolbar layout immediately reflows the surrounding
   cards.
 
-PetCard is also mode-aware: active tasks use the configured animation rate
-(capped at 12 FPS), idle mode uses 1 FPS, hidden/background cards remove their
-frame timer, and offline/single-frame states have no animation timer. Agent
-tasks retain only their original brightness-protection deadline, including
-while waiting for input or confirmation. Completion sound is controlled by the
-global runtime setting. See [docs/PET_CARD.md](docs/PET_CARD.md).
+PetCard is also policy-aware: any mapped active-Agent state uses the configured
+animation rate (capped at 12 FPS) for both active and inactive mapped windows
+during daytime or a quiet-hours observation lease. Without a lease, quiet hours
+freeze all looping animation while Agent state events continue. Continuous
+non-Agent loops are capped at 1 FPS outside quiet hours; finite completion/error
+animations may play once. Hot/Throttled freezes the current frame, while Warm
+and Unknown do not cap it. Hidden/unmapped cards remove their frame timer, and
+Agent animation never promotes ordinary refresh, remote work, brightness, or
+screen inhibition. Completion sound is controlled by the global Agent
+notification setting. See [docs/PET_CARD.md](docs/PET_CARD.md).
 
 ![PetCard working in quad presentation](docs/images/pulsedeck-petcard-working.png)
 
@@ -313,7 +344,7 @@ presentation._
 - `src/execution`: bounded subprocess execution for user-triggered actions and sources.
 - `src/plugins`: optional external integrations.
 - `docs/PET_CARD.md`: optional Codex PetCard build, hook, and asset configuration.
-- `docs/RUNTIME_POWER.md`: runtime modes, low-power policies, and validation.
+- `docs/RUNTIME_POWER.md`: runtime policy, low-power behavior, and validation.
 - `config`: portable examples and the card guide.
 - `data`: desktop entry and application icon.
 

@@ -9,7 +9,7 @@ The generic `[cards.display.colors]`, `[[cards.display.states]]`, and
 non-plugin cards. A PetCard declares `kind = "pet-card"`, so its lifecycle
 artwork, state labels, transitions, and colors remain owned by the plugin
 configuration documented here and are never rewritten by generic card rules.
-The PetCard example is a standalone strict schema v3 module for the automatic
+The PetCard example is a standalone strict schema v4 module for the automatic
 `config.d/` directory; it is not appended to the main configuration.
 
 ## Build
@@ -31,7 +31,7 @@ without requiring AI or a manual edit. To install custom artwork, replace the
 generated module with `src/plugins/pet_card/config.example.toml` and update
 `asset_root`.
 
-Set `codex_completion_sound = true` in the global `[runtime]` section to play
+Set `agent_completion_sound = true` in the global `[runtime]` section to play
 the desktop theme's single `complete` event for a completion, failure,
 cancellation, waiting-input, confirmation-required, or abnormal-stop edge.
 Task and event identifiers deduplicate notifications, so polling or rereading
@@ -121,16 +121,23 @@ when clients run concurrently.
 - The current state's frames are decoded on state transitions and retained in
   memory during that state, so animation does not read from disk per frame.
 - Animation is capped to 12 FPS and defaults to 12 FPS.
+- Any mapped active-Agent state (`thinking`, `working`, `coding`, `waiting`, or
+  `confirm`) uses its configured rate, capped at 12 FPS, for both mapped-active
+  and mapped-inactive windows during daytime or an active quiet-hours observation
+  lease. Without a lease, quiet hours freeze looping animation while Agent state
+  events continue. This exception is local to PetCard and does not promote
+  ordinary refresh, brightness, screen inhibition, or remote work.
+- Continuously looping non-Agent states such as `ready` are capped at 1 FPS
+  outside quiet hours and frozen during quiet hours. Finite completion/error
+  animations may play once at configured speed as event acknowledgement.
+- Warm and Unknown thermal verdicts do not cap animation. Hot or Throttled
+  freezes the current frame; unmapped/hidden states remove the frame timer.
 - Frame timers are removed, rather than callback-skipped, while the card is
   unmapped or PulseDeck is in the background.
-- Foreground idle mode reduces animation to 1 FPS; normal and Codex protection
-  modes use the configured rate.
 - Offline and any single-frame state have no animation timer.
-- Stale state automatically returns to offline after
-  `offline_after_seconds`.
-- A stale state only changes the card's visual state. It does not cancel an
-  already active agent's original one-hour idle-overlay protection; an explicit
-  terminal/offline event or the protection deadline controls that lifecycle.
+- Stale state automatically returns to offline after `offline_after_seconds`
+  and clears the Agent lifecycle fact without changing global work, brightness,
+  or screen-inhibit policy.
 - After five continuous offline minutes, the card temporarily returns to one
   normal cell. The next active state restores the last user-selected size.
 - Size preference writes happen only when the user makes a selection and use
@@ -172,13 +179,14 @@ Important plugin options are:
 | `offline_normal_after_seconds` | `300` | Continuous offline time before temporary one-cell fallback. |
 | `fps` | `12` | Default animation rate; per-state `fps` overrides it. |
 | `done_hold_seconds` | `5` | Time the `done` animation remains before `ready`. |
-| `pause_when_unmapped` | `true` | Remove the frame timer while not visible. |
+| `pause_when_unmapped` | `true` | Deprecated compatibility field; B2 always stops animation while unmapped. |
 | `show_status` | `true` | Show the state label below the image. |
 | `completion_sound_file` | unset | Custom audio file; otherwise use the theme's `complete` event. |
 
-Sound enable/disable, the new-task brightness-protection period, and the
-post-event attention period belong to `[runtime]`, because they affect the
-whole application. PetCard only owns its optional custom audio asset.
+Sound enable/disable (`agent_completion_sound`) and the deduplicated event
+attention period (`agent_attention_seconds`) belong to `[runtime]`. Agent state
+is diagnostic/notification input and never promotes global work, brightness, or
+screen-inhibit policy. PetCard only owns its optional custom audio asset.
 
 Each `[cards.plugin.animations.<state>]` table accepts `frames`, optional `fps`,
 and `loop`. Frame paths are resolved under `asset_root`. A single-frame offline
@@ -192,6 +200,6 @@ dependencies and UI implementation. Disabled Cargo features do not compile or
 register their plugin modules.
 
 ScrcpyForge and other page plugins use the generic `[pages.plugin]` table.
-Both plugin types receive the same generic runtime handle for mode changes,
+Both plugin types receive the same generic runtime handle for policy changes,
 real user activity, bounded interaction leases, and important events; plugins
 do not inspect system power or control global brightness themselves.

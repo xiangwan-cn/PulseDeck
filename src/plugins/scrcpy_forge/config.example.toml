@@ -2,7 +2,7 @@
 # when no `scrcpy-forge` page exists. This file is a standalone module that can
 # be copied there to customize every option explicitly.
 
-schema_version = 3
+schema_version = 4
 
 [[pages]]
 id = "scrcpy-forge"

@@ -5,6 +5,8 @@ pub mod error;
 pub mod error_limiter;
 pub mod power_debug;
 pub mod power_supply;
+pub mod refresh;
 pub mod runtime;
+pub mod runtime_policy;
 pub mod schedule;
 pub mod scheduler;

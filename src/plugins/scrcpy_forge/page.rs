@@ -15,7 +15,27 @@ use gtk::{
 
 use super::config::{CardConfig, PageConfig as ScrcpyForgeConfig};
 use super::service::{Client, DaemonController, Device, Snapshot};
-use crate::core::runtime::{PreviewPolicy, RuntimeHandle};
+use crate::core::runtime::{RuntimeHandle, WorkLevel};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewMode {
+    Full,
+    Reduced,
+    MetadataOnly,
+    Stopped,
+}
+
+fn preview_mode(level: WorkLevel, periodic_refresh_paused: bool) -> PreviewMode {
+    if periodic_refresh_paused {
+        return PreviewMode::Stopped;
+    }
+    match level {
+        WorkLevel::Full => PreviewMode::Full,
+        WorkLevel::Reduced => PreviewMode::Reduced,
+        WorkLevel::Minimal => PreviewMode::MetadataOnly,
+        WorkLevel::Suspended => PreviewMode::Stopped,
+    }
+}
 
 pub fn build(
     handle: tokio::runtime::Handle,
@@ -112,24 +132,25 @@ pub fn build(
                 break;
             };
             let snapshot = runtime.snapshot();
-            if flow.is_mapped()
-                && snapshot.preview_policy != PreviewPolicy::Stopped
-                && !request_busy.replace(true)
-            {
-                request(snapshot.preview_policy != PreviewPolicy::MetadataOnly);
+            let mode = preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused);
+            if flow.is_mapped() && mode != PreviewMode::Stopped && !request_busy.replace(true) {
+                request(mode != PreviewMode::MetadataOnly);
             }
             drop(flow);
-            let delay = match snapshot.preview_policy {
-                PreviewPolicy::Normal => preview_seconds,
-                PreviewPolicy::Reduced => preview_seconds.saturating_mul(3),
-                PreviewPolicy::MetadataOnly => preview_seconds.saturating_mul(8),
-                PreviewPolicy::Stopped => 3600,
+            let delay = match mode {
+                PreviewMode::Full => preview_seconds,
+                PreviewMode::Reduced => preview_seconds.saturating_mul(3),
+                PreviewMode::MetadataOnly => preview_seconds.saturating_mul(8),
+                PreviewMode::Stopped => 3600,
             };
             let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
             let mode = Box::pin(mode_rx.recv());
             let visibility = Box::pin(visibility_rx.recv());
             let first = futures_util::future::select(timer, mode);
             let _ = futures_util::future::select(Box::pin(first), visibility).await;
+            if mode_rx.is_closed() || visibility_rx.is_closed() {
+                break;
+            }
         }
     });
     let weak_update_flow = flow.downgrade();
@@ -139,7 +160,10 @@ pub fn build(
             let Some(update_flow) = weak_update_flow.upgrade() else {
                 break;
             };
-            if render_runtime.snapshot().preview_policy == PreviewPolicy::Stopped {
+            let snapshot = render_runtime.snapshot();
+            if preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused)
+                == PreviewMode::Stopped
+            {
                 continue;
             }
             match result {
@@ -297,7 +321,8 @@ fn backend_card(
                 break;
             };
             let snapshot = runtime.snapshot();
-            if status.is_mapped() && snapshot.preview_policy != PreviewPolicy::Stopped {
+            let mode = preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused);
+            if status.is_mapped() && mode != PreviewMode::Stopped {
                 let client = client.clone();
                 let tx = tx.clone();
                 handle.spawn(async move {
@@ -312,17 +337,20 @@ fn backend_card(
             }
             drop(status);
             drop(toggle);
-            let delay = match snapshot.preview_policy {
-                PreviewPolicy::Normal => base_interval,
-                PreviewPolicy::Reduced => base_interval.saturating_mul(3),
-                PreviewPolicy::MetadataOnly => base_interval.saturating_mul(4),
-                PreviewPolicy::Stopped => 3600,
+            let delay = match mode {
+                PreviewMode::Full => base_interval,
+                PreviewMode::Reduced => base_interval.saturating_mul(3),
+                PreviewMode::MetadataOnly => base_interval.saturating_mul(4),
+                PreviewMode::Stopped => 3600,
             };
             let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
             let mode = Box::pin(mode_rx.recv());
             let visible = Box::pin(visible_rx.recv());
             let first = futures_util::future::select(timer, mode);
             let _ = futures_util::future::select(Box::pin(first), visible).await;
+            if mode_rx.is_closed() || visible_rx.is_closed() {
+                break;
+            }
         }
     });
     card_box
@@ -767,5 +795,28 @@ fn card(role: &str, title: &str, order: i32) -> CardConfig {
         enabled: true,
         icon: None,
         description: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_levels_map_to_plugin_preview_modes() {
+        assert_eq!(preview_mode(WorkLevel::Full, false), PreviewMode::Full);
+        assert_eq!(
+            preview_mode(WorkLevel::Reduced, false),
+            PreviewMode::Reduced
+        );
+        assert_eq!(
+            preview_mode(WorkLevel::Minimal, false),
+            PreviewMode::MetadataOnly
+        );
+        assert_eq!(
+            preview_mode(WorkLevel::Suspended, false),
+            PreviewMode::Stopped
+        );
+        assert_eq!(preview_mode(WorkLevel::Full, true), PreviewMode::Stopped);
     }
 }

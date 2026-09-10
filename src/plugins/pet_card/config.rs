@@ -23,6 +23,9 @@ pub struct PetConfig {
     pub done_hold_seconds: u64,
     #[serde(default = "default_offline_normal_after")]
     pub offline_normal_after_seconds: u64,
+    /// Deprecated v4 compatibility field. B2 always hard-stops animation when
+    /// the card is unmapped, regardless of this decoded value.
+    #[allow(dead_code)]
     #[serde(default = "default_true")]
     pub pause_when_unmapped: bool,
     #[serde(default = "default_true")]

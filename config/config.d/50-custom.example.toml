@@ -1,6 +1,6 @@
 # Standalone module example. Copy it into ~/.config/pulsedeck/config.d/
 # and choose a descriptive file name such as 50-workstation.toml.
-schema_version = 3
+schema_version = 4
 name = "custom-cards"
 
 [[cards]]

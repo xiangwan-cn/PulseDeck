@@ -21,6 +21,31 @@ impl ActionCard {
         on_dialog_open: impl Fn() + 'static,
         on_dialog_response: impl Fn() + 'static,
     ) -> Self {
+        let confirm_title = confirm_title.to_owned();
+        let confirm_detail = confirm_detail.to_owned();
+        Self::new_with_resolver(
+            action_id,
+            name,
+            description,
+            icon_name,
+            move |_| Some((confirm, confirm_title.clone(), confirm_detail.clone())),
+            on_click,
+            on_dialog_open,
+            on_dialog_response,
+        )
+    }
+
+    pub fn new_with_resolver(
+        action_id: &str,
+        name: &str,
+        description: &str,
+        icon_name: &str,
+        resolve: impl Fn(&str) -> Option<(bool, String, String)> + 'static,
+        on_click: impl Fn(&str) + 'static,
+        on_dialog_open: impl Fn() + 'static,
+        on_dialog_response: impl Fn() + 'static,
+    ) -> Self {
+        let initial_confirm = resolve(action_id).is_some_and(|(confirm, _, _)| confirm);
         let card = GtkBox::new(Orientation::Vertical, 0);
         card.add_css_class("card");
         card.add_css_class("pulsedeck-card");
@@ -51,7 +76,7 @@ impl ActionCard {
         sl.add_css_class("action-desc");
         tb.append(&sl);
 
-        if confirm {
+        if initial_confirm {
             let badge = Label::new(Some("需确认"));
             badge.set_halign(Align::Start);
             badge.add_css_class("action-confirm-badge");
@@ -72,11 +97,10 @@ impl ActionCard {
         btn_row.append(&spinner);
 
         let aid = action_id.to_string();
+        let resolve: Rc<dyn Fn(&str) -> Option<(bool, String, String)>> = Rc::new(resolve);
         let on_click: Rc<dyn Fn(&str)> = Rc::new(on_click);
         let on_dialog_open: Rc<dyn Fn()> = Rc::new(on_dialog_open);
         let on_dialog_response: Rc<dyn Fn()> = Rc::new(on_dialog_response);
-        let confirm_title = confirm_title.to_string();
-        let confirm_detail = confirm_detail.to_string();
         let btn = Button::with_label("执行");
         btn.set_valign(Align::Center);
         btn.add_css_class("pill");
@@ -84,6 +108,11 @@ impl ActionCard {
         btn.add_css_class("action-run-btn");
         let running_spinner = spinner.clone();
         btn.connect_clicked(move |button| {
+            let Some((confirm, confirm_title, confirm_detail)) = resolve(&aid) else {
+                // A hot reload may remove an action while its control remains
+                // visible. Never execute the old command silently.
+                return;
+            };
             if !confirm {
                 set_running(button, &running_spinner, true);
                 on_click(&aid);
@@ -104,6 +133,7 @@ impl ActionCard {
                 .build();
             on_dialog_open();
             let aid = aid.clone();
+            let resolve = resolve.clone();
             let on_click = on_click.clone();
             let on_dialog_response = on_dialog_response.clone();
             let button = button.clone();
@@ -111,7 +141,7 @@ impl ActionCard {
             glib::MainContext::default().spawn_local(async move {
                 let response = dialog.choose_future(Some(&window)).await;
                 on_dialog_response();
-                if response == Ok(1) {
+                if response == Ok(1) && resolve(&aid).is_some() {
                     set_running(&button, &running_spinner, true);
                     on_click(&aid);
                 }

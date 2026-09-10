@@ -42,7 +42,8 @@ impl HttpMetric {
         }
     }
 
-    pub fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
+    pub fn collect(&mut self, ctx: &MetricContext, global_max_output: usize) -> MetricResult {
+        let max_output = self.max_output_bytes.min(global_max_output).max(1);
         let result = ctx.runtime.block_on(http_fetch(
             &ctx.http_client,
             &self.url,
@@ -50,7 +51,7 @@ impl HttpMetric {
             &self.headers,
             self.body.as_deref(),
             self.timeout_secs,
-            self.max_output_bytes,
+            max_output,
         ));
 
         match result {

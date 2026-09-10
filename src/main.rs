@@ -49,6 +49,7 @@ fn main() -> glib::ExitCode {
     app.connect_activate(|app| {
         application::build_app(app);
     });
+    app.connect_shutdown(application::release_app);
 
     app.run()
 }

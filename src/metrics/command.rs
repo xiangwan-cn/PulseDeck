@@ -30,12 +30,13 @@ impl CommandMetric {
         }
     }
 
-    pub fn collect_no_ctx(&mut self) -> MetricResult {
+    pub fn collect_no_ctx(&mut self, global_max_output: usize) -> MetricResult {
+        let max_output = self.max_output_bytes.min(global_max_output).max(1);
         let output = crate::tokio_handle().block_on(run_command(
             &self.program,
             &self.args,
             self.timeout_secs,
-            self.max_output_bytes,
+            max_output,
         ));
         match output {
             Ok(output) if output.success => self.render_success(output.stdout),

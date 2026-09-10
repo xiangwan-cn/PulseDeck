@@ -88,6 +88,58 @@ impl ProcFsSource {
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| anyhow::anyhow!("failed to parse /proc/uptime"))
     }
+
+    pub fn read_load_average(&self) -> Result<Vec<String>, anyhow::Error> {
+        let content = fs::read_to_string(self.root.join("loadavg"))
+            .map_err(|e| anyhow::anyhow!("read /proc/loadavg: {}", e))?;
+        Ok(content
+            .split_whitespace()
+            .take(3)
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub fn process_count(&self) -> Result<usize, anyhow::Error> {
+        let entries = fs::read_dir(&self.root).map_err(|e| anyhow::anyhow!("read /proc: {}", e))?;
+        Ok(entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+            })
+            .count())
+    }
+
+    pub fn network_totals(&self) -> Result<(u64, u64), anyhow::Error> {
+        let content = fs::read_to_string(self.root.join("net/dev"))
+            .map_err(|e| anyhow::anyhow!("read /proc/net/dev: {}", e))?;
+        let (mut rx, mut tx) = (0_u64, 0_u64);
+        for line in content.lines().skip(2) {
+            let Some((name, values)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim() == "lo" {
+                continue;
+            }
+            let fields: Vec<_> = values.split_whitespace().collect();
+            rx = rx.saturating_add(
+                fields
+                    .first()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            );
+            tx = tx.saturating_add(
+                fields
+                    .get(8)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            );
+        }
+        Ok((rx, tx))
+    }
 }
 
 fn parse_kb_value(s: &str) -> u64 {

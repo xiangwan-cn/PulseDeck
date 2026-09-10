@@ -1,14 +1,18 @@
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::model::metric_result::MetricResult;
 use crate::sources::battery::BatterySource;
+use crate::sources::network::NetworkSource;
 use crate::sources::procfs::ProcFsSource;
 
 pub struct MetricContext {
     pub runtime: tokio::runtime::Handle,
     pub http_client: reqwest::Client,
-    pub battery: Mutex<BatterySource>,
+    pub battery: Arc<Mutex<BatterySource>>,
+    pub network: Mutex<NetworkSource>,
     pub procfs: Mutex<ProcFsSource>,
+    pub thermal_root: PathBuf,
 }
 
 impl MetricContext {
@@ -17,12 +21,15 @@ impl MetricContext {
         http_client: reqwest::Client,
         battery_root: std::path::PathBuf,
         procfs_root: std::path::PathBuf,
+        thermal_root: std::path::PathBuf,
     ) -> Self {
         Self {
             runtime,
             http_client,
-            battery: Mutex::new(BatterySource::new(battery_root)),
+            battery: Arc::new(Mutex::new(BatterySource::new(battery_root))),
+            network: Mutex::new(NetworkSource::new()),
             procfs: Mutex::new(ProcFsSource::new(procfs_root)),
+            thermal_root,
         }
     }
 }

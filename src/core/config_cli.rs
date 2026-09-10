@@ -2,8 +2,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core::config::{
-    config_path, parse_duration, CardConfig, CardRuntimeConfig, CommandSourceConfig, ConfigManager,
-    ConfigModuleInfo, FileSourceConfig, HttpSourceConfig, SourceConfig,
+    config_path, parse_duration, AppConfig, CardConfig, CardRuntimeConfig, CommandSourceConfig,
+    ConfigFragment, ConfigManager, ConfigModuleInfo, FileSourceConfig, HttpSourceConfig,
+    SourceConfig, CONFIG_SCHEMA_VERSION,
 };
 use crate::model::card_model::RendererKind;
 
@@ -12,6 +13,7 @@ PulseDeck configuration tools
 
   pulsedeck config check [CONFIG_FILE]
   pulsedeck config format [CONFIG_FILE]
+  pulsedeck config migrate [CONFIG_FILE]
   pulsedeck config add builtin METRIC --id ID [OPTIONS]
   pulsedeck config add command --id ID [OPTIONS] -- PROGRAM [ARG ...]
   pulsedeck config add file PATH --id ID [OPTIONS]
@@ -49,6 +51,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     match arguments.first().map(String::as_str) {
         Some("check") => check(&arguments[1..]),
         Some("format") => format(&arguments[1..]),
+        Some("migrate") => migrate(&arguments[1..]),
         Some("add") => add(&arguments[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
@@ -91,6 +94,639 @@ fn format(arguments: &[String]) -> Result<(), String> {
         path.display(),
         manager.loaded_module_count()
     );
+    Ok(())
+}
+
+fn migrate(arguments: &[String]) -> Result<(), String> {
+    let path = single_optional_path(arguments, "migrate")?;
+    let mut documents = vec![path.clone()];
+    let modules = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.d");
+    match std::fs::read_dir(&modules) {
+        Ok(entries) => {
+            let mut module_paths = Vec::new();
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| format!("cannot read {}: {error}", modules.display()))?
+                    .path();
+                if path.is_file()
+                    && matches!(
+                        path.extension().and_then(|value| value.to_str()),
+                        Some("toml" | "json")
+                    )
+                {
+                    module_paths.push(path);
+                }
+            }
+            module_paths.sort();
+            documents.extend(module_paths);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot read {}: {error}", modules.display())),
+    }
+
+    let mut converted = Vec::new();
+    for (index, document) in documents.into_iter().enumerate() {
+        let text = std::fs::read_to_string(&document)
+            .map_err(|error| format!("cannot read {}: {error}", document.display()))?;
+        match document_schema(&document, &text)? {
+            3 => {
+                let output = migrate_document(&document, &text)?;
+                validate_migrated_document(&document, &output, index == 0)?;
+                converted.push((document, output));
+            }
+            4 => validate_migrated_document(&document, &text, index == 0)?,
+            version => {
+                return Err(format!(
+                    "{} uses unsupported schema v{version}; expected v3 or v4",
+                    document.display()
+                ));
+            }
+        }
+    }
+    if converted.is_empty() {
+        println!("configuration is already schema v4: {}", path.display());
+        return Ok(());
+    }
+
+    for (document, _) in &converted {
+        let backup = migration_backup(document);
+        if backup.exists() {
+            return Err(format!(
+                "backup already exists: {}; move it before migrating again",
+                backup.display()
+            ));
+        }
+    }
+
+    let temporaries = converted
+        .iter()
+        .map(|(document, _)| migration_temporary(document))
+        .collect::<Vec<_>>();
+    for (index, ((document, output), temporary)) in converted.iter().zip(&temporaries).enumerate() {
+        let result = std::fs::write(temporary, output).and_then(|()| {
+            let permissions = std::fs::metadata(document)?.permissions();
+            std::fs::set_permissions(temporary, permissions)
+        });
+        if let Err(error) = result {
+            cleanup_temporaries(&temporaries[..=index]);
+            return Err(format!(
+                "cannot prepare migrated {}: {error}",
+                document.display()
+            ));
+        }
+    }
+
+    let mut backed_up = 0;
+    for (document, _) in &converted {
+        let backup = migration_backup(document);
+        if let Err(error) = std::fs::rename(document, &backup) {
+            cleanup_temporaries(&temporaries);
+            let rollback = rollback_documents(&converted[..backed_up]);
+            return Err(format!(
+                "cannot create {}: {error}; {rollback}",
+                backup.display()
+            ));
+        }
+        backed_up += 1;
+    }
+
+    for (index, ((document, _), temporary)) in converted.iter().zip(&temporaries).enumerate() {
+        if let Err(error) = std::fs::rename(temporary, document) {
+            cleanup_temporaries(&temporaries[index..]);
+            let rollback = rollback_documents(&converted);
+            return Err(format!(
+                "cannot install migrated {}: {error}; {rollback}",
+                document.display()
+            ));
+        }
+    }
+
+    let validation = (|| {
+        let mut manager = ConfigManager::new(path.clone());
+        manager.load().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = validation {
+        let rollback = rollback_documents(&converted);
+        return Err(format!(
+            "migrated configuration failed v4 validation: {error}; {rollback}"
+        ));
+    }
+
+    println!(
+        "migrated {} documents to schema v4; .v3.bak backups were created (comments are not retained)",
+        converted.len()
+    );
+    println!(
+        "recommended v4 defaults: profile=balanced, screen_inhibit=while-active, external_boost=false, idle_view=none, observation_lease_seconds=300, battery=20/25% low and 10/15% critical"
+    );
+    println!(
+        "note: v3 external_prevents_idle/hysteresis, Agent brightness protection, CPU hints, and multiplier fields have no v4 equivalent"
+    );
+    Ok(())
+}
+
+fn document_schema(path: &Path, text: &str) -> Result<u64, String> {
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|error| format!("cannot parse JSON {}: {error}", path.display()))?
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("{} has no integer schema_version", path.display()))
+    } else {
+        toml::from_str::<toml::Value>(text)
+            .map_err(|error| format!("cannot parse TOML {}: {error}", path.display()))?
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{} has no non-negative integer schema_version",
+                    path.display()
+                )
+            })
+    }
+}
+
+fn validate_migrated_document(path: &Path, text: &str, root: bool) -> Result<(), String> {
+    let version = if root {
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            serde_json::from_str::<AppConfig>(text)
+                .map_err(|error| format!("invalid migrated JSON {}: {error}", path.display()))?
+                .schema_version
+        } else {
+            toml::from_str::<AppConfig>(text)
+                .map_err(|error| format!("invalid migrated TOML {}: {error}", path.display()))?
+                .schema_version
+        }
+    } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        serde_json::from_str::<ConfigFragment>(text)
+            .map_err(|error| format!("invalid migrated JSON {}: {error}", path.display()))?
+            .schema_version
+    } else {
+        toml::from_str::<ConfigFragment>(text)
+            .map_err(|error| format!("invalid migrated TOML {}: {error}", path.display()))?
+            .schema_version
+    };
+    if version == CONFIG_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid migrated schema in {}: expected {CONFIG_SCHEMA_VERSION}, got {version}",
+            path.display()
+        ))
+    }
+}
+
+fn migration_backup(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.v3.bak", path.display()))
+}
+
+fn migration_temporary(path: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.v4-migrate-{}.tmp",
+        path.display(),
+        std::process::id()
+    ))
+}
+
+fn cleanup_temporaries(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn rollback_documents(documents: &[(PathBuf, String)]) -> String {
+    let mut failures = Vec::new();
+    for (document, _) in documents.iter().rev() {
+        let backup = migration_backup(document);
+        if !backup.exists() {
+            continue;
+        }
+        if document.exists() {
+            if let Err(error) = std::fs::remove_file(document) {
+                failures.push(format!("cannot remove {}: {error}", document.display()));
+                continue;
+            }
+        }
+        if let Err(error) = std::fs::rename(&backup, document) {
+            failures.push(format!(
+                "cannot restore {} from {}: {error}",
+                document.display(),
+                backup.display()
+            ));
+        }
+    }
+    if failures.is_empty() {
+        "original documents restored".into()
+    } else {
+        format!("rollback incomplete: {}", failures.join("; "))
+    }
+}
+
+fn migrate_document(path: &Path, text: &str) -> Result<String, String> {
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        let mut value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|error| format!("cannot parse legacy JSON {}: {error}", path.display()))?;
+        migrate_json_value(&mut value, path)?;
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+    } else {
+        let mut value: toml::Value = toml::from_str(text)
+            .map_err(|error| format!("cannot parse legacy TOML {}: {error}", path.display()))?;
+        migrate_toml_value(&mut value, path)?;
+        toml::to_string_pretty(&value).map_err(|error| error.to_string())
+    }
+}
+
+fn migrate_toml_value(value: &mut toml::Value, path: &Path) -> Result<(), String> {
+    let root = value
+        .as_table_mut()
+        .ok_or_else(|| format!("legacy document {} must be a table", path.display()))?;
+    match root.get("schema_version").and_then(toml::Value::as_integer) {
+        Some(3) => {}
+        Some(4) => return Err(format!("{} is already schema v4", path.display())),
+        other => return Err(format!("{} is not schema v3 ({other:?})", path.display())),
+    }
+    root.insert("schema_version".into(), toml::Value::Integer(4));
+    if let Some(runtime) = root.get_mut("runtime").and_then(toml::Value::as_table_mut) {
+        migrate_toml_runtime(runtime)?;
+    }
+    if let Some(cards) = root.get_mut("cards").and_then(toml::Value::as_array_mut) {
+        for card in cards {
+            if let Some(runtime) = card
+                .as_table_mut()
+                .and_then(|card| card.get_mut("runtime"))
+                .and_then(toml::Value::as_table_mut)
+            {
+                migrate_toml_card_runtime(runtime)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrated_profile(idle_saving: Option<bool>, saving: Option<&str>) -> &'static str {
+    if idle_saving == Some(false) {
+        "performance"
+    } else if saving == Some("aggressive") {
+        "eco"
+    } else {
+        "balanced"
+    }
+}
+
+fn migrated_idle_view(display: &str) -> &'static str {
+    match display {
+        "minimal" => "minimal",
+        "dim" => "dim",
+        _ => "none",
+    }
+}
+
+fn migrated_workload(class: &str) -> Option<&'static str> {
+    match class {
+        "auto" => Some("auto"),
+        "system-realtime" | "network-rate" => Some("live"),
+        "command" | "http" => Some("expensive"),
+        "network-status" | "file" | "static" => Some("event"),
+        "battery-thermal" => Some("normal"),
+        _ => None,
+    }
+}
+
+fn migrate_toml_runtime(runtime: &mut toml::map::Map<String, toml::Value>) -> Result<(), String> {
+    for field in [
+        "keep_screen_on",
+        "idle_power_saving",
+        "external_realtime",
+        "external_prevents_idle",
+        "codex_keep_bright",
+        "codex_completion_sound",
+        "cpu_activity_hint",
+    ] {
+        validate_toml_field(runtime, field, "boolean", toml::Value::is_bool)?;
+    }
+    for field in [
+        "external_sample_seconds",
+        "external_enter_samples",
+        "external_exit_samples",
+        "codex_protection_minutes",
+        "codex_attention_seconds",
+    ] {
+        validate_toml_field(runtime, field, "non-negative integer", |value| {
+            value.as_integer().is_some_and(|value| value >= 0)
+        })?;
+    }
+    validate_toml_field(
+        runtime,
+        "refresh_saving_strength",
+        "`mild`, `balanced`, or `aggressive`",
+        |value| matches!(value.as_str(), Some("mild" | "balanced" | "aggressive")),
+    )?;
+    validate_toml_field(runtime, "idle_display", "`dim` or `minimal`", |value| {
+        matches!(value.as_str(), Some("dim" | "minimal"))
+    })?;
+    let keep = runtime
+        .remove("keep_screen_on")
+        .and_then(|value| value.as_bool());
+    let saving = runtime
+        .remove("refresh_saving_strength")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let idle_saving = runtime
+        .remove("idle_power_saving")
+        .and_then(|value| value.as_bool());
+    let external_realtime = runtime
+        .remove("external_realtime")
+        .and_then(|value| value.as_bool());
+    runtime.remove("external_prevents_idle");
+    let display = runtime
+        .remove("idle_display")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if let Some(sample) = runtime.remove("external_sample_seconds") {
+        runtime.insert("power_sample_seconds".into(), sample);
+    }
+    if let Some(attention) = runtime.remove("codex_attention_seconds") {
+        runtime.insert("agent_attention_seconds".into(), attention);
+    }
+    if let Some(sound) = runtime.remove("codex_completion_sound") {
+        runtime.insert("agent_completion_sound".into(), sound);
+    }
+    runtime.remove("external_enter_samples");
+    runtime.remove("external_exit_samples");
+    runtime.remove("codex_keep_bright");
+    runtime.remove("codex_protection_minutes");
+    runtime.remove("cpu_activity_hint");
+    if idle_saving.is_some() || saving.is_some() {
+        runtime.insert(
+            "profile".into(),
+            toml::Value::String(migrated_profile(idle_saving, saving.as_deref()).into()),
+        );
+    }
+    if let Some(keep) = keep {
+        runtime.insert(
+            "screen_inhibit".into(),
+            toml::Value::String(if keep { "while-mapped" } else { "never" }.into()),
+        );
+    }
+    if let Some(external_realtime) = external_realtime {
+        runtime.insert(
+            "external_boost".into(),
+            toml::Value::Boolean(external_realtime),
+        );
+    }
+    if let Some(display) = display {
+        runtime.insert(
+            "idle_view".into(),
+            toml::Value::String(migrated_idle_view(&display).into()),
+        );
+    }
+    Ok(())
+}
+
+fn validate_toml_field(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    expected: &str,
+    valid: impl Fn(&toml::Value) -> bool,
+) -> Result<(), String> {
+    if let Some(value) = table.get(field) {
+        if !valid(value) {
+            return Err(format!(
+                "legacy field `{field}` must be {expected}, got {value:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_toml_card_runtime(
+    runtime: &mut toml::map::Map<String, toml::Value>,
+) -> Result<(), String> {
+    validate_toml_field(runtime, "class", "a known string", |value| {
+        value.as_str().and_then(migrated_workload).is_some()
+    })?;
+    validate_toml_field(runtime, "idle_behavior", "`throttle` or `pause`", |value| {
+        matches!(value.as_str(), Some("throttle" | "pause"))
+    })?;
+    validate_toml_field(runtime, "idle_multiplier", "number", |value| {
+        value.is_float() || value.is_integer()
+    })?;
+    validate_toml_field(
+        runtime,
+        "external_realtime",
+        "boolean",
+        toml::Value::is_bool,
+    )?;
+    validate_toml_field(runtime, "realtime_multiplier", "number", |value| {
+        value.is_float() || value.is_integer()
+    })?;
+    let class = runtime
+        .remove("class")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let idle = runtime
+        .remove("idle_behavior")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    runtime.remove("idle_multiplier");
+    runtime.remove("external_realtime");
+    runtime.remove("realtime_multiplier");
+    if let Some(class) = class {
+        runtime.insert(
+            "workload".into(),
+            toml::Value::String(
+                migrated_workload(&class)
+                    .expect("legacy class was validated")
+                    .into(),
+            ),
+        );
+    }
+    if let Some(idle) = idle {
+        runtime.insert("idle_behavior".into(), toml::Value::String(idle));
+    }
+    Ok(())
+}
+
+fn migrate_json_value(value: &mut serde_json::Value, path: &Path) -> Result<(), String> {
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("legacy document {} must be an object", path.display()))?;
+    match root
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(3) => {}
+        Some(4) => return Err(format!("{} is already schema v4", path.display())),
+        other => return Err(format!("{} is not schema v3 ({other:?})", path.display())),
+    }
+    root.insert("schema_version".into(), serde_json::Value::from(4));
+    if let Some(runtime) = root
+        .get_mut("runtime")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for field in [
+            "keep_screen_on",
+            "idle_power_saving",
+            "external_realtime",
+            "external_prevents_idle",
+            "codex_keep_bright",
+            "codex_completion_sound",
+            "cpu_activity_hint",
+        ] {
+            validate_json_field(runtime, field, "boolean", serde_json::Value::is_boolean)?;
+        }
+        for field in [
+            "external_sample_seconds",
+            "external_enter_samples",
+            "external_exit_samples",
+            "codex_protection_minutes",
+            "codex_attention_seconds",
+        ] {
+            validate_json_field(
+                runtime,
+                field,
+                "non-negative integer",
+                serde_json::Value::is_u64,
+            )?;
+        }
+        validate_json_field(
+            runtime,
+            "refresh_saving_strength",
+            "`mild`, `balanced`, or `aggressive`",
+            |value| matches!(value.as_str(), Some("mild" | "balanced" | "aggressive")),
+        )?;
+        validate_json_field(runtime, "idle_display", "`dim` or `minimal`", |value| {
+            matches!(value.as_str(), Some("dim" | "minimal"))
+        })?;
+        let keep = runtime
+            .remove("keep_screen_on")
+            .and_then(|value| value.as_bool());
+        let saving = runtime
+            .remove("refresh_saving_strength")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let idle_saving = runtime
+            .remove("idle_power_saving")
+            .and_then(|value| value.as_bool());
+        let external_realtime = runtime
+            .remove("external_realtime")
+            .and_then(|value| value.as_bool());
+        runtime.remove("external_prevents_idle");
+        let display = runtime
+            .remove("idle_display")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if let Some(sample) = runtime.remove("external_sample_seconds") {
+            runtime.insert("power_sample_seconds".into(), sample);
+        }
+        if let Some(attention) = runtime.remove("codex_attention_seconds") {
+            runtime.insert("agent_attention_seconds".into(), attention);
+        }
+        if let Some(sound) = runtime.remove("codex_completion_sound") {
+            runtime.insert("agent_completion_sound".into(), sound);
+        }
+        runtime.remove("external_enter_samples");
+        runtime.remove("external_exit_samples");
+        runtime.remove("codex_keep_bright");
+        runtime.remove("codex_protection_minutes");
+        runtime.remove("cpu_activity_hint");
+        if idle_saving.is_some() || saving.is_some() {
+            runtime.insert(
+                "profile".into(),
+                serde_json::Value::String(migrated_profile(idle_saving, saving.as_deref()).into()),
+            );
+        }
+        if let Some(keep) = keep {
+            runtime.insert(
+                "screen_inhibit".into(),
+                serde_json::Value::String(if keep { "while-mapped" } else { "never" }.into()),
+            );
+        }
+        if let Some(external_realtime) = external_realtime {
+            runtime.insert(
+                "external_boost".into(),
+                serde_json::Value::Bool(external_realtime),
+            );
+        }
+        if let Some(display) = display {
+            runtime.insert(
+                "idle_view".into(),
+                serde_json::Value::String(migrated_idle_view(&display).into()),
+            );
+        }
+    }
+    if let Some(cards) = root
+        .get_mut("cards")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for card in cards {
+            if let Some(runtime) = card
+                .get_mut("runtime")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                validate_json_field(runtime, "class", "a known string", |value| {
+                    value.as_str().and_then(migrated_workload).is_some()
+                })?;
+                validate_json_field(runtime, "idle_behavior", "`throttle` or `pause`", |value| {
+                    matches!(value.as_str(), Some("throttle" | "pause"))
+                })?;
+                validate_json_field(
+                    runtime,
+                    "idle_multiplier",
+                    "number",
+                    serde_json::Value::is_number,
+                )?;
+                validate_json_field(
+                    runtime,
+                    "external_realtime",
+                    "boolean",
+                    serde_json::Value::is_boolean,
+                )?;
+                validate_json_field(
+                    runtime,
+                    "realtime_multiplier",
+                    "number",
+                    serde_json::Value::is_number,
+                )?;
+                let class = runtime
+                    .remove("class")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let idle = runtime
+                    .remove("idle_behavior")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                runtime.remove("idle_multiplier");
+                runtime.remove("external_realtime");
+                runtime.remove("realtime_multiplier");
+                if let Some(class) = class {
+                    runtime.insert(
+                        "workload".into(),
+                        serde_json::Value::String(
+                            migrated_workload(&class)
+                                .expect("legacy class was validated")
+                                .into(),
+                        ),
+                    );
+                }
+                if let Some(idle) = idle {
+                    runtime.insert("idle_behavior".into(), serde_json::Value::String(idle));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected: &str,
+    valid: impl Fn(&serde_json::Value) -> bool,
+) -> Result<(), String> {
+    if let Some(value) = object.get(field) {
+        if !valid(value) {
+            return Err(format!(
+                "legacy field `{field}` must be {expected}, got {value}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -496,5 +1132,194 @@ mod tests {
     fn module_targets_cannot_escape_config_directory() {
         assert!(new_module_target("../personal.toml").is_err());
         assert!(new_module_target("personal.yaml").is_err());
+    }
+
+    #[test]
+    fn v3_runtime_migration_produces_strict_v4_fields() {
+        let legacy = r#"
+schema_version = 3
+
+[runtime]
+keep_screen_on = true
+idle_power_saving = true
+refresh_saving_strength = "mild"
+external_realtime = false
+external_prevents_idle = true
+external_sample_seconds = 9
+external_enter_samples = 3
+external_exit_samples = 2
+codex_keep_bright = true
+codex_protection_minutes = 60
+codex_attention_seconds = 20
+codex_completion_sound = false
+cpu_activity_hint = true
+idle_display = "dim"
+"#;
+        let output = migrate_document(Path::new("config.toml"), legacy).unwrap();
+        let config: AppConfig = toml::from_str(&output).unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            config.runtime.profile,
+            crate::core::config::RuntimeProfile::Balanced
+        );
+        assert_eq!(
+            config.runtime.screen_inhibit,
+            crate::core::config::ScreenInhibitMode::WhileMapped
+        );
+        assert!(!config.runtime.external_boost);
+        assert_eq!(config.runtime.power_sample_seconds, 9);
+        assert_eq!(config.runtime.agent_attention_seconds, 20);
+        assert!(!config.runtime.agent_completion_sound);
+        assert_eq!(
+            config.runtime.idle_view,
+            crate::core::config::IdleViewMode::Dim
+        );
+        for obsolete in [
+            "keep_screen_on",
+            "idle_power_saving",
+            "refresh_saving_strength",
+            "external_realtime",
+            "external_prevents_idle",
+            "external_enter_samples",
+            "external_exit_samples",
+            "codex_keep_bright",
+            "codex_protection_minutes",
+            "codex_attention_seconds",
+            "codex_completion_sound",
+            "cpu_activity_hint",
+            "idle_display",
+        ] {
+            assert!(
+                !output.contains(obsolete),
+                "obsolete field remained: {obsolete}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_runtime_migration_uses_the_same_v4_mapping() {
+        let legacy = r#"{
+  "schema_version": 3,
+  "runtime": {
+    "keep_screen_on": false,
+    "idle_power_saving": false,
+    "codex_attention_seconds": 7,
+    "codex_completion_sound": true
+  }
+}"#;
+        let output = migrate_document(Path::new("config.json"), legacy).unwrap();
+        let config: AppConfig = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            config.runtime.profile,
+            crate::core::config::RuntimeProfile::Performance
+        );
+        assert_eq!(
+            config.runtime.screen_inhibit,
+            crate::core::config::ScreenInhibitMode::Never
+        );
+        assert_eq!(config.runtime.agent_attention_seconds, 7);
+        assert!(config.runtime.agent_completion_sound);
+    }
+
+    #[test]
+    fn fragment_migration_does_not_invent_unrelated_overrides() {
+        let legacy = r#"
+schema_version = 3
+name = "power-only"
+replace_existing = true
+
+[runtime]
+external_realtime = false
+"#;
+        let output = migrate_document(Path::new("50-power.toml"), legacy).unwrap();
+        let value: toml::Value = toml::from_str(&output).unwrap();
+        let runtime = value["runtime"].as_table().unwrap();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime["external_boost"].as_bool(), Some(false));
+        let _: ConfigFragment = toml::from_str(&output).unwrap();
+    }
+
+    #[test]
+    fn malformed_legacy_values_are_rejected_instead_of_defaulted() {
+        let bad_toml = r#"
+schema_version = 3
+[runtime]
+keep_screen_on = "yes"
+"#;
+        assert!(migrate_document(Path::new("config.toml"), bad_toml)
+            .unwrap_err()
+            .contains("keep_screen_on"));
+
+        let bad_json = r#"{
+  "schema_version": 3,
+  "runtime": {"codex_attention_seconds": "soon"}
+}"#;
+        assert!(migrate_document(Path::new("config.json"), bad_json)
+            .unwrap_err()
+            .contains("codex_attention_seconds"));
+
+        let unknown_saving = r#"
+schema_version = 3
+[runtime]
+refresh_saving_strength = "typo"
+"#;
+        assert!(migrate_document(Path::new("config.toml"), unknown_saving)
+            .unwrap_err()
+            .contains("refresh_saving_strength"));
+
+        let unknown_display = r#"{
+  "schema_version": 3,
+  "runtime": {"idle_display": "ambient"}
+}"#;
+        assert!(migrate_document(Path::new("config.json"), unknown_display)
+            .unwrap_err()
+            .contains("idle_display"));
+
+        let unknown_class = r#"
+schema_version = 3
+[[cards]]
+id = "bad"
+title = "Bad"
+page = "monitor"
+[cards.runtime]
+class = "burst"
+"#;
+        assert!(migrate_document(Path::new("config.toml"), unknown_class)
+            .unwrap_err()
+            .contains("class"));
+    }
+
+    #[test]
+    fn card_runtime_class_migrates_to_workload_without_legacy_tuning_fields() {
+        let legacy = r#"
+schema_version = 3
+
+[[cards]]
+id = "remote"
+title = "Remote"
+page = "monitor"
+renderer = "text"
+refresh = "1m"
+source = { text = "ok" }
+
+[cards.runtime]
+class = "http"
+idle_behavior = "throttle"
+idle_multiplier = 8.0
+external_realtime = false
+realtime_multiplier = 0.75
+"#;
+        let output = migrate_document(Path::new("config.toml"), legacy).unwrap();
+        let config: AppConfig = toml::from_str(&output).unwrap();
+        assert_eq!(
+            config.cards[0].runtime.workload,
+            crate::core::config::CardWorkload::Expensive
+        );
+        assert_eq!(
+            config.cards[0].runtime.idle_behavior,
+            crate::core::config::CardWorkBehavior::Throttle
+        );
+        assert!(!output.contains("idle_multiplier"));
+        assert!(!output.contains("realtime_multiplier"));
     }
 }

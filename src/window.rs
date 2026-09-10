@@ -2,7 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use adw::prelude::AdwApplicationWindowExt;
@@ -11,12 +14,19 @@ use gtk::{Align, Box as GtkBox, Button, Label, Orientation};
 
 use crate::core::cache;
 use crate::core::config::{
-    config_modules_dir, config_path, CardConfig, CardIdleBehavior, CardRuntimeClass, ConfigManager,
-    DisplayConfig, SourceConfig, SourceKind,
+    config_modules_dir, config_path, AppConfig, CardConfig, CardWorkBehavior, CardWorkload,
+    ConfigManager, DisplayConfig, IdleViewMode, ScreenInhibitMode, SourceConfig, SourceKind,
 };
-use crate::core::runtime::{RuntimeHandle, RuntimeManager, RuntimeMode, UserActivity};
-use crate::core::scheduler::{IdleBehavior, Scheduler, TaskClass, TaskPolicy};
-use crate::metrics::builtin::create_builtin_metric;
+use crate::core::refresh::{
+    RefreshCoordinator, RefreshReason, SourceEventKind, SourceKey, SourceRevision,
+};
+use crate::core::runtime::{
+    Activity, IdleViewDecision, RuntimeHandle, RuntimeManager, UserActivity, Visibility,
+};
+use crate::core::scheduler::{Scheduler, TaskPolicy, WorkBehavior, Workload};
+use crate::metrics::builtin::{
+    builtin_is_event_driven, builtin_uses_stateful_sampling, create_builtin_metric,
+};
 use crate::metrics::command::CommandMetric;
 use crate::metrics::file::FileMetric;
 use crate::metrics::http::HttpMetric;
@@ -26,6 +36,9 @@ use crate::model::card_model::{CardModel, CardState, CardValue};
 use crate::model::metric_result::{MetricResult, MetricState};
 use crate::tokio_handle;
 use crate::ui::page::Page;
+
+const DEFAULT_CONFIG: &str = include_str!("../config/config.example.toml");
+const NETWORK_SIGNAL_FALLBACK_SECONDS: u64 = 600;
 
 const APP_CSS: &str = r#"
 .tab-bar-area { padding: 5px 6px; }
@@ -93,20 +106,97 @@ const APP_CSS: &str = r#"
 struct MetricUpdate {
     card_id: String,
     page_id: String,
+    source_key: String,
+    source_revision: SourceRevision,
+    /// Source key for the revision domain that triggered this run. It is
+    /// separate from the canonical card source because power/network signal
+    /// aliases share one scheduler task.
+    revision_key: Option<String>,
+    /// Cache/source invalidation generations cover periodic runs as well as
+    /// event-triggered runs. A collector that overlaps an edge is rejected by
+    /// the GTK receiver before it can render stale data.
+    invalidation_generation: u64,
+    config_epoch: u64,
+    task_generation: u64,
     result: MetricResult,
+    /// Health of the underlying collection, independent of the result chosen
+    /// for display. A stale last-good projection may still be rendered after
+    /// failure, but it must not reset scheduler backoff as if the collection
+    /// were healthy.
+    collection_health: CollectionHealth,
+    /// Budget used by this replay/collection. The receiver rejects an update
+    /// if hot reload lowered the current budget while it was queued.
+    max_output_bytes: usize,
     interval_secs: u64,
     next_delay: Option<Duration>,
+    /// Fixed wall-clock schedules carry their absolute next slot through the
+    /// worker so completion latency cannot shift the following execution.
+    next_deadline: Option<Instant>,
 }
 
 struct ActionUpdate {
     action_id: String,
+    invocation_id: u64,
     result_card_id: Option<String>,
     result: ActionResult,
+}
+
+const MAX_COMPLETED_ACTION_INVOCATIONS: usize = 4096;
+static NEXT_SAMPLING_CONSUMER_KEY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionHealth {
+    Healthy,
+    Failed,
+}
+
+impl CollectionHealth {
+    fn from_collector(result: &MetricResult) -> Self {
+        if result.state == MetricState::Normal && !result.cached {
+            Self::Healthy
+        } else {
+            Self::Failed
+        }
+    }
+
+    fn cache_hit() -> Self {
+        Self::Healthy
+    }
+
+    fn is_healthy(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
+struct InvocationDedup {
+    seen: std::collections::HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl InvocationDedup {
+    fn insert(&mut self, invocation_id: u64) -> bool {
+        if !self.seen.insert(invocation_id) {
+            return false;
+        }
+        self.order.push_back(invocation_id);
+        while self.order.len() > MAX_COMPLETED_ACTION_INVOCATIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
 }
 
 struct CardMeta {
     page_id: String,
     interval_secs: u64,
+    source_key: String,
+    source_node_key: String,
+    config_epoch: u64,
+    /// Opaque lifetime identity for this card's mutable sampling consumer.
+    /// It is deliberately separate from the canonical source descriptor.
+    sampling_consumer_key: u64,
 }
 
 enum PersistentSource {
@@ -116,12 +206,89 @@ enum PersistentSource {
     Static(MetricResult),
 }
 
+enum SourceCollector {
+    Builtin(BuiltinMetric),
+    Persistent(PersistentSource),
+}
+
+struct SourceNode {
+    state: Mutex<SourceNodeState>,
+    /// Canonical descriptor key used to invalidate all sampling-policy nodes
+    /// that project the same source.
+    descriptor_key: String,
+    /// Invalidation is atomic so a GTK event never waits for a blocking
+    /// command/HTTP collector holding the state lock.
+    invalidation_generation: AtomicU64,
+}
+
+struct SourceNodeState {
+    collector: SourceCollector,
+    /// A short source-level coalescing window lets cards bound to the same
+    /// descriptor share one in-flight sample/result without mixing the
+    /// cadence/state of stateful samplers.
+    last_result: Option<MetricResult>,
+    last_collected_at: Option<Instant>,
+    last_generation: u64,
+    last_max_output: usize,
+}
+
+impl SourceNode {
+    const COALESCE_WINDOW: Duration = Duration::from_millis(100);
+
+    fn new(collector: SourceCollector, descriptor_key: String) -> Self {
+        Self {
+            state: Mutex::new(SourceNodeState {
+                collector,
+                last_result: None,
+                last_collected_at: None,
+                last_generation: 0,
+                last_max_output: 0,
+            }),
+            descriptor_key,
+            invalidation_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn collect(&self, ctx: &MetricContext, max_output: usize) -> MetricResult {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let generation = self.invalidation_generation.load(Ordering::Acquire);
+        if state.last_generation == generation
+            && state.last_max_output == max_output
+            && state
+                .last_collected_at
+                .is_some_and(|at| now.duration_since(at) < Self::COALESCE_WINDOW)
+        {
+            if let Some(result) = &state.last_result {
+                return result.clone();
+            }
+        }
+        let result = match &mut state.collector {
+            SourceCollector::Builtin(metric) => metric.collect(ctx),
+            SourceCollector::Persistent(source) => source.collect(ctx, max_output),
+        };
+        state.last_collected_at = Some(Instant::now());
+        state.last_max_output = max_output;
+        state.last_result = Some(result.clone());
+        // Keep the generation observed before collection. If an edge arrived
+        // during the blocking sample, the next caller sees a mismatch and
+        // cannot replay this potentially stale result from the coalescing
+        // window.
+        state.last_generation = generation;
+        result
+    }
+
+    fn invalidate(&self) {
+        self.invalidation_generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 impl PersistentSource {
-    fn collect(&mut self, ctx: &MetricContext) -> MetricResult {
+    fn collect(&mut self, ctx: &MetricContext, max_output: usize) -> MetricResult {
         match self {
-            Self::Command(source) => source.collect_no_ctx(),
+            Self::Command(source) => source.collect_no_ctx(max_output),
             Self::File(source) => source.collect(ctx),
-            Self::Http(source) => source.collect(ctx),
+            Self::Http(source) => source.collect(ctx, max_output),
             Self::Static(result) => result.clone(),
         }
     }
@@ -132,6 +299,14 @@ struct ConfigReloadGuard {
     debounce_ms: u64,
     pending: RefCell<bool>,
     source_id: Rc<RefCell<Option<glib::SourceId>>>,
+}
+
+impl Drop for ConfigReloadGuard {
+    fn drop(&mut self) {
+        if let Some(source) = self.source_id.borrow_mut().take() {
+            source.remove();
+        }
+    }
 }
 
 impl ConfigReloadGuard {
@@ -154,9 +329,11 @@ pub struct MonitorWindow {
     handle: tokio::runtime::Handle,
     metric_ctx: Arc<MetricContext>,
     previous_results: Rc<RefCell<HashMap<String, MetricResult>>>,
-    builtin_metrics: Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>>,
-    persistent_sources: Arc<Mutex<HashMap<String, Arc<Mutex<PersistentSource>>>>>,
+    source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    max_output_budget: Arc<AtomicUsize>,
     card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
+    refresh: Rc<RefCell<RefreshCoordinator>>,
+    config_epoch: Rc<Cell<u64>>,
     current_page_id: Rc<RefCell<String>>,
     metric_tx: async_channel::Sender<MetricUpdate>,
     action_tx: async_channel::Sender<ActionUpdate>,
@@ -170,8 +347,12 @@ pub struct MonitorWindow {
     idle_status: gtk::Label,
     idle_time: gtk::Label,
     _power_monitor: Rc<crate::core::power_supply::PowerSupplyMonitor>,
-    file_monitors: RefCell<Vec<gio::FileMonitor>>,
+    file_monitors: Rc<RefCell<Vec<gio::FileMonitor>>>,
+    file_fallback: Rc<RefCell<Option<glib::SourceId>>>,
     _network_monitor: gio::NetworkMonitor,
+    network_dbus: Option<(gio::DBusConnection, gio::SignalSubscriptionId)>,
+    network_fallback: Option<glib::SourceId>,
+    network_debounce: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
 impl MonitorWindow {
@@ -282,25 +463,68 @@ impl MonitorWindow {
             http_client.clone(),
             battery_root,
             procfs_root,
-        ));
-        let power_monitor = crate::core::power_supply::PowerSupplyMonitor::start(
-            runtime.clone(),
-            PathBuf::from("/sys/class/power_supply"),
             PathBuf::from("/sys/class/thermal"),
-        );
+        ));
 
         let (metric_tx, metric_rx) = async_channel::unbounded::<MetricUpdate>();
         let (action_tx, action_rx) = async_channel::unbounded::<ActionUpdate>();
         let (scheduler_wake, scheduler_wake_rx) = async_channel::bounded::<()>(1);
-
+        let source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let max_output_budget = Arc::new(AtomicUsize::new(
+            config_ref.borrow().config().app.max_output_bytes.max(1),
+        ));
+        let refresh = Rc::new(RefCell::new(RefreshCoordinator::new()));
+        let config_epoch = Rc::new(Cell::new(0));
         let previous_results: Rc<RefCell<HashMap<String, MetricResult>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let builtin_metrics: Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let persistent_sources = Arc::new(Mutex::new(HashMap::new()));
         let card_metas: Rc<RefCell<HashMap<String, CardMeta>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let current_page_id = Rc::new(RefCell::new(String::new()));
+        let power_ctx = metric_ctx.clone();
+        let power_refresh = refresh.clone();
+        let power_scheduler = scheduler.clone();
+        let power_wake = scheduler_wake.clone();
+        let power_card_metas = card_metas.clone();
+        let power_nodes = source_nodes.clone();
+        let thermal_refresh = refresh.clone();
+        let thermal_scheduler = scheduler.clone();
+        let thermal_wake = scheduler_wake.clone();
+        let thermal_card_metas = card_metas.clone();
+        let thermal_nodes = source_nodes.clone();
+        let power_monitor =
+            crate::core::power_supply::PowerSupplyMonitor::start_with_shared_battery(
+                runtime.clone(),
+                PathBuf::from("/sys/class/power_supply"),
+                PathBuf::from("/sys/class/thermal"),
+                power_ctx.battery.clone(),
+                move || {
+                    if let Ok(mut battery) = power_ctx.battery.lock() {
+                        battery.invalidate();
+                    }
+                    publish_source_event(
+                        &power_refresh,
+                        &power_scheduler,
+                        &power_wake,
+                        &power_card_metas,
+                        &power_nodes,
+                        "signal:power-supply",
+                        SourceEventKind::Changed,
+                    );
+                },
+                move || {
+                    publish_source_event(
+                        &thermal_refresh,
+                        &thermal_scheduler,
+                        &thermal_wake,
+                        &thermal_card_metas,
+                        &thermal_nodes,
+                        "signal:thermal",
+                        SourceEventKind::Changed,
+                    );
+                },
+            );
+
         let reload_guard = ConfigReloadGuard::new(500);
         let network_monitor = gio::NetworkMonitor::default();
 
@@ -313,9 +537,11 @@ impl MonitorWindow {
             handle,
             metric_ctx,
             previous_results,
-            builtin_metrics,
-            persistent_sources,
+            source_nodes,
+            max_output_budget,
             card_metas,
+            refresh,
+            config_epoch,
             current_page_id: current_page_id.clone(),
             metric_tx,
             action_tx,
@@ -329,13 +555,17 @@ impl MonitorWindow {
             idle_status,
             idle_time,
             _power_monitor: power_monitor,
-            file_monitors: RefCell::new(Vec::new()),
+            file_monitors: Rc::new(RefCell::new(Vec::new())),
+            file_fallback: Rc::new(RefCell::new(None)),
             _network_monitor: network_monitor.clone(),
+            network_dbus: None,
+            network_fallback: None,
+            network_debounce: Rc::new(RefCell::new(None)),
         };
 
         win.setup_pages();
         win.setup_adaptive_layout();
-        win.setup_screen_inhibit(app);
+        win.setup_runtime_consumers(app);
         win.setup_lifecycle();
         win.setup_config_monitor();
         win.setup_network_monitor(&network_monitor);
@@ -346,18 +576,23 @@ impl MonitorWindow {
         win
     }
 
-    fn setup_screen_inhibit(&mut self, app: &adw::Application) {
+    fn setup_runtime_consumers(&mut self, app: &adw::Application) {
         let application = app.clone();
         let inhibit_cookie: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
         let runtime = self.runtime.clone();
-        runtime.set_foreground(self.window.is_mapped());
+        runtime.set_mapped(self.window.is_mapped());
+        runtime.set_active(self.window.is_active());
         self.window.connect_map({
             let runtime = runtime.clone();
-            move |_| runtime.set_foreground(true)
+            move |_| runtime.set_mapped(true)
         });
         self.window.connect_unmap({
             let runtime = runtime.clone();
-            move |_| runtime.set_foreground(false)
+            move |_| runtime.set_mapped(false)
+        });
+        self.window.connect_is_active_notify({
+            let runtime = runtime.clone();
+            move |window| runtime.set_active(window.is_active())
         });
 
         let rx = runtime.subscribe();
@@ -372,9 +607,8 @@ impl MonitorWindow {
         glib::MainContext::default().spawn_local(async move {
             while let Ok(snapshot) = rx.recv().await {
                 let runtime_config = runtime.config();
-                let keep_screen_on = runtime_config.keep_screen_on;
-                if let crate::core::runtime::CodexPhase::Attention { task_id, event_id } =
-                    &snapshot.codex_phase
+                if let crate::core::runtime::AgentPhase::Attention { task_id, event_id } =
+                    &snapshot.agent_phase
                 {
                     let key = (task_id.clone(), event_id.clone());
                     if runtime_config.bring_to_foreground_on_attention
@@ -386,10 +620,9 @@ impl MonitorWindow {
                 } else {
                     presented_attention.borrow_mut().take();
                 }
-                if snapshot.foreground && keep_screen_on {
+                if snapshot.inhibit_screen {
                     if inhibit_cookie.borrow().is_none() {
-                        let flags = gtk::ApplicationInhibitFlags::IDLE
-                            | gtk::ApplicationInhibitFlags::SUSPEND;
+                        let flags = gtk::ApplicationInhibitFlags::IDLE;
                         let id = application.inhibit(
                             Some(&window),
                             flags,
@@ -401,21 +634,24 @@ impl MonitorWindow {
                     application.uninhibit(id);
                 }
 
-                let idle = snapshot.mode == RuntimeMode::ForegroundIdle;
-                if idle {
-                    let runtime_config = runtime.config();
-                    let minimal = runtime_config.idle_display == "minimal";
-                    let brightness = runtime_config.idle_visual_brightness_percent.min(100) as f64;
+                let idle_view = snapshot.idle_view;
+                if idle_view != IdleViewDecision::None {
+                    let minimal = idle_view == IdleViewDecision::Minimal;
+                    let brightness = match idle_view {
+                        IdleViewDecision::Dim(percent) => percent as f64,
+                        IdleViewDecision::Minimal => 0.0,
+                        IdleViewDecision::None => 100.0,
+                    };
                     dashboard_content.set_child_visible(!minimal);
                     idle_status.set_visible(minimal);
                     idle_time.set_visible(minimal);
                     if minimal {
                         idle_status.set_text(&format!(
                             "{:?}\n供电 {:?} · 温度 {:?}\n{}",
-                            snapshot.codex_phase,
+                            snapshot.agent_phase,
                             snapshot.power_verdict,
                             snapshot.thermal_verdict,
-                            snapshot.reason
+                            snapshot.reasons.join(", ")
                         ));
                         update_idle_clock(&idle_time, &idle_status);
                         if clock_source.borrow().is_none() {
@@ -425,9 +661,7 @@ impl MonitorWindow {
                             let holder = clock_source.clone();
                             let source =
                                 glib::timeout_add_local(Duration::from_secs(60), move || {
-                                    if mode.snapshot().mode != RuntimeMode::ForegroundIdle
-                                        || mode.config().idle_display != "minimal"
-                                    {
+                                    if mode.snapshot().idle_view != IdleViewDecision::Minimal {
                                         holder.borrow_mut().take();
                                         return glib::ControlFlow::Break;
                                     }
@@ -474,14 +708,7 @@ impl MonitorWindow {
         let cfg = self.config.borrow();
         let app_config = cfg.config();
 
-        let mut cards = app_config.cards.clone();
-        if cards.is_empty() {
-            cards = default_builtin_cards();
-        } else {
-            // The external configuration is authoritative. In particular, a
-            // disabled card must not be silently recreated from Rust defaults.
-            cards.retain(|card| card.enabled);
-        }
+        let mut cards = effective_cards(app_config, cfg.uses_default_card_registry());
 
         cards.sort_by_key(|c| c.order);
 
@@ -494,36 +721,7 @@ impl MonitorWindow {
         let cfg = self.config.borrow();
         let app_config = cfg.config();
 
-        let mut pages_list = if app_config.pages.is_empty() {
-            vec![
-                crate::core::config::PageConfig {
-                    id: "monitor".into(),
-                    title: "监控".into(),
-                    icon: Some("computer-symbolic".into()),
-                    order: 10,
-                    kind: None,
-                    plugin: None,
-                },
-                crate::core::config::PageConfig {
-                    id: "actions".into(),
-                    title: "操作".into(),
-                    icon: Some("system-run-symbolic".into()),
-                    order: 20,
-                    kind: None,
-                    plugin: None,
-                },
-                crate::core::config::PageConfig {
-                    id: "settings".into(),
-                    title: "设置".into(),
-                    icon: Some("preferences-system-symbolic".into()),
-                    order: 30,
-                    kind: None,
-                    plugin: None,
-                },
-            ]
-        } else {
-            app_config.pages.clone()
-        };
+        let mut pages_list = effective_pages(app_config, cfg.uses_default_page_registry());
 
         pages_list.sort_by_key(|p| p.order);
         pages_list
@@ -532,15 +730,46 @@ impl MonitorWindow {
     fn setup_pages(&mut self) {
         let pages_list = self.sorted_pages();
         let (cards, actions) = self.drain_cards();
-        self.setup_file_monitors(&cards);
 
         let mut page_ids = Vec::new();
 
         self.pages.borrow_mut().clear();
         self.card_metas.borrow_mut().clear();
         self.previous_results.borrow_mut().clear();
-        self.builtin_metrics.lock().unwrap().clear();
-        self.persistent_sources.lock().unwrap().clear();
+        self.source_nodes.lock().unwrap().clear();
+        self.refresh.borrow_mut().clear();
+        for card in &cards {
+            let source_key = source_key_for(card.source.as_ref());
+            self.refresh
+                .borrow_mut()
+                .register_source(source_key.clone());
+            self.refresh.borrow_mut().bind(source_key, card.id.clone());
+            if card
+                .source
+                .as_ref()
+                .and_then(SourceConfig::builtin_metric)
+                .is_some_and(|metric| {
+                    matches!(metric, "battery_capacity" | "battery_temperature" | "power")
+                })
+            {
+                self.refresh
+                    .borrow_mut()
+                    .bind("signal:power-supply", card.id.clone());
+            }
+            if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("network") {
+                self.refresh
+                    .borrow_mut()
+                    .bind("signal:network", card.id.clone());
+            }
+            if card.source.as_ref().and_then(SourceConfig::builtin_metric)
+                == Some("cpu_temperature")
+            {
+                self.refresh
+                    .borrow_mut()
+                    .bind("signal:thermal", card.id.clone());
+            }
+        }
+        self.setup_file_monitors(&cards);
 
         let plugin_context = crate::plugins::PluginContext {
             handle: self.handle.clone(),
@@ -622,50 +851,99 @@ impl MonitorWindow {
     }
 
     fn setup_file_monitors(&self, cards: &[CardConfig]) {
-        self.file_monitors.borrow_mut().clear();
-        for card in cards {
-            let Some(source) = card.source.as_ref() else {
-                continue;
-            };
-            let SourceConfig::File(file_source) = source else {
-                continue;
-            };
-            let Ok(monitor) = gio::File::for_path(&file_source.path)
-                .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-            else {
-                continue;
-            };
-            let scheduler = self.scheduler.clone();
-            let wake = self.scheduler_wake.clone();
-            let card_id = card.id.clone();
-            monitor.connect_changed(move |_, _, _, event| {
-                if matches!(
-                    event,
-                    gio::FileMonitorEvent::Changed
-                        | gio::FileMonitorEvent::ChangesDoneHint
-                        | gio::FileMonitorEvent::Created
-                        | gio::FileMonitorEvent::MovedIn
-                ) {
-                    scheduler.borrow_mut().request_now(&card_id);
-                    let _ = wake.try_send(());
-                }
-            });
-            self.file_monitors.borrow_mut().push(monitor);
-        }
+        install_file_monitors(
+            &self.file_monitors,
+            &self.file_fallback,
+            cards,
+            self.refresh.clone(),
+            self.scheduler.clone(),
+            self.scheduler_wake.clone(),
+            self.card_metas.clone(),
+            self.source_nodes.clone(),
+        );
     }
 
-    fn setup_network_monitor(&self, monitor: &gio::NetworkMonitor) {
-        let scheduler = self.scheduler.clone();
-        let wake = self.scheduler_wake.clone();
-        let config = self.config.clone();
-        monitor.connect_network_changed(move |_, _| {
-            for card in &config.borrow().config().cards {
-                if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("network") {
-                    scheduler.borrow_mut().request_now(&card.id);
+    fn setup_network_monitor(&mut self, monitor: &gio::NetworkMonitor) {
+        let pending = self.network_debounce.clone();
+        let queue_network_event: Rc<dyn Fn()> = {
+            let pending = pending.clone();
+            let refresh = self.refresh.clone();
+            let scheduler = self.scheduler.clone();
+            let wake = self.scheduler_wake.clone();
+            let card_metas = self.card_metas.clone();
+            let source_nodes = self.source_nodes.clone();
+            let network = self.metric_ctx.clone();
+            Rc::new(move || {
+                if pending.borrow().is_some() {
+                    return;
                 }
-            }
-            let _ = wake.try_send(());
+                let pending_for_timer = pending.clone();
+                let refresh = refresh.clone();
+                let scheduler = scheduler.clone();
+                let wake = wake.clone();
+                let card_metas = card_metas.clone();
+                let source_nodes = source_nodes.clone();
+                let network = network.clone();
+                let source = glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    pending_for_timer.borrow_mut().take();
+                    if let Ok(mut source) = network.network.lock() {
+                        source.invalidate();
+                    }
+                    publish_source_event(
+                        &refresh,
+                        &scheduler,
+                        &wake,
+                        &card_metas,
+                        &source_nodes,
+                        "signal:network",
+                        SourceEventKind::Changed,
+                    );
+                });
+                pending.replace(Some(source));
+            })
+        };
+        monitor.connect_network_changed({
+            let queue_network_event = queue_network_event.clone();
+            move |_, _| queue_network_event()
         });
+
+        // A signal loss must not turn an event-driven network source into a
+        // permanently stale value. The watchdog is a source hint, not a
+        // second per-card NetworkManager query, and remains harmless when no
+        // card is bound to the signal key.
+        let watchdog = {
+            let queue_network_event = queue_network_event.clone();
+            glib::timeout_add_local(
+                Duration::from_secs(NETWORK_SIGNAL_FALLBACK_SECONDS),
+                move || {
+                    queue_network_event();
+                    glib::ControlFlow::Continue
+                },
+            )
+        };
+        self.network_fallback = Some(watchdog);
+
+        // NetworkMonitor is a useful generic hint, but NetworkManager's own
+        // PropertiesChanged/StateChanged signals are the authoritative edge.
+        let Ok(connection) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) else {
+            tracing::debug!(
+                "NetworkManager system bus unavailable; bounded source fallback remains active"
+            );
+            return;
+        };
+        let subscription = connection.signal_subscribe(
+            Some("org.freedesktop.NetworkManager"),
+            None,
+            None,
+            None,
+            None,
+            gio::DBusSignalFlags::NONE,
+            {
+                let queue_network_event = queue_network_event.clone();
+                move |_, _, _, _, _, _| queue_network_event()
+            },
+        );
+        self.network_dbus = Some((connection, subscription));
     }
 
     fn populate_page(
@@ -748,130 +1026,28 @@ impl MonitorWindow {
                     }
                 });
 
-                if let Some(action_id) = card_cfg.click_action.as_deref() {
-                    if let Some(action_cfg) =
-                        all_actions.iter().find(|action| action.id == action_id)
-                    {
-                        metric_card.set_action_enabled(true);
-                        let action_controls = match &metric_card.render_widgets {
-                            crate::ui::metric_card::RenderWidgets::Action(widgets) => {
-                                Some(widgets.clone())
-                            }
-                            _ => None,
-                        };
-                        if let Some(controls) = action_controls.clone() {
-                            let button_controls = controls.clone();
-                            let action_cfg = action_cfg.clone();
-                            let action_tx = self.action_tx.clone();
-                            let handle = self.handle.clone();
-                            let result_card_id = card_cfg.id.clone();
-                            let (confirm_title, confirm_detail) =
-                                action_confirmation_text(&action_cfg);
-                            let global_max_output =
-                                self.config.borrow().config().app.max_output_bytes;
-                            let runtime = self.runtime.clone();
-                            controls.button.connect_clicked(move |button| {
-                                let run = {
-                                    let controls = button_controls.clone();
-                                    let action_cfg = action_cfg.clone();
-                                    let action_tx = action_tx.clone();
-                                    let handle = handle.clone();
-                                    let result_card_id = result_card_id.clone();
-                                    move || {
-                                        controls.set_running(true);
-                                        execute_action_async(
-                                            action_cfg,
-                                            action_tx,
-                                            handle,
-                                            global_max_output,
-                                            Some(result_card_id),
-                                        );
-                                    }
-                                };
-                                if action_cfg.confirm {
-                                    confirm_action(
-                                        button.upcast_ref(),
-                                        &confirm_title,
-                                        &confirm_detail,
-                                        runtime.clone(),
-                                        run,
-                                    );
-                                } else {
-                                    run();
-                                }
-                            });
-                        }
-                        metric_card.card.add_css_class("click-action-card");
-                        metric_card.card.set_cursor_from_name(Some("pointer"));
-                        let click = gtk::GestureClick::new();
-                        click.set_button(gtk::gdk::BUTTON_PRIMARY);
-                        let action_cfg = action_cfg.clone();
-                        let action_tx = self.action_tx.clone();
-                        let handle = self.handle.clone();
-                        let result_card_id = card_cfg.id.clone();
-                        let dialog_runtime = self.runtime.clone();
-                        let (confirm_title, confirm_detail) = action_confirmation_text(&action_cfg);
-                        let global_max_output = self.config.borrow().config().app.max_output_bytes;
-                        click.connect_released(move |gesture, presses, x, y| {
-                            if presses != 1 {
-                                return;
-                            }
-                            let Some(widget) = gesture.widget() else {
-                                return;
-                            };
-                            if widget
-                                .pick(x, y, gtk::PickFlags::DEFAULT)
-                                .is_some_and(|target| widget_or_ancestor_is_button(target, &widget))
-                            {
-                                return;
-                            }
-                            let run = {
-                                let action_controls = action_controls.clone();
-                                let action_cfg = action_cfg.clone();
-                                let action_tx = action_tx.clone();
-                                let handle = handle.clone();
-                                let result_card_id = result_card_id.clone();
-                                move || {
-                                    if let Some(controls) = &action_controls {
-                                        controls.set_running(true);
-                                    }
-                                    execute_action_async(
-                                        action_cfg,
-                                        action_tx,
-                                        handle,
-                                        global_max_output,
-                                        Some(result_card_id),
-                                    );
-                                }
-                            };
-                            if action_cfg.confirm {
-                                confirm_action(
-                                    &widget,
-                                    &confirm_title,
-                                    &confirm_detail,
-                                    dialog_runtime.clone(),
-                                    run,
-                                );
-                            } else {
-                                run();
-                            }
-                        });
-                        metric_card.card.add_controller(click);
-                    } else {
-                        tracing::warn!(
-                            card = %card_cfg.id,
-                            action = %action_id,
-                            "card click action not found"
-                        );
-                    }
-                }
+                bind_metric_action(
+                    metric_card,
+                    &card_cfg.id,
+                    self.config.clone(),
+                    self.action_tx.clone(),
+                    self.handle.clone(),
+                    self.runtime.clone(),
+                );
             }
 
+            let source_key = source_key_for(card_cfg.source.as_ref());
+            let sampling_consumer_key = next_sampling_consumer_key();
+            let source_node_key = source_node_key(&source_key, card_cfg, sampling_consumer_key);
             self.card_metas.borrow_mut().insert(
                 card_cfg.id.clone(),
                 CardMeta {
                     page_id: page_id.to_string(),
                     interval_secs: card_cfg.refresh_interval,
+                    source_key,
+                    source_node_key,
+                    config_epoch: self.config_epoch.get(),
+                    sampling_consumer_key,
                 },
             );
 
@@ -886,30 +1062,39 @@ impl MonitorWindow {
         for action_cfg in &page_actions {
             let icon = action_cfg.icon.as_deref().unwrap_or("system-run-symbolic");
             let action_id = action_cfg.id.clone();
-            let action_cfg_clone = (*action_cfg).clone();
             let action_tx = self.action_tx.clone();
             let handle = self.handle.clone();
-            let global_max_output = self.config.borrow().config().app.max_output_bytes;
-            let (confirm_title, confirm_detail) = action_confirmation_text(action_cfg);
+            let config = self.config.clone();
+            let resolve_config = config.clone();
             let dialog_runtime = self.runtime.clone();
             let response_runtime = self.runtime.clone();
             let dialog_lease = Rc::new(RefCell::new(None));
             let open_lease = dialog_lease.clone();
             let close_lease = dialog_lease.clone();
 
-            page.add_action_card(
+            page.add_action_card_with_resolver(
                 &action_id,
                 &action_cfg.name,
                 action_cfg.description.as_deref().unwrap_or(""),
                 icon,
-                action_cfg.confirm,
-                &confirm_title,
-                &confirm_detail,
-                move |_id| {
-                    let cfg = action_cfg_clone.clone();
-                    let tx = action_tx.clone();
-                    let h = handle.clone();
-                    execute_action_async(cfg, tx, h, global_max_output, None);
+                move |id| {
+                    current_action_config(&resolve_config, id).map(|action| {
+                        let (title, detail) = action_confirmation_text(&action);
+                        (action.confirm, title, detail)
+                    })
+                },
+                move |id| {
+                    let Some(cfg) = current_action_config(&config, id) else {
+                        tracing::warn!(action = %id, "action was removed by config reload");
+                        return;
+                    };
+                    execute_action_async(
+                        cfg,
+                        action_tx.clone(),
+                        handle.clone(),
+                        config.clone(),
+                        None,
+                    );
                 },
                 move || {
                     open_lease.replace(Some(
@@ -952,55 +1137,33 @@ impl MonitorWindow {
 
         page.flow_insert(&status_card);
 
-        let keep_screen_on = self.config.borrow().config().runtime.keep_screen_on;
+        let runtime_cfg = self.config.borrow().config().runtime.clone();
+        let (inhibit_row, inhibit_dropdown) = setting_dropdown_row(
+            "屏幕常亮策略",
+            "常亮与刷新、空闲视觉独立；推荐仅窗口活动时抑制熄屏",
+            &["从不", "窗口活动时", "窗口已映射时"],
+            match runtime_cfg.screen_inhibit {
+                ScreenInhibitMode::Never => 0,
+                ScreenInhibitMode::WhileActive => 1,
+                ScreenInhibitMode::WhileMapped => 2,
+            },
+        );
         {
-            let row = GtkBox::new(Orientation::Horizontal, 14);
-            row.set_hexpand(true);
-            row.set_overflow(gtk::Overflow::Hidden);
-            row.add_css_class("card");
-            row.add_css_class("pulsedeck-card");
-            row.add_css_class("settings-card-row");
-
-            let row_icon = gtk::Image::from_icon_name("display-brightness-symbolic");
-            row_icon.set_pixel_size(28);
-            row_icon.set_valign(Align::Center);
-            row_icon.add_css_class("settings-icon");
-            row.append(&row_icon);
-
-            let label_box = GtkBox::new(Orientation::Vertical, 2);
-            label_box.set_hexpand(true);
-            label_box.set_size_request(1, -1);
-            label_box.set_valign(Align::Center);
-
-            let title = Label::new(Some("保持屏幕开启"));
-            title.set_halign(Align::Start);
-            title.add_css_class("settings-name");
-            label_box.append(&title);
-
-            let desc = Label::new(Some("应用显示时阻止熄屏与系统休眠"));
-            desc.set_halign(Align::Start);
-            desc.add_css_class("settings-desc");
-            label_box.append(&desc);
-            row.append(&label_box);
-
-            let sw = gtk::Switch::new();
-            sw.set_valign(Align::Center);
-            sw.set_active(keep_screen_on);
             let config = self.config.clone();
             let runtime = self.runtime.clone();
-            sw.connect_active_notify(move |switch| {
+            inhibit_dropdown.connect_selected_notify(move |dropdown| {
                 let mut config = config.borrow_mut();
-                config.config_mut().runtime.keep_screen_on = switch.is_active();
+                config.config_mut().runtime.screen_inhibit = match dropdown.selected() {
+                    0 => ScreenInhibitMode::Never,
+                    2 => ScreenInhibitMode::WhileMapped,
+                    _ => ScreenInhibitMode::WhileActive,
+                };
                 let next = config.config().runtime.clone();
-                if let Err(error) = config.save() {
-                    tracing::warn!("failed to save keep-screen setting: {}", error);
-                }
+                let _ = config.save();
                 runtime.update_config(next);
             });
-            row.append(&sw);
-
-            page.flow_insert(&row);
         }
+        page.flow_insert(&inhibit_row);
 
         let runtime_section = Label::new(Some("运行与省电"));
         runtime_section.set_halign(Align::Start);
@@ -1008,49 +1171,24 @@ impl MonitorWindow {
         runtime_section.set_margin_top(8);
         page.flow_insert(&runtime_section);
 
-        let runtime_cfg = self.config.borrow().config().runtime.clone();
         for (title, description, active, field) in [
             (
-                "启用空闲低功耗",
-                "无真实用户操作后降低显示、刷新和动画",
-                runtime_cfg.idle_power_saving,
-                "idle_power_saving",
+                "启用夜间静默",
+                "按本地时钟暂停普通周期工作；电源、网络、Agent 信号和手动/事件请求仍可用",
+                runtime_cfg.quiet_hours_enabled,
+                "quiet_hours_enabled",
             ),
             (
-                "外接电源高实时",
-                "检测到外接电源在线时立即升档",
-                runtime_cfg.external_realtime,
-                "external_realtime",
-            ),
-            (
-                "外接供电时禁止空闲",
-                "检测到外接电源在线时保持正常亮度",
-                runtime_cfg.external_prevents_idle,
-                "external_prevents_idle",
-            ),
-            (
-                "Codex 工作保持正常亮度",
-                "只保护亮度；普通卡片仍可在用户空闲时节流",
-                runtime_cfg.codex_keep_bright,
-                "codex_keep_bright",
-            ),
-            (
-                "Codex 完成提示音",
+                "Agent 完成提示音",
                 "重要任务边沿只提示一次，后台仍保留",
-                runtime_cfg.codex_completion_sound,
-                "codex_completion_sound",
+                runtime_cfg.agent_completion_sound,
+                "agent_completion_sound",
             ),
             (
                 "重要事件带回前台",
-                "Codex 完成或需要处理时主动显示窗口；默认关闭",
+                "Agent 完成或需要处理时主动显示窗口；默认关闭",
                 runtime_cfg.bring_to_foreground_on_attention,
                 "bring_to_foreground_on_attention",
-            ),
-            (
-                "CPU 活动辅助判断",
-                "仅作为空闲稳定期辅助信号，不替代真实用户操作",
-                runtime_cfg.cpu_activity_hint,
-                "cpu_activity_hint",
             ),
         ] {
             let row = setting_switch_row(title, description, active);
@@ -1064,19 +1202,15 @@ impl MonitorWindow {
                 let mut config = config.borrow_mut();
                 let value = switch.is_active();
                 match field {
-                    "idle_power_saving" => config.config_mut().runtime.idle_power_saving = value,
-                    "external_realtime" => config.config_mut().runtime.external_realtime = value,
-                    "external_prevents_idle" => {
-                        config.config_mut().runtime.external_prevents_idle = value
+                    "quiet_hours_enabled" => {
+                        config.config_mut().runtime.quiet_hours_enabled = value
                     }
-                    "codex_keep_bright" => config.config_mut().runtime.codex_keep_bright = value,
-                    "codex_completion_sound" => {
-                        config.config_mut().runtime.codex_completion_sound = value
+                    "agent_completion_sound" => {
+                        config.config_mut().runtime.agent_completion_sound = value
                     }
                     "bring_to_foreground_on_attention" => {
                         config.config_mut().runtime.bring_to_foreground_on_attention = value
                     }
-                    "cpu_activity_hint" => config.config_mut().runtime.cpu_activity_hint = value,
                     _ => {}
                 }
                 let next = config.config().runtime.clone();
@@ -1089,6 +1223,14 @@ impl MonitorWindow {
         }
 
         for (title, description, value, min, max, field) in [
+            (
+                "非活动宽限时间",
+                "仅记录窗口焦点变化；映射白天的默认监控不会因失焦而降速",
+                runtime_cfg.inactive_grace_seconds,
+                0,
+                300,
+                "inactive_grace_seconds",
+            ),
             (
                 "空闲等待时间",
                 "最后一次真实操作后等待的秒数",
@@ -1107,27 +1249,43 @@ impl MonitorWindow {
             ),
             (
                 "空闲视觉亮度",
-                "应用内遮罩保留的近似亮度百分比",
+                "仅改变显式空闲视图，不影响映射窗口的监控新鲜度",
                 runtime_cfg.idle_visual_brightness_percent as u64,
                 5,
                 100,
                 "idle_visual_brightness_percent",
             ),
             (
-                "Codex 亮度保护",
-                "新任务开始后的保护分钟数",
-                runtime_cfg.codex_protection_minutes,
+                "夜间静默开始小时",
+                "本地时间 0–23；默认 0 表示午夜",
+                runtime_cfg.quiet_hours_start_hour as u64,
                 0,
-                1440,
-                "codex_protection_minutes",
+                23,
+                "quiet_hours_start_hour",
             ),
             (
-                "完成唤醒时间",
-                "重要事件后保持正常亮度的秒数",
-                runtime_cfg.codex_attention_seconds,
+                "夜间静默结束小时",
+                "本地时间 0–23；默认 8 表示上午八点",
+                runtime_cfg.quiet_hours_end_hour as u64,
+                0,
+                23,
+                "quiet_hours_end_hour",
+            ),
+            (
+                "观察租约时长",
+                "真实点击、滚动、切页或手动刷新后暂时允许观察工作；最长 300 秒，不会被后台事件续期",
+                runtime_cfg.observation_lease_seconds,
                 1,
                 300,
-                "codex_attention_seconds",
+                "observation_lease_seconds",
+            ),
+            (
+                "Agent 提醒保留时间",
+                "去重的重要事件在运行状态中保留的秒数",
+                runtime_cfg.agent_attention_seconds,
+                1,
+                300,
+                "agent_attention_seconds",
             ),
         ] {
             let (row, spin) = setting_spin_row(title, description, value, min, max);
@@ -1137,6 +1295,9 @@ impl MonitorWindow {
                 let value = spin.value().round().max(0.0) as u64;
                 let mut config = config.borrow_mut();
                 match field {
+                    "inactive_grace_seconds" => {
+                        config.config_mut().runtime.inactive_grace_seconds = value
+                    }
                     "idle_timeout_seconds" => {
                         config.config_mut().runtime.idle_timeout_seconds = value
                     }
@@ -1147,11 +1308,17 @@ impl MonitorWindow {
                         config.config_mut().runtime.idle_visual_brightness_percent =
                             value.min(100) as u8
                     }
-                    "codex_protection_minutes" => {
-                        config.config_mut().runtime.codex_protection_minutes = value
+                    "quiet_hours_start_hour" => {
+                        config.config_mut().runtime.quiet_hours_start_hour = value.min(23) as u8
                     }
-                    "codex_attention_seconds" => {
-                        config.config_mut().runtime.codex_attention_seconds = value
+                    "quiet_hours_end_hour" => {
+                        config.config_mut().runtime.quiet_hours_end_hour = value.min(23) as u8
+                    }
+                    "agent_attention_seconds" => {
+                        config.config_mut().runtime.agent_attention_seconds = value
+                    }
+                    "observation_lease_seconds" => {
+                        config.config_mut().runtime.observation_lease_seconds = value.min(300)
                     }
                     _ => {}
                 }
@@ -1164,51 +1331,26 @@ impl MonitorWindow {
             page.flow_insert(&row);
         }
 
-        let (saving_row, saving_dropdown) = setting_dropdown_row(
-            "刷新节能强度",
-            "控制空闲模式下普通卡片的默认节流倍率",
-            &["温和", "均衡", "强力"],
-            match runtime_cfg.refresh_saving_strength.as_str() {
-                "mild" => 0,
-                "aggressive" => 2,
-                _ => 1,
-            },
-        );
-        {
-            let config = self.config.clone();
-            let runtime = self.runtime.clone();
-            saving_dropdown.connect_selected_notify(move |dropdown| {
-                let value = match dropdown.selected() {
-                    0 => "mild",
-                    2 => "aggressive",
-                    _ => "balanced",
-                };
-                let mut config = config.borrow_mut();
-                config.config_mut().runtime.refresh_saving_strength = value.into();
-                let next = config.config().runtime.clone();
-                let _ = config.save();
-                runtime.update_config(next);
-            });
-        }
-        page.flow_insert(&saving_row);
-
         let (display_row, display_dropdown) = setting_dropdown_row(
             "空闲显示方式",
-            "遮罩保留完整页面；纯黑极简模式进一步降低 OLED 发光与合成",
-            &["深色遮罩", "纯黑极简"],
-            u32::from(runtime_cfg.idle_display == "minimal"),
+            "默认不改变视觉；可选遮罩或 OLED 纯黑极简视图",
+            &["不改变", "深色遮罩", "纯黑极简"],
+            match runtime_cfg.idle_view {
+                IdleViewMode::None => 0,
+                IdleViewMode::Dim => 1,
+                IdleViewMode::Minimal => 2,
+            },
         );
         {
             let config = self.config.clone();
             let runtime = self.runtime.clone();
             display_dropdown.connect_selected_notify(move |dropdown| {
                 let mut config = config.borrow_mut();
-                config.config_mut().runtime.idle_display = if dropdown.selected() == 1 {
-                    "minimal"
-                } else {
-                    "dim"
-                }
-                .into();
+                config.config_mut().runtime.idle_view = match dropdown.selected() {
+                    1 => IdleViewMode::Dim,
+                    2 => IdleViewMode::Minimal,
+                    _ => IdleViewMode::None,
+                };
                 let next = config.config().runtime.clone();
                 let _ = config.save();
                 runtime.update_config(next);
@@ -1225,14 +1367,21 @@ impl MonitorWindow {
         glib::MainContext::default().spawn_local(async move {
             while let Ok(snapshot) = runtime_rx.recv().await {
                 status_value.set_text(&format!(
-                    "{:?} · {:?}\n供电 {:?} · 温度 {:?}\n{}\nCodex {:?} · 保护 {}s · 唤醒 {}s",
-                    snapshot.mode,
-                    snapshot.refresh_mode,
+                    "{:?} · {:?} · {:?} · 周期刷新 {}\n供电 {:?} · 电池阶段 {:?} · 温度 {:?}\n租约 {}\n{}\nAgent {:?} · 提醒 {}s",
+                    snapshot.visibility,
+                    snapshot.activity,
+                    snapshot.work_level,
+                    if snapshot.periodic_refresh_paused {
+                        "按静默许可暂停"
+                    } else {
+                        "运行中"
+                    },
                     snapshot.power_verdict,
+                    snapshot.battery_stage,
                     snapshot.thermal_verdict,
-                    snapshot.reason,
-                    snapshot.codex_phase,
-                    snapshot.codex_protection_remaining_seconds,
+                    if snapshot.observation_lease_active { "有效" } else { "无" },
+                    snapshot.reasons.join(", "),
+                    snapshot.agent_phase,
                     snapshot.attention_remaining_seconds
                 ));
             }
@@ -1327,6 +1476,8 @@ impl MonitorWindow {
             toggle.set_active(card.enabled);
             let card_id = card.id.clone();
             let config = self.config.clone();
+            let action_tx = self.action_tx.clone();
+            let action_handle = self.handle.clone();
             let pages = self.pages.clone();
             let scheduler = self.scheduler.clone();
             let card_metas = self.card_metas.clone();
@@ -1334,9 +1485,14 @@ impl MonitorWindow {
             let scheduler_wake = self.scheduler_wake.clone();
             let current_page_id = self.current_page_id.clone();
             let runtime = self.runtime.clone();
+            let refresh = self.refresh.clone();
+            let file_monitors = self.file_monitors.clone();
+            let file_fallback = self.file_fallback.clone();
+            let source_nodes = self.source_nodes.clone();
+            let config_epoch = self.config_epoch.clone();
             toggle.connect_active_notify(move |switch| {
-                let mut config = config.borrow_mut();
-                let changed_card = config
+                let mut config_manager = config.borrow_mut();
+                let changed_card = config_manager
                     .config_mut()
                     .cards
                     .iter_mut()
@@ -1346,10 +1502,11 @@ impl MonitorWindow {
                         card.clone()
                     });
                 if let Some(card) = changed_card {
-                    if let Err(error) = config.save() {
+                    if let Err(error) = config_manager.save() {
                         tracing::warn!("failed to save card setting: {}", error);
                     }
-                    drop(config);
+                    let cards_for_watchers = config_manager.config().cards.clone();
+                    drop(config_manager);
 
                     if switch.is_active() {
                         previous_results.borrow_mut().remove(&card.id);
@@ -1370,6 +1527,14 @@ impl MonitorWindow {
                                 };
                                 page.add_metric_card(&model, card.display.as_ref());
                                 if let Some(metric_card) = page.get_metric_card(&card.id) {
+                                    bind_metric_action(
+                                        metric_card,
+                                        &card.id,
+                                        config.clone(),
+                                        action_tx.clone(),
+                                        action_handle.clone(),
+                                        runtime.clone(),
+                                    );
                                     let scheduler = scheduler.clone();
                                     let wake = scheduler_wake.clone();
                                     let card_id = card.id.clone();
@@ -1383,11 +1548,19 @@ impl MonitorWindow {
                                         }
                                     });
                                 }
+                                let source_key = source_key_for(card.source.as_ref());
+                                let sampling_consumer_key = next_sampling_consumer_key();
+                                let source_node_key =
+                                    source_node_key(&source_key, &card, sampling_consumer_key);
                                 card_metas.borrow_mut().insert(
                                     card.id.clone(),
                                     CardMeta {
                                         page_id: card.page.clone(),
                                         interval_secs: card.refresh_interval,
+                                        source_key,
+                                        source_node_key,
+                                        config_epoch: config_epoch.get(),
+                                        sampling_consumer_key,
                                     },
                                 );
                                 scheduler.borrow_mut().register_with_policy(
@@ -1396,6 +1569,7 @@ impl MonitorWindow {
                                     &card.page,
                                     task_policy(&card),
                                 );
+                                bind_card_refresh_sources(&mut refresh.borrow_mut(), &card);
                                 scheduler
                                     .borrow_mut()
                                     .set_active_page(&current_page_id.borrow());
@@ -1409,7 +1583,19 @@ impl MonitorWindow {
                         }
                         card_metas.borrow_mut().remove(&card.id);
                         scheduler.borrow_mut().unregister(&card.id);
+                        refresh.borrow_mut().unbind_task(&card.id);
                     }
+                    prune_source_nodes(&source_nodes, &card_metas);
+                    install_file_monitors(
+                        &file_monitors,
+                        &file_fallback,
+                        &cards_for_watchers,
+                        refresh.clone(),
+                        scheduler.clone(),
+                        scheduler_wake.clone(),
+                        card_metas.clone(),
+                        source_nodes.clone(),
+                    );
                 }
             });
             row.append(&toggle);
@@ -1470,15 +1656,17 @@ impl MonitorWindow {
         self.window.add_controller(drag);
 
         let runtime_rx = self.runtime.subscribe();
-        let runtime_config = self.runtime.clone();
         let runtime_scheduler = self.scheduler.clone();
         let runtime_wake = self.scheduler_wake.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(snapshot) = runtime_rx.recv().await {
                 let mut scheduler = runtime_scheduler.borrow_mut();
-                scheduler.set_window_active(snapshot.foreground);
-                scheduler.set_saving_strength(&runtime_config.config().refresh_saving_strength);
-                scheduler.set_refresh_mode(snapshot.refresh_mode);
+                scheduler.set_work_level(
+                    snapshot.work_level,
+                    snapshot.visibility == Visibility::MappedInactive,
+                    snapshot.activity == Activity::Idle,
+                );
+                scheduler.set_periodic_refresh_paused(snapshot.periodic_refresh_paused);
                 drop(scheduler);
                 let _ = runtime_wake.try_send(());
             }
@@ -1506,7 +1694,7 @@ impl MonitorWindow {
 
     fn setup_config_monitor(&mut self) {
         let config_path_buf = config_path();
-        if !config_path_buf.exists() {
+        if !config_path_buf.exists() || !self.config.borrow().config().app.reload_on_change {
             return;
         }
 
@@ -1530,12 +1718,23 @@ impl MonitorWindow {
         let config_ref = self.config.clone();
         let reload_guard = self.reload_guard.clone();
         let runtime = self.runtime.clone();
-        let persistent_sources = self.persistent_sources.clone();
         let previous_results = self.previous_results.clone();
         let scheduler = self.scheduler.clone();
         let scheduler_wake = self.scheduler_wake.clone();
+        let card_metas = self.card_metas.clone();
+        let source_nodes = self.source_nodes.clone();
+        let file_monitors = self.file_monitors.clone();
+        let file_fallback = self.file_fallback.clone();
+        let refresh = self.refresh.clone();
+        let max_output_budget = self.max_output_budget.clone();
+        let config_epoch = self.config_epoch.clone();
 
         let reload: Rc<dyn Fn(gio::FileMonitorEvent)> = Rc::new(move |event_type| {
+            // Keep monitors installed after a true -> false transition so the
+            // transition itself is applied, but ignore later file edges.
+            if !config_ref.borrow().config().app.reload_on_change {
+                return;
+            }
             if matches!(
                 event_type,
                 gio::FileMonitorEvent::Changed
@@ -1549,10 +1748,16 @@ impl MonitorWindow {
                 let guard = reload_guard.clone();
                 let cfg = config_ref.clone();
                 let runtime = runtime.clone();
-                let sources = persistent_sources.clone();
                 let previous_results = previous_results.clone();
                 let scheduler = scheduler.clone();
                 let scheduler_wake = scheduler_wake.clone();
+                let card_metas = card_metas.clone();
+                let source_nodes = source_nodes.clone();
+                let file_monitors = file_monitors.clone();
+                let file_fallback = file_fallback.clone();
+                let refresh = refresh.clone();
+                let max_output_budget = max_output_budget.clone();
+                let config_epoch = config_epoch.clone();
 
                 let should_schedule;
                 {
@@ -1570,14 +1775,80 @@ impl MonitorWindow {
                         *last = Instant::now();
                         should_schedule = None;
                         drop(last);
+                        let (previous, previous_effective) = {
+                            let manager = cfg.borrow();
+                            let raw = manager.config().clone();
+                            let mut effective = raw.clone();
+                            effective.cards =
+                                effective_cards(&raw, manager.uses_default_card_registry());
+                            (raw, effective)
+                        };
                         if do_reload_config(&cfg) {
-                            sources.lock().unwrap().clear();
-                            previous_results.borrow_mut().clear();
-                            for card in &cfg.borrow().config().cards {
-                                scheduler.borrow_mut().request_now(&card.id);
+                            let (next, next_effective) = {
+                                let manager = cfg.borrow();
+                                let raw = manager.config().clone();
+                                let mut effective = raw.clone();
+                                effective.cards =
+                                    effective_cards(&raw, manager.uses_default_card_registry());
+                                (raw, effective)
+                            };
+                            apply_output_budget_change(
+                                &previous,
+                                &next,
+                                &max_output_budget,
+                                &scheduler,
+                                &scheduler_wake,
+                                &card_metas,
+                                &source_nodes,
+                            );
+                            let changed = changed_card_ids(&previous_effective, &next_effective);
+                            for card_id in &changed {
+                                previous_results.borrow_mut().remove(card_id);
+                                invalidate_changed_source_keys(
+                                    &previous_effective,
+                                    &next_effective,
+                                    card_id,
+                                    &source_nodes,
+                                );
+                            }
+                            if !changed.is_empty() {
+                                let next_epoch = config_epoch.get().wrapping_add(1);
+                                reconcile_scheduler_cards(
+                                    &scheduler,
+                                    &card_metas,
+                                    &source_nodes,
+                                    &previous_effective,
+                                    &next_effective,
+                                    &changed,
+                                    next_epoch,
+                                );
+                                rebind_refresh_sources(
+                                    &refresh,
+                                    &previous_effective,
+                                    &next_effective,
+                                    &changed,
+                                );
+                                install_file_monitors(
+                                    &file_monitors,
+                                    &file_fallback,
+                                    &next_effective.cards,
+                                    refresh.clone(),
+                                    scheduler.clone(),
+                                    scheduler_wake.clone(),
+                                    card_metas.clone(),
+                                    source_nodes.clone(),
+                                );
+                                config_epoch.set(next_epoch);
+                            }
+                            for card_id in changed {
+                                if next_effective.cards.iter().any(|card| {
+                                    card.id == card_id && card.enabled && card.schedule.is_none()
+                                }) {
+                                    let _ = scheduler.borrow_mut().request_config_reload(&card_id);
+                                }
                             }
                             let _ = scheduler_wake.try_send(());
-                            runtime.update_config(cfg.borrow().config().runtime.clone());
+                            runtime.update_config(next.runtime);
                         }
                     }
                 }
@@ -1585,24 +1856,102 @@ impl MonitorWindow {
                 if let Some(remaining_ms) = should_schedule {
                     let cfg2 = cfg.clone();
                     let runtime2 = runtime.clone();
-                    let sources2 = sources.clone();
                     let previous_results2 = previous_results.clone();
                     let scheduler2 = scheduler.clone();
                     let scheduler_wake2 = scheduler_wake.clone();
+                    let card_metas2 = card_metas.clone();
+                    let source_nodes2 = source_nodes.clone();
+                    let file_monitors2 = file_monitors.clone();
+                    let file_fallback2 = file_fallback.clone();
+                    let refresh2 = refresh.clone();
+                    let max_output_budget2 = max_output_budget.clone();
+                    let config_epoch2 = config_epoch.clone();
                     let sid_cell = guard.source_id.clone();
 
+                    let sid_cell_for_timer = sid_cell.clone();
                     let sid = glib::timeout_add_local(
                         Duration::from_millis(remaining_ms + 50),
                         move || {
+                            sid_cell_for_timer.borrow_mut().take();
                             guard.pending.replace(false);
+                            let (previous, previous_effective) = {
+                                let manager = cfg2.borrow();
+                                let raw = manager.config().clone();
+                                let mut effective = raw.clone();
+                                effective.cards =
+                                    effective_cards(&raw, manager.uses_default_card_registry());
+                                (raw, effective)
+                            };
                             if do_reload_config(&cfg2) {
-                                sources2.lock().unwrap().clear();
-                                previous_results2.borrow_mut().clear();
-                                for card in &cfg2.borrow().config().cards {
-                                    scheduler2.borrow_mut().request_now(&card.id);
+                                let (next, next_effective) = {
+                                    let manager = cfg2.borrow();
+                                    let raw = manager.config().clone();
+                                    let mut effective = raw.clone();
+                                    effective.cards =
+                                        effective_cards(&raw, manager.uses_default_card_registry());
+                                    (raw, effective)
+                                };
+                                apply_output_budget_change(
+                                    &previous,
+                                    &next,
+                                    &max_output_budget2,
+                                    &scheduler2,
+                                    &scheduler_wake2,
+                                    &card_metas2,
+                                    &source_nodes2,
+                                );
+                                let changed =
+                                    changed_card_ids(&previous_effective, &next_effective);
+                                for card_id in &changed {
+                                    previous_results2.borrow_mut().remove(card_id);
+                                    invalidate_changed_source_keys(
+                                        &previous_effective,
+                                        &next_effective,
+                                        card_id,
+                                        &source_nodes2,
+                                    );
+                                }
+                                if !changed.is_empty() {
+                                    let next_epoch = config_epoch2.get().wrapping_add(1);
+                                    reconcile_scheduler_cards(
+                                        &scheduler2,
+                                        &card_metas2,
+                                        &source_nodes2,
+                                        &previous_effective,
+                                        &next_effective,
+                                        &changed,
+                                        next_epoch,
+                                    );
+                                    rebind_refresh_sources(
+                                        &refresh2,
+                                        &previous_effective,
+                                        &next_effective,
+                                        &changed,
+                                    );
+                                    install_file_monitors(
+                                        &file_monitors2,
+                                        &file_fallback2,
+                                        &next_effective.cards,
+                                        refresh2.clone(),
+                                        scheduler2.clone(),
+                                        scheduler_wake2.clone(),
+                                        card_metas2.clone(),
+                                        source_nodes2.clone(),
+                                    );
+                                    config_epoch2.set(next_epoch);
+                                }
+                                for card_id in changed {
+                                    if next_effective.cards.iter().any(|card| {
+                                        card.id == card_id
+                                            && card.enabled
+                                            && card.schedule.is_none()
+                                    }) {
+                                        let _ =
+                                            scheduler2.borrow_mut().request_config_reload(&card_id);
+                                    }
                                 }
                                 let _ = scheduler_wake2.try_send(());
-                                runtime2.update_config(cfg2.borrow().config().runtime.clone());
+                                runtime2.update_config(next.runtime);
                             }
                             glib::ControlFlow::Break
                         },
@@ -1642,10 +1991,9 @@ impl MonitorWindow {
         let config = self.config.clone();
         let handle = self.handle.clone();
         let metric_ctx = self.metric_ctx.clone();
-        let builtin_metrics = self.builtin_metrics.clone();
-        let persistent_sources = self.persistent_sources.clone();
+        let source_nodes = self.source_nodes.clone();
+        let max_output_budget = self.max_output_budget.clone();
         let metric_tx = self.metric_tx.clone();
-
         glib::MainContext::default().spawn_local(async move {
             loop {
                 let delay = scheduler
@@ -1655,7 +2003,13 @@ impl MonitorWindow {
                     .unwrap_or(Duration::from_secs(3600));
                 let timer = Box::pin(glib::timeout_future(delay.max(Duration::from_millis(10))));
                 let wake = Box::pin(wake_rx.recv());
-                let _ = futures_util::future::select(timer, wake).await;
+                let wake_closed = match futures_util::future::select(timer, wake).await {
+                    futures_util::future::Either::Left((_timer, _wake)) => false,
+                    futures_util::future::Either::Right((result, _timer)) => result.is_err(),
+                };
+                if wake_closed {
+                    break;
+                }
                 crate::core::power_debug::increment(
                     crate::core::power_debug::Counter::SchedulerWake,
                 );
@@ -1666,6 +2020,10 @@ impl MonitorWindow {
                         Some(m) => CardMeta {
                             page_id: m.page_id.clone(),
                             interval_secs: m.interval_secs,
+                            source_key: m.source_key.clone(),
+                            source_node_key: m.source_node_key.clone(),
+                            config_epoch: m.config_epoch,
+                            sampling_consumer_key: m.sampling_consumer_key,
                         },
                         None => continue,
                     };
@@ -1673,7 +2031,8 @@ impl MonitorWindow {
                     scheduler.borrow_mut().mark_started(&card_id);
 
                     let cfg = config.borrow();
-                    let card_cfg = cfg.config().cards.iter().find(|c| c.id == card_id).cloned();
+                    let use_default_cards = cfg.uses_default_card_registry();
+                    let card_cfg = effective_card_config(cfg.config(), &card_id, use_default_cards);
                     drop(cfg);
 
                     let card_cfg = match card_cfg {
@@ -1693,18 +2052,51 @@ impl MonitorWindow {
                         continue;
                     }
 
+                    let source_key = meta.source_key.clone();
+                    let source_revision = scheduler.borrow().active_revision(&card_id);
+                    let revision_key = scheduler
+                        .borrow()
+                        .active_source_key(&card_id)
+                        .map(|key| key.as_str().to_owned());
+                    let task_generation =
+                        scheduler.borrow().generation(&card_id).unwrap_or_default();
+                    // Epochs are owned by each card. An unrelated card reload
+                    // must not reject this card's otherwise current result.
+                    let epoch = meta.config_epoch;
+                    let invalidation_generation = cache::invalidation_token(&source_key);
                     let tx = metric_tx.clone();
                     let h = handle.clone();
                     let ctx = metric_ctx.clone();
-                    let bm = builtin_metrics.clone();
-                    let sources = persistent_sources.clone();
-                    let max_output = config.borrow().config().app.max_output_bytes;
+                    let nodes = source_nodes.clone();
+                    // Read the current budget for cache replay and again inside
+                    // the queued worker immediately before collection.
+                    let max_output = max_output_budget.load(Ordering::Acquire).max(1);
 
                     let source = card_cfg.source.clone();
+                    let node_key = meta.source_node_key.clone();
                     let needs_initial_follow_up = source
                         .as_ref()
                         .is_some_and(|source| source.builtin_metric() == Some("cpu"));
-                    let cache_ttl = card_cfg.cache_ttl_seconds;
+                    // Counter/window metrics own mutable sampling state and
+                    // must not be satisfied by a card-level disk cache. Their
+                    // source node is scoped to this opaque consumer.
+                    let cache_allowed = source.as_ref().is_none_or(|source| {
+                        !matches!(
+                            source,
+                            SourceConfig::Builtin(metric)
+                                if builtin_uses_stateful_sampling(metric)
+                        )
+                    });
+                    let cache_ttl = card_cfg.cache_ttl_seconds.filter(|_| cache_allowed);
+                    let cacheable_source = cache_allowed
+                        && source.as_ref().is_some_and(|source| {
+                            matches!(
+                                source,
+                                SourceConfig::Command(_)
+                                    | SourceConfig::File(_)
+                                    | SourceConfig::Http(_)
+                            )
+                        });
                     let schedule = card_cfg
                         .schedule
                         .as_deref()
@@ -1715,89 +2107,165 @@ impl MonitorWindow {
                             let _ = tx.try_send(MetricUpdate {
                                 card_id,
                                 page_id: meta.page_id,
+                                source_key: source_key.clone(),
+                                source_revision,
+                                revision_key: revision_key.clone(),
+                                config_epoch: epoch,
+                                task_generation,
                                 result: MetricResult::error(error),
+                                collection_health: CollectionHealth::Failed,
+                                max_output_bytes: max_output,
+                                invalidation_generation,
                                 interval_secs: meta.interval_secs,
                                 next_delay: None,
+                                next_deadline: None,
                             });
                             continue;
                         }
                         None => None,
                     };
+                    let schedule_deadline = schedule_state.as_ref().map(|schedule| {
+                        Instant::now() + Duration::from_secs(schedule.next_delay_seconds.max(1))
+                    });
 
                     // Scheduled data is immutable within one configured time slot. Load it
                     // from disk instead of repeating external requests after every launch.
                     if let Some(schedule) = &schedule_state {
-                        let cached = match schedule.period.as_deref() {
-                            Some(period) => cache::load(&card_id, None, Some(period)),
-                            None => cache::load(&card_id, None, None),
+                        if schedule.period.is_none() {
+                            let _ = tx.try_send(MetricUpdate {
+                                card_id,
+                                page_id: meta.page_id,
+                                source_key: source_key.clone(),
+                                source_revision,
+                                revision_key: revision_key.clone(),
+                                invalidation_generation,
+                                config_epoch: epoch,
+                                task_generation,
+                                result: MetricResult::unavailable("等待第一个计划更新时间"),
+                                collection_health: CollectionHealth::Failed,
+                                max_output_bytes: max_output,
+                                interval_secs: schedule.next_delay_seconds,
+                                next_delay: None,
+                                next_deadline: schedule_deadline,
+                            });
+                            continue;
+                        }
+                        let cached = if cache_allowed {
+                            cache::load_with_budget(
+                                &source_key,
+                                None,
+                                schedule.period.as_deref(),
+                                max_output,
+                            )
+                        } else {
+                            None
                         };
                         if let Some(result) = cached {
                             let _ = tx.try_send(MetricUpdate {
                                 card_id,
                                 page_id: meta.page_id,
+                                source_key: source_key.clone(),
+                                source_revision,
+                                revision_key: revision_key.clone(),
+                                config_epoch: epoch,
+                                task_generation,
+                                collection_health: CollectionHealth::cache_hit(),
+                                max_output_bytes: max_output,
+                                invalidation_generation,
                                 result,
                                 interval_secs: schedule.next_delay_seconds,
                                 next_delay: None,
+                                next_deadline: schedule_deadline,
                             });
                             continue;
                         }
-                        if schedule.period.is_none() {
-                            let _ = tx.try_send(MetricUpdate {
-                                card_id,
-                                page_id: meta.page_id,
-                                result: MetricResult::unavailable("等待第一个计划更新时间"),
-                                interval_secs: schedule.next_delay_seconds,
-                                next_delay: None,
-                            });
-                            continue;
-                        }
-                    } else if let Some(result) =
-                        cache_ttl.and_then(|ttl| cache::load(&card_id, Some(ttl), None))
-                    {
+                    } else if let Some(result) = cache_ttl.and_then(|ttl| {
+                        cache::load_with_budget(&source_key, Some(ttl), None, max_output)
+                    }) {
                         let _ = tx.try_send(MetricUpdate {
                             card_id,
                             page_id: meta.page_id,
+                            source_key: source_key.clone(),
+                            source_revision,
+                            revision_key: revision_key.clone(),
+                            config_epoch: epoch,
+                            task_generation,
+                            collection_health: CollectionHealth::cache_hit(),
+                            max_output_bytes: max_output,
+                            invalidation_generation,
                             result,
                             interval_secs: meta.interval_secs,
                             next_delay: None,
+                            next_deadline: None,
                         });
                         continue;
                     }
 
+                    let cache_source_key = source_key.clone();
+                    let collect_source_key = source_key.clone();
+                    let cache_token = cache::invalidation_token(&cache_source_key);
+                    let collection_budget = max_output_budget.clone();
                     h.spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
+                        let collection_budget = collection_budget.load(Ordering::Acquire).max(1);
+                        let mut result = tokio::task::spawn_blocking(move || {
                             crate::core::power_debug::increment(
                                 crate::core::power_debug::Counter::CardCollect,
                             );
                             collect_card_metric(
-                                &card_cfg.id,
+                                &collect_source_key,
+                                &node_key,
                                 &source,
                                 &ctx,
-                                &bm,
-                                &sources,
-                                max_output,
+                                &nodes,
+                                collection_budget,
                             )
                         })
                         .await
                         .unwrap_or_else(|e| {
                             MetricResult::error(format!("metric task panicked: {}", e))
                         });
+                        let collection_health = metric_result_collection_health(&result);
 
-                        if schedule_state.is_some() || cache_ttl.is_some() {
-                            let cache_key = format!("cache:{card_id}");
-                            if let Err(error) = cache::store(
-                                &card_id,
-                                schedule_state
-                                    .as_ref()
-                                    .and_then(|state| state.period.as_deref()),
-                                &result,
-                            ) {
-                                crate::core::error_limiter::warn(
-                                    cache_key.clone(),
-                                    format!("failed to persist cache for {card_id}: {error}"),
-                                );
-                            } else if result.state != MetricState::Error {
-                                crate::core::error_limiter::recovered(&cache_key);
+                        if cache_allowed
+                            && (cacheable_source || schedule_state.is_some() || cache_ttl.is_some())
+                        {
+                            let cache_key = format!("cache:{cache_source_key}");
+                            let period = schedule_state
+                                .as_ref()
+                                .and_then(|state| state.period.as_deref());
+                            if collection_health.is_healthy()
+                                && cache::result_within_output_budget(&result, collection_budget)
+                            {
+                                match cache::store_if_current(
+                                    &cache_source_key,
+                                    period,
+                                    &result,
+                                    cache_token,
+                                ) {
+                                    Ok(true) => crate::core::error_limiter::recovered(&cache_key),
+                                    Ok(false) => {
+                                        // A source edge won the race with this
+                                        // worker. Keep the cache dirty so the
+                                        // follow-up cannot replay this result.
+                                    }
+                                    Err(error) => crate::core::error_limiter::warn(
+                                        cache_key.clone(),
+                                        format!("failed to persist source cache: {error}"),
+                                    ),
+                                }
+                            } else if let Some(last_good) =
+                                cache::load_last_good_with_max_age_and_budget(
+                                    &cache_source_key,
+                                    Some(cache::DEFAULT_LAST_GOOD_MAX_STALENESS_SECONDS),
+                                    period,
+                                    collection_budget,
+                                )
+                            {
+                                // Preserve the last-good visible value after a
+                                // transient command/HTTP/file failure. The
+                                // stale state remains explicit in the model,
+                                // while collection_health keeps backoff.
+                                result = last_good;
                             }
                         }
 
@@ -1811,6 +2279,14 @@ impl MonitorWindow {
                         let _ = tx.try_send(MetricUpdate {
                             card_id,
                             page_id,
+                            source_key,
+                            source_revision,
+                            revision_key,
+                            config_epoch: epoch,
+                            task_generation,
+                            invalidation_generation,
+                            collection_health,
+                            max_output_bytes: collection_budget,
                             next_delay: if needs_initial_follow_up
                                 && result.state == MetricState::Loading
                             {
@@ -1820,6 +2296,7 @@ impl MonitorWindow {
                             },
                             result,
                             interval_secs: interval,
+                            next_deadline: schedule_deadline,
                         });
                     });
                 }
@@ -1833,8 +2310,9 @@ impl MonitorWindow {
         let scheduler = self.scheduler.clone();
         let card_metas = self.card_metas.clone();
         let config = self.config.clone();
-        let runtime = self.runtime.clone();
+        let max_output_budget = self.max_output_budget.clone();
         let scheduler_wake = self.scheduler_wake.clone();
+        let refresh = self.refresh.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(first) = rx.recv().await {
@@ -1844,24 +2322,59 @@ impl MonitorWindow {
                 }
                 let cfg = config.borrow();
                 for update in updates {
-                    let _meta = match card_metas.borrow().get(&update.card_id) {
+                    // A reload may replace a running task with a new
+                    // generation under the same card id. Its old worker must
+                    // not complete or reschedule the replacement task.
+                    if scheduler.borrow().generation(&update.card_id)
+                        != Some(update.task_generation)
+                    {
+                        continue;
+                    }
+                    let meta = match card_metas.borrow().get(&update.card_id) {
                         Some(m) => CardMeta {
                             page_id: m.page_id.clone(),
                             interval_secs: m.interval_secs,
+                            source_key: m.source_key.clone(),
+                            source_node_key: m.source_node_key.clone(),
+                            config_epoch: m.config_epoch,
+                            sampling_consumer_key: m.sampling_consumer_key,
                         },
                         None => continue,
                     };
-
-                    let card_cfg = cfg.config().cards.iter().find(|c| c.id == update.card_id);
-                    let is_cpu = card_cfg
-                        .and_then(|card| card.source.as_ref())
-                        .is_some_and(|source| source.builtin_metric() == Some("cpu"));
-                    if is_cpu {
-                        if let CardValue::Percentage(percent) = &update.result.value {
-                            runtime.report_cpu_activity(*percent);
-                        }
+                    let current_revision = update
+                        .revision_key
+                        .as_deref()
+                        .map(|key| refresh.borrow().revision(&SourceKey::new(key.to_owned())));
+                    if update.config_epoch != meta.config_epoch
+                        || update.source_key != meta.source_key
+                        || update.max_output_bytes
+                            != max_output_budget.load(Ordering::Acquire).max(1)
+                        || cache::invalidation_token(&update.source_key)
+                            != update.invalidation_generation
+                        || current_revision
+                            .is_some_and(|revision| update.source_revision < revision)
+                    {
+                        // A stale worker still has to complete its scheduler
+                        // slot; pending source revisions then produce one
+                        // follow-up rather than being lost.
+                        scheduler
+                            .borrow_mut()
+                            .mark_done_after_revision_with_deadline(
+                                &update.card_id,
+                                update.interval_secs,
+                                update.collection_health.is_healthy(),
+                                None,
+                                update.next_deadline,
+                                update.source_revision,
+                            );
+                        let _ = scheduler_wake.try_send(());
+                        continue;
                     }
-                    let display = card_cfg.and_then(|c| c.display.as_ref()).cloned();
+
+                    let use_default_cards = cfg.uses_default_card_registry();
+                    let card_cfg =
+                        effective_card_config(cfg.config(), &update.card_id, use_default_cards);
+                    let display = card_cfg.as_ref().and_then(|card| card.display.clone());
 
                     let should_skip = {
                         let prev = previous_results.borrow();
@@ -1892,15 +2405,16 @@ impl MonitorWindow {
                             .insert(update.card_id.clone(), update.result.clone());
                     }
 
-                    // A persisted response (including a persisted API error) is a
-                    // completed round and must not trigger short retry wakeups.
-                    let success = update.result.cached || update.result.state != MetricState::Error;
-                    scheduler.borrow_mut().mark_done_after(
-                        &update.card_id,
-                        update.interval_secs,
-                        success,
-                        update.next_delay,
-                    );
+                    scheduler
+                        .borrow_mut()
+                        .mark_done_after_revision_with_deadline(
+                            &update.card_id,
+                            update.interval_secs,
+                            update.collection_health.is_healthy(),
+                            update.next_delay,
+                            update.next_deadline,
+                            update.source_revision,
+                        );
                     let _ = scheduler_wake.try_send(());
                 }
                 drop(cfg);
@@ -1911,6 +2425,16 @@ impl MonitorWindow {
     fn start_action_receiver(&self, rx: async_channel::Receiver<ActionUpdate>) {
         let pages = self.pages.clone();
         let runtime = self.runtime.clone();
+        let config = self.config.clone();
+        let card_metas = self.card_metas.clone();
+        let scheduler = self.scheduler.clone();
+        let scheduler_wake = self.scheduler_wake.clone();
+        let refresh = self.refresh.clone();
+        let source_nodes = self.source_nodes.clone();
+        let completed = Rc::new(RefCell::new(InvocationDedup {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }));
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(first) = rx.recv().await {
@@ -1919,6 +2443,51 @@ impl MonitorWindow {
                     updates.push(update);
                 }
                 for update in updates {
+                    if !completed.borrow_mut().insert(update.invocation_id) {
+                        continue;
+                    }
+
+                    // Action completion is a generic relationship lookup: any
+                    // enabled card linked through click_action is invalidated,
+                    // whether visible, hidden, or on another page. Failure is
+                    // intentionally included because a partial command may
+                    // still have changed observable state.
+                    let linked_cards = linked_card_ids(config.borrow().config(), &update.action_id);
+                    let mut linked_sources = Vec::new();
+                    let mut cards_without_source = Vec::new();
+                    for card_id in linked_cards {
+                        if let Some(meta) = card_metas.borrow().get(&card_id) {
+                            if !linked_sources.iter().any(|key| key == &meta.source_key) {
+                                linked_sources.push(meta.source_key.clone());
+                            }
+                        } else {
+                            cards_without_source.push(card_id);
+                        }
+                    }
+                    linked_sources.sort();
+                    for source_key in linked_sources {
+                        publish_source_event(
+                            &refresh,
+                            &scheduler,
+                            &scheduler_wake,
+                            &card_metas,
+                            &source_nodes,
+                            &source_key,
+                            SourceEventKind::Changed,
+                        );
+                    }
+                    // Keep the generic one-shot behavior for an enabled linked
+                    // card that has no standard source/task (for example a
+                    // plugin-owned control), without inventing source logic.
+                    for card_id in cards_without_source {
+                        let _ = scheduler.borrow_mut().request_with_reason(
+                            &card_id,
+                            RefreshReason::Manual,
+                            SourceRevision::INITIAL,
+                        );
+                    }
+                    let _ = scheduler_wake.try_send(());
+
                     if let Some(card_id) = update.result_card_id.as_deref() {
                         for page in pages.borrow_mut().values_mut() {
                             if let Some(card) = page.get_metric_card(card_id) {
@@ -1932,7 +2501,6 @@ impl MonitorWindow {
                                 break;
                             }
                         }
-                        continue;
                     }
                     for (_page_id, page) in pages.borrow_mut().iter_mut() {
                         if let Some(card) = page.get_action_card(&update.action_id) {
@@ -1956,12 +2524,585 @@ impl MonitorWindow {
     }
 }
 
-fn collect_card_metric(
+impl Drop for MonitorWindow {
+    fn drop(&mut self) {
+        // Closing the channels wakes the controller-owned local consumers even
+        // when a task still retains a sender clone. Runtime subscriptions need
+        // the same explicit boundary because RuntimeManager is also retained
+        // by those consumers.
+        self.metric_tx.close();
+        self.action_tx.close();
+        self.scheduler_wake.close();
+        self.runtime.shutdown();
+
+        if let Some(source) = self.file_fallback.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(source) = self.network_fallback.take() {
+            source.remove();
+        }
+        if let Some(source) = self.network_debounce.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(source) = self.reload_guard.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some((connection, subscription)) = self.network_dbus.take() {
+            connection.signal_unsubscribe(subscription);
+        }
+    }
+}
+
+fn effective_cards(config: &AppConfig, use_default_cards: bool) -> Vec<CardConfig> {
+    if !use_default_cards {
+        return config
+            .cards
+            .iter()
+            .filter(|card| card.enabled)
+            .cloned()
+            .collect();
+    }
+    // The root owns the default-registry decision. Generated module entries
+    // layer over the shipped registry, and removing an override reveals the
+    // shipped card again rather than deleting its runtime metadata.
+    let mut cards = default_builtin_cards();
+    for configured in config.cards.iter().filter(|card| card.enabled) {
+        if let Some(existing) = cards.iter_mut().find(|card| card.id == configured.id) {
+            *existing = configured.clone();
+        } else {
+            cards.push(configured.clone());
+        }
+    }
+    cards
+}
+
+fn effective_card_config(
+    config: &AppConfig,
     card_id: &str,
+    use_default_cards: bool,
+) -> Option<CardConfig> {
+    effective_cards(config, use_default_cards)
+        .into_iter()
+        .find(|card| card.id == card_id)
+}
+
+fn changed_card_ids(
+    previous: &crate::core::config::AppConfig,
+    next: &crate::core::config::AppConfig,
+) -> Vec<String> {
+    let mut ids = std::collections::HashSet::new();
+    ids.extend(previous.cards.iter().map(|card| card.id.clone()));
+    ids.extend(next.cards.iter().map(|card| card.id.clone()));
+    let mut changed = ids
+        .into_iter()
+        .filter(|id| {
+            let before = previous.cards.iter().find(|card| &card.id == id);
+            let after = next.cards.iter().find(|card| &card.id == id);
+            match (before, after) {
+                (Some(before), Some(after)) => {
+                    serde_json::to_string(before).ok() != serde_json::to_string(after).ok()
+                }
+                _ => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
+fn apply_output_budget_change(
+    previous: &AppConfig,
+    next: &AppConfig,
+    budget: &Arc<AtomicUsize>,
+    scheduler: &Rc<RefCell<Scheduler>>,
+    wake: &async_channel::Sender<()>,
+    card_metas: &Rc<RefCell<HashMap<String, CardMeta>>>,
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+) {
+    let previous_budget = previous.app.max_output_bytes.max(1);
+    let next_budget = next.app.max_output_bytes.max(1);
+    if previous_budget == next_budget {
+        return;
+    }
+    budget.store(next_budget, Ordering::Release);
+
+    let active_cards = card_metas
+        .borrow()
+        .iter()
+        .map(|(card_id, meta)| (card_id.clone(), meta.source_key.clone()))
+        .collect::<Vec<_>>();
+    for (_, source_key) in &active_cards {
+        invalidate_source(source_nodes, source_key);
+        cache::invalidate(source_key);
+    }
+    for (card_id, _) in active_cards {
+        let scheduled = next
+            .cards
+            .iter()
+            .find(|card| card.id == card_id)
+            .is_some_and(|card| card.schedule.is_some());
+        if !scheduled {
+            let _ = scheduler.borrow_mut().request_config_reload(&card_id);
+        }
+    }
+    let _ = wake.try_send(());
+}
+
+fn rebind_refresh_sources(
+    refresh: &Rc<RefCell<RefreshCoordinator>>,
+    previous: &crate::core::config::AppConfig,
+    next: &crate::core::config::AppConfig,
+    changed: &[String],
+) {
+    let mut coordinator = refresh.borrow_mut();
+    for card_id in changed {
+        coordinator.unbind_task(card_id);
+    }
+    for card in next.cards.iter().filter(|card| card.enabled) {
+        // Unchanged cards retain their source revision. Changed/new cards were
+        // unbound above (or were absent) and are installed with fresh edges.
+        if previous.cards.iter().any(|current| {
+            current.id == card.id
+                && !changed.iter().any(|changed_id| changed_id == &card.id)
+                && current.enabled
+        }) {
+            continue;
+        }
+        bind_card_refresh_sources(&mut coordinator, card);
+    }
+}
+
+fn bind_card_refresh_sources(coordinator: &mut RefreshCoordinator, card: &CardConfig) {
+    let source_key = source_key_for(card.source.as_ref());
+    coordinator.register_source(source_key.clone());
+    coordinator.bind(source_key, card.id.clone());
+    if card
+        .source
+        .as_ref()
+        .and_then(SourceConfig::builtin_metric)
+        .is_some_and(|metric| {
+            matches!(metric, "battery_capacity" | "battery_temperature" | "power")
+        })
+    {
+        coordinator.bind("signal:power-supply", card.id.clone());
+    }
+    if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("network") {
+        coordinator.bind("signal:network", card.id.clone());
+    }
+    if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("cpu_temperature") {
+        coordinator.bind("signal:thermal", card.id.clone());
+    }
+}
+
+fn reconcile_scheduler_cards(
+    scheduler: &Rc<RefCell<Scheduler>>,
+    card_metas: &Rc<RefCell<HashMap<String, CardMeta>>>,
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    previous: &crate::core::config::AppConfig,
+    next: &crate::core::config::AppConfig,
+    changed: &[String],
+    config_epoch: u64,
+) {
+    let mut scheduler = scheduler.borrow_mut();
+    let mut metas = card_metas.borrow_mut();
+    for card_id in changed {
+        let Some(card) = next
+            .cards
+            .iter()
+            .find(|card| card.id == *card_id && card.enabled)
+        else {
+            scheduler.unregister(card_id);
+            metas.remove(card_id);
+            continue;
+        };
+
+        // Keep an active runtime in place across a reload. Re-registering it
+        // would create a fresh due heap entry while the old wall-clock slot is
+        // still collecting. The old worker keeps its generation and completes
+        // the active slot before the rebound policy schedules another one.
+        if scheduler.is_running(card_id) {
+            if let Some(meta) = metas.get_mut(card_id) {
+                scheduler.rebind_with_policy(
+                    card_id,
+                    card.refresh_interval,
+                    &card.page,
+                    task_policy(card),
+                );
+                meta.page_id = card.page.clone();
+                meta.interval_secs = card.refresh_interval;
+                meta.source_key = source_key_for(card.source.as_ref());
+                meta.source_node_key =
+                    source_node_key(&meta.source_key, card, meta.sampling_consumer_key);
+                meta.config_epoch = config_epoch;
+                continue;
+            }
+        }
+
+        let preserved_deadline = previous
+            .cards
+            .iter()
+            .find(|before| before.id == *card_id && before.schedule.is_some())
+            .filter(|before| card.schedule == before.schedule)
+            .and_then(|_| scheduler.next_run(card_id));
+        scheduler.unregister(card_id);
+
+        // Existing UI cards can be rebound in place. A newly added card still
+        // requires the normal page rebuild before it can own a GTK widget.
+        if let Some(meta) = metas.get_mut(card_id) {
+            meta.page_id = card.page.clone();
+            meta.interval_secs = card.refresh_interval;
+            meta.source_key = source_key_for(card.source.as_ref());
+            meta.source_node_key =
+                source_node_key(&meta.source_key, card, meta.sampling_consumer_key);
+            meta.config_epoch = config_epoch;
+            scheduler.register_with_policy(
+                card_id,
+                card.refresh_interval,
+                &card.page,
+                task_policy(card),
+            );
+            if let Some(deadline) = preserved_deadline {
+                scheduler.restore_deadline(card_id, deadline);
+            }
+        }
+    }
+    drop(metas);
+    drop(scheduler);
+    prune_source_nodes(source_nodes, card_metas);
+}
+
+fn invalidate_changed_source_keys(
+    previous: &crate::core::config::AppConfig,
+    next: &crate::core::config::AppConfig,
+    card_id: &str,
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+) {
+    for config in [
+        previous.cards.iter().find(|card| card.id == card_id),
+        next.cards.iter().find(|card| card.id == card_id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let key = source_key_for(config.source.as_ref());
+        invalidate_source(source_nodes, &key);
+        cache::invalidate(&key);
+    }
+}
+
+fn linked_card_ids(config: &crate::core::config::AppConfig, action_id: &str) -> Vec<String> {
+    let mut cards = config
+        .cards
+        .iter()
+        .filter(|card| card.enabled && card.click_action.as_deref() == Some(action_id))
+        .map(|card| card.id.clone())
+        .collect::<Vec<_>>();
+    cards.sort();
+    cards
+}
+
+fn source_key_for(source: Option<&SourceConfig>) -> String {
+    match source {
+        None => "source:none".into(),
+        Some(SourceConfig::Builtin(metric)) => format!("builtin:{metric}"),
+        Some(SourceConfig::File(file)) => {
+            format!("file:path={:?};first_line={}", file.path, file.first_line)
+        }
+        Some(SourceConfig::Command(command)) => format!(
+            "command:run={:?};timeout={};max_output={};reverse_lines={};subtitle_lines={}",
+            command.run,
+            command.timeout_seconds,
+            command.max_output_bytes,
+            command.reverse_lines,
+            command.subtitle_lines
+        ),
+        Some(SourceConfig::Http(http)) => {
+            let mut headers = http
+                .headers
+                .as_ref()
+                .map(|headers| headers.iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            headers.sort_by(|left, right| left.0.cmp(right.0));
+            format!(
+                "http:url={:?};method={:?};headers={:?};body={:?};timeout={};max_output={};parser={:?}",
+                http.url,
+                http.method,
+                headers,
+                http.body,
+                http.timeout_seconds,
+                http.max_output_bytes,
+                http.parser
+            )
+        }
+        Some(SourceConfig::Text(value)) => format!("text:{value:?}"),
+    }
+}
+
+fn install_file_monitors(
+    file_monitors: &Rc<RefCell<Vec<gio::FileMonitor>>>,
+    file_fallback: &Rc<RefCell<Option<glib::SourceId>>>,
+    cards: &[CardConfig],
+    refresh: Rc<RefCell<RefreshCoordinator>>,
+    scheduler: Rc<RefCell<Scheduler>>,
+    wake: async_channel::Sender<()>,
+    card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
+    source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+) {
+    file_monitors.borrow_mut().clear();
+    if let Some(source) = file_fallback.borrow_mut().take() {
+        source.remove();
+    }
+    let mut watched = std::collections::HashSet::new();
+    for card in cards.iter().filter(|card| card.enabled) {
+        let Some(SourceConfig::File(file_source)) = card.source.as_ref() else {
+            continue;
+        };
+        let path = PathBuf::from(&file_source.path);
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let Some(watch_key) = nearest_existing_directory(parent) else {
+            continue;
+        };
+        if !watched.insert(watch_key.clone()) {
+            continue;
+        }
+        let Ok(monitor) = gio::File::for_path(&watch_key)
+            .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        else {
+            continue;
+        };
+        let refresh = refresh.clone();
+        let scheduler = scheduler.clone();
+        let wake = wake.clone();
+        let card_metas = card_metas.clone();
+        let source_nodes = source_nodes.clone();
+        let cards = cards
+            .iter()
+            .filter(|card| card.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        monitor.connect_changed(move |_, file, other_file, event| {
+            if !matches!(
+                event,
+                gio::FileMonitorEvent::Changed
+                    | gio::FileMonitorEvent::ChangesDoneHint
+                    | gio::FileMonitorEvent::Created
+                    | gio::FileMonitorEvent::Deleted
+                    | gio::FileMonitorEvent::Moved
+                    | gio::FileMonitorEvent::MovedIn
+                    | gio::FileMonitorEvent::MovedOut
+                    | gio::FileMonitorEvent::Renamed
+            ) {
+                return;
+            }
+            let file_path = file.path();
+            let other_path = other_file.and_then(|other| other.path());
+            for card in &cards {
+                let Some(SourceConfig::File(file_source)) = card.source.as_ref() else {
+                    continue;
+                };
+                let target = PathBuf::from(&file_source.path);
+                if file_event_matches_target(
+                    file_path.as_deref(),
+                    other_path.as_deref(),
+                    target.as_path(),
+                ) {
+                    publish_source_event(
+                        &refresh,
+                        &scheduler,
+                        &wake,
+                        &card_metas,
+                        &source_nodes,
+                        &source_key_for(card.source.as_ref()),
+                        SourceEventKind::Changed,
+                    );
+                }
+            }
+        });
+        file_monitors.borrow_mut().push(monitor);
+    }
+
+    let mut source_keys = cards
+        .iter()
+        .filter(|card| card.enabled)
+        .filter_map(|card| {
+            card.source
+                .as_ref()
+                .is_some_and(|source| matches!(source, SourceConfig::File(_)))
+                .then(|| source_key_for(card.source.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    source_keys.sort();
+    source_keys.dedup();
+    if !source_keys.is_empty() {
+        let source = glib::timeout_add_local(Duration::from_secs(60), move || {
+            for key in &source_keys {
+                publish_source_event(
+                    &refresh,
+                    &scheduler,
+                    &wake,
+                    &card_metas,
+                    &source_nodes,
+                    key,
+                    SourceEventKind::Changed,
+                );
+            }
+            glib::ControlFlow::Continue
+        });
+        file_fallback.replace(Some(source));
+    }
+}
+
+fn nearest_existing_directory(path: &std::path::Path) -> Option<PathBuf> {
+    let mut current = path;
+    loop {
+        if current.is_dir() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn file_event_matches_target(
+    file_path: Option<&std::path::Path>,
+    other_path: Option<&std::path::Path>,
+    target: &std::path::Path,
+) -> bool {
+    let absolute_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(target))
+            .unwrap_or_else(|_| target.to_path_buf())
+    };
+    let target_parent = absolute_target.parent();
+    [file_path, other_path].into_iter().flatten().any(|path| {
+        if path == target || path == absolute_target || target_parent == Some(path) {
+            return true;
+        }
+        // If the configured parent did not exist when monitoring started,
+        // watching its nearest existing ancestor still catches creation of a
+        // path component and allows the first refresh to observe the file.
+        if absolute_target.starts_with(path) {
+            return true;
+        }
+        match (
+            std::fs::canonicalize(path),
+            std::fs::canonicalize(&absolute_target),
+        ) {
+            (Ok(path), Ok(target)) => path == target,
+            _ => false,
+        }
+    })
+}
+
+fn publish_source_event(
+    refresh: &Rc<RefCell<RefreshCoordinator>>,
+    scheduler: &Rc<RefCell<Scheduler>>,
+    wake: &async_channel::Sender<()>,
+    card_metas: &Rc<RefCell<HashMap<String, CardMeta>>>,
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    source_key: &str,
+    kind: SourceEventKind,
+) {
+    let source_key = SourceKey::new(source_key);
+    invalidate_source(source_nodes, source_key.as_str());
+    cache::invalidate(source_key.as_str());
+    let (_, requests) = refresh.borrow_mut().publish(source_key, kind);
+    let had_requests = !requests.is_empty();
+    let mut projection_keys = Vec::new();
+    for request in &requests {
+        // A signal source is intentionally separate from a card's canonical
+        // source key. Invalidate each dependent projection once, or a
+        // cache_ttl card could replay the pre-edge value before collecting.
+        if let Some(meta) = card_metas.borrow().get(&request.task) {
+            if !projection_keys.iter().any(|key| key == &meta.source_key) {
+                projection_keys.push(meta.source_key.clone());
+            }
+        }
+    }
+    for key in projection_keys {
+        invalidate_source(source_nodes, &key);
+        cache::invalidate(&key);
+    }
+    for request in requests {
+        let _ = scheduler.borrow_mut().request_with_reason(
+            &request.task,
+            request.reason,
+            request.requested_revision,
+        );
+    }
+    if had_requests {
+        let _ = wake.try_send(());
+    }
+}
+
+fn invalidate_source(
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    source_key: &str,
+) {
+    let nodes = source_nodes
+        .lock()
+        .ok()
+        .map(|nodes| {
+            nodes
+                .values()
+                .filter(|node| node.descriptor_key == source_key)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // The collector may be blocking on a command/HTTP request. Keep the GTK
+    // event path non-blocking; the atomic generation makes the next caller
+    // bypass the short source coalescing window.
+    for node in nodes {
+        node.invalidate();
+    }
+}
+
+fn next_sampling_consumer_key() -> u64 {
+    NEXT_SAMPLING_CONSUMER_KEY.fetch_add(1, Ordering::Relaxed)
+}
+
+fn source_node_key(source_key: &str, card: &CardConfig, consumer_key: u64) -> String {
+    let Some(metric) = card.source.as_ref().and_then(SourceConfig::builtin_metric) else {
+        return source_key.to_owned();
+    };
+    if !builtin_uses_stateful_sampling(metric) {
+        return source_key.to_owned();
+    }
+    // Stateful collectors hold deltas/windows between samples. Keep their
+    // state separate for independent consumers while retaining the canonical
+    // descriptor for event fan-out and cache identity. The consumer key is an
+    // opaque in-memory lifetime token, never a card/device/path identifier.
+    format!(
+        "{source_key};sampling=refresh:{};schedule:{:?};runtime:{:?};consumer:{consumer_key}",
+        card.refresh_interval, card.schedule, card.runtime
+    )
+}
+
+fn prune_source_nodes(
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    card_metas: &Rc<RefCell<HashMap<String, CardMeta>>>,
+) {
+    let active_node_keys = card_metas
+        .borrow()
+        .values()
+        .map(|meta| meta.source_node_key.clone())
+        .collect::<std::collections::HashSet<_>>();
+    if let Ok(mut nodes) = source_nodes.lock() {
+        nodes.retain(|key, _| active_node_keys.contains(key));
+    }
+}
+
+fn collect_card_metric(
+    source_key: &str,
+    node_key: &str,
     source: &Option<SourceConfig>,
     ctx: &Arc<MetricContext>,
-    builtin_metrics: &Arc<Mutex<HashMap<String, Arc<Mutex<BuiltinMetric>>>>>,
-    persistent_sources: &Arc<Mutex<HashMap<String, Arc<Mutex<PersistentSource>>>>>,
+    source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
     max_output: usize,
 ) -> MetricResult {
     let source = match source {
@@ -1980,59 +3121,55 @@ fn collect_card_metric(
 
     match source {
         SourceConfig::Builtin(metric_name) => {
-            // Keep registry lookup and insertion under one guard. An `if let`
-            // directly on `lock()` keeps its temporary guard alive through the
-            // entire expression; trying to lock again in the `else` branch then
-            // deadlocks the blocking worker pool and leaves every native card
-            // blank.
-            let builtin = {
-                let mut registry = builtin_metrics.lock().unwrap();
-                if let Some(metric) = registry.get(card_id).cloned() {
-                    metric
+            let node = {
+                let mut registry = source_nodes.lock().unwrap();
+                if let Some(node) = registry.get(node_key).cloned() {
+                    node
                 } else {
-                    let new_metric = match create_builtin_metric(metric_name) {
+                    let metric = match create_builtin_metric(metric_name) {
                         Some(metric) => metric,
                         None => {
                             return MetricResult::error(format!("未知的内置指标: {metric_name}"));
                         }
                     };
-                    let metric = Arc::new(Mutex::new(new_metric));
-                    registry.insert(card_id.to_string(), metric.clone());
-                    metric
+                    let node = Arc::new(SourceNode::new(
+                        SourceCollector::Builtin(metric),
+                        source_key.to_string(),
+                    ));
+                    registry.insert(node_key.to_string(), node.clone());
+                    node
                 }
             };
-            let result = builtin.lock().unwrap().collect(ctx);
-            result
+            node.collect(ctx, max_output)
         }
 
         SourceConfig::Command(_)
         | SourceConfig::File(_)
         | SourceConfig::Http(_)
         | SourceConfig::Text(_) => {
-            let persistent = {
-                let mut registry = persistent_sources.lock().unwrap();
-                if let Some(source) = registry.get(card_id).cloned() {
-                    source
+            let node = {
+                let mut registry = source_nodes.lock().unwrap();
+                if let Some(node) = registry.get(node_key).cloned() {
+                    node
                 } else {
-                    let source = match build_persistent_source(source, max_output) {
+                    let source = match build_persistent_source(source) {
                         Ok(source) => source,
                         Err(result) => return result,
                     };
-                    let source = Arc::new(Mutex::new(source));
-                    registry.insert(card_id.to_string(), source.clone());
-                    source
+                    let node = Arc::new(SourceNode::new(
+                        SourceCollector::Persistent(source),
+                        source_key.to_string(),
+                    ));
+                    registry.insert(node_key.to_string(), node.clone());
+                    node
                 }
             };
-            let result = persistent.lock().unwrap().collect(ctx);
-            result
+            node.collect(ctx, max_output)
         }
     }
 }
 
-fn build_persistent_source(
-    source: &SourceConfig,
-    max_output: usize,
-) -> Result<PersistentSource, MetricResult> {
+fn build_persistent_source(source: &SourceConfig) -> Result<PersistentSource, MetricResult> {
     match source {
         SourceConfig::Command(command) => {
             let (program, args) = command
@@ -2040,7 +3177,7 @@ fn build_persistent_source(
                 .split_first()
                 .map(|(program, args)| (program.clone(), args.to_vec()))
                 .ok_or_else(|| MetricResult::error("command.run 至少需要一个程序名"))?;
-            let max_out = command.max_output_bytes.min(max_output).max(1);
+            let max_out = command.max_output_bytes.max(1);
 
             Ok(PersistentSource::Command(CommandMetric::new(
                 program,
@@ -2056,7 +3193,7 @@ fn build_persistent_source(
             file.first_line,
         ))),
         SourceConfig::Http(http) => {
-            let max_out = http.max_output_bytes.min(max_output).max(1);
+            let max_out = http.max_output_bytes.max(1);
 
             Ok(PersistentSource::Http(HttpMetric::new(
                 http.url.clone(),
@@ -2089,44 +3226,32 @@ fn task_policy(card: &CardConfig) -> TaskPolicy {
         .as_ref()
         .and_then(SourceConfig::builtin_metric)
         .unwrap_or_default();
-    let class = match card.runtime.class {
-        CardRuntimeClass::SystemRealtime => TaskClass::SystemRealtime,
-        CardRuntimeClass::NetworkRate => TaskClass::NetworkRate,
-        CardRuntimeClass::NetworkStatus => TaskClass::NetworkStatus,
-        CardRuntimeClass::BatteryThermal => TaskClass::BatteryThermal,
-        CardRuntimeClass::Command => TaskClass::Command,
-        CardRuntimeClass::Http => TaskClass::Http,
-        CardRuntimeClass::File => TaskClass::File,
-        CardRuntimeClass::Static => TaskClass::Static,
-        CardRuntimeClass::Auto => match source_type {
-            Some(SourceKind::Command) => TaskClass::Command,
-            Some(SourceKind::Http) => TaskClass::Http,
-            Some(SourceKind::File) => TaskClass::File,
-            Some(SourceKind::Text) => TaskClass::Static,
-            Some(SourceKind::Builtin)
-                if matches!(
-                    metric,
-                    "battery_capacity" | "battery_temperature" | "power" | "cpu_temperature"
-                ) =>
-            {
-                TaskClass::BatteryThermal
-            }
-            Some(SourceKind::Builtin) if metric == "network_traffic" => TaskClass::NetworkRate,
-            Some(SourceKind::Builtin) if metric == "network" => TaskClass::NetworkStatus,
-            Some(SourceKind::Builtin) => TaskClass::SystemRealtime,
-            _ => TaskClass::Other,
+    let workload = match card.runtime.workload {
+        CardWorkload::Live => Workload::Live,
+        CardWorkload::Normal => Workload::Normal,
+        CardWorkload::Expensive => Workload::Expensive,
+        CardWorkload::Event => Workload::Event,
+        CardWorkload::Auto => match source_type {
+            Some(SourceKind::Command | SourceKind::Http) => Workload::Expensive,
+            Some(SourceKind::File | SourceKind::Text) => Workload::Event,
+            Some(SourceKind::Builtin) if builtin_is_event_driven(metric) => Workload::Event,
+            Some(SourceKind::Builtin) if metric == "network_traffic" => Workload::Live,
+            Some(SourceKind::Builtin) => Workload::Normal,
+            _ => Workload::Normal,
         },
     };
+    let behavior = |value| match value {
+        CardWorkBehavior::Inherit => WorkBehavior::Inherit,
+        CardWorkBehavior::Keep => WorkBehavior::Keep,
+        CardWorkBehavior::Throttle => WorkBehavior::Throttle,
+        CardWorkBehavior::Pause => WorkBehavior::Pause,
+    };
     TaskPolicy {
-        class,
-        idle_behavior: if card.runtime.idle_behavior == CardIdleBehavior::Pause {
-            IdleBehavior::Pause
-        } else {
-            IdleBehavior::Throttle
-        },
-        idle_multiplier: card.runtime.idle_multiplier,
-        external_realtime: card.runtime.external_realtime,
-        realtime_multiplier: card.runtime.realtime_multiplier,
+        workload,
+        inactive_behavior: behavior(card.runtime.inactive_behavior),
+        idle_behavior: behavior(card.runtime.idle_behavior),
+        inactive_interval_secs: card.runtime.inactive_interval_seconds,
+        idle_interval_secs: card.runtime.idle_interval_seconds,
         minimum_interval_secs: card.runtime.minimum_interval_seconds,
         scheduled: card.schedule.is_some(),
     }
@@ -2261,6 +3386,10 @@ fn update_idle_clock(time: &gtk::Label, status: &gtk::Label) {
     status.set_margin_bottom((-vertical).max(0) as i32);
 }
 
+fn metric_result_collection_health(result: &MetricResult) -> CollectionHealth {
+    CollectionHealth::from_collector(result)
+}
+
 fn results_equivalent(
     prev: &MetricResult,
     curr: &MetricResult,
@@ -2277,28 +3406,28 @@ fn results_equivalent(
             CardValue::Number {
                 value: pv,
                 unit: pu,
-                ..
+                decimals: pdecimals,
             },
             CardValue::Number {
                 value: cv,
                 unit: cu,
-                ..
+                decimals: cdecimals,
             },
         ) = (&prev.value, &curr.value)
         {
-            if pu == cu {
-                let diff = (cv - pv).abs();
-                if diff < threshold {
-                    // Subtitle and tooltip are commonly formatted from the same
-                    // sample. Do not let their rounding bypass minimum_change.
-                    return true;
-                }
+            if pu == cu
+                && pdecimals == cdecimals
+                && (cv - pv).abs() < threshold
+                && prev.subtitle == curr.subtitle
+                && prev.tooltip == curr.tooltip
+            {
+                return true;
             }
         }
 
         if let (CardValue::Percentage(pp), CardValue::Percentage(pc)) = (&prev.value, &curr.value) {
             let diff = (pc - pp).abs();
-            if diff < threshold {
+            if diff < threshold && prev.subtitle == curr.subtitle && prev.tooltip == curr.tooltip {
                 return true;
             }
         }
@@ -2348,16 +3477,212 @@ fn apply_metric_result(
     }
 }
 
+fn current_action_config(
+    config: &Rc<RefCell<ConfigManager>>,
+    action_id: &str,
+) -> Option<crate::core::config::ActionConfig> {
+    config
+        .borrow()
+        .config()
+        .actions
+        .iter()
+        .find(|action| action.id == action_id)
+        .cloned()
+}
+
+fn current_card_action(
+    config: &Rc<RefCell<ConfigManager>>,
+    card_id: &str,
+) -> Option<crate::core::config::ActionConfig> {
+    let config = config.borrow();
+    let action_id = config
+        .config()
+        .cards
+        .iter()
+        .find(|card| card.id == card_id)
+        .and_then(|card| card.click_action.as_deref())?;
+    config
+        .config()
+        .actions
+        .iter()
+        .find(|action| action.id == action_id)
+        .cloned()
+}
+
+fn execute_card_action(
+    config: &Rc<RefCell<ConfigManager>>,
+    card_id: &str,
+    action_tx: &async_channel::Sender<ActionUpdate>,
+    handle: &tokio::runtime::Handle,
+    result_card_id: Option<String>,
+    set_running: Option<&Rc<dyn Fn(bool)>>,
+) {
+    let Some(action_cfg) = current_card_action(config, card_id) else {
+        tracing::warn!(card = %card_id, "card click action is no longer configured");
+        return;
+    };
+    if let Some(set_running) = set_running {
+        set_running(true);
+    }
+    execute_action_async(
+        action_cfg,
+        action_tx.clone(),
+        handle.clone(),
+        config.clone(),
+        result_card_id,
+    );
+}
+
+fn bind_metric_action(
+    metric_card: &crate::ui::metric_card::MetricCard,
+    card_id: &str,
+    config: Rc<RefCell<ConfigManager>>,
+    action_tx: async_channel::Sender<ActionUpdate>,
+    handle: tokio::runtime::Handle,
+    runtime: RuntimeHandle,
+) {
+    let has_click_action = config
+        .borrow()
+        .config()
+        .cards
+        .iter()
+        .find(|card| card.id == card_id)
+        .and_then(|card| card.click_action.as_ref())
+        .is_some();
+    if !has_click_action {
+        return;
+    }
+
+    metric_card.set_action_enabled(true);
+    let action_controls = match &metric_card.render_widgets {
+        crate::ui::metric_card::RenderWidgets::Action(widgets) => Some(widgets.clone()),
+        _ => None,
+    };
+    let set_running = action_controls.as_ref().map(|controls| {
+        let controls = controls.clone();
+        Rc::new(move |running| controls.set_running(running)) as Rc<dyn Fn(bool)>
+    });
+    if let Some(controls) = action_controls {
+        let config = config.clone();
+        let action_tx = action_tx.clone();
+        let handle = handle.clone();
+        let runtime = runtime.clone();
+        let card_id = card_id.to_owned();
+        let set_running = set_running.clone();
+        controls.button.connect_clicked(move |button| {
+            runtime.report_user_activity(UserActivity::Click);
+            let Some(action) = current_card_action(&config, &card_id) else {
+                tracing::warn!(card = %card_id, "card click action is no longer configured");
+                return;
+            };
+            let (confirm_title, confirm_detail) = action_confirmation_text(&action);
+            let run = {
+                let config = config.clone();
+                let action_tx = action_tx.clone();
+                let handle = handle.clone();
+                let card_id = card_id.clone();
+                let set_running = set_running.clone();
+                move || {
+                    execute_card_action(
+                        &config,
+                        &card_id,
+                        &action_tx,
+                        &handle,
+                        Some(card_id.clone()),
+                        set_running.as_ref(),
+                    );
+                }
+            };
+            if action.confirm {
+                confirm_action(
+                    button.upcast_ref(),
+                    &confirm_title,
+                    &confirm_detail,
+                    runtime.clone(),
+                    run,
+                );
+            } else {
+                run();
+            }
+        });
+    }
+
+    metric_card.card.add_css_class("click-action-card");
+    metric_card.card.set_cursor_from_name(Some("pointer"));
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_PRIMARY);
+    let config_for_click = config.clone();
+    let action_tx_for_click = action_tx.clone();
+    let handle_for_click = handle.clone();
+    let runtime_for_click = runtime.clone();
+    let card_id_for_click = card_id.to_owned();
+    let set_running_for_click = set_running.clone();
+    click.connect_released(move |gesture, presses, x, y| {
+        if presses != 1 {
+            return;
+        }
+        let Some(widget) = gesture.widget() else {
+            return;
+        };
+        if widget
+            .pick(x, y, gtk::PickFlags::DEFAULT)
+            .is_some_and(|target| widget_or_ancestor_is_button(target, &widget))
+        {
+            return;
+        }
+        runtime_for_click.report_user_activity(UserActivity::Click);
+        let Some(action) = current_card_action(&config_for_click, &card_id_for_click) else {
+            tracing::warn!(card = %card_id_for_click, "card click action is no longer configured");
+            return;
+        };
+        let (confirm_title, confirm_detail) = action_confirmation_text(&action);
+        let run = {
+            let config = config_for_click.clone();
+            let action_tx = action_tx_for_click.clone();
+            let handle = handle_for_click.clone();
+            let card_id = card_id_for_click.clone();
+            let set_running = set_running_for_click.clone();
+            move || {
+                execute_card_action(
+                    &config,
+                    &card_id,
+                    &action_tx,
+                    &handle,
+                    Some(card_id.clone()),
+                    set_running.as_ref(),
+                );
+            }
+        };
+        if action.confirm {
+            confirm_action(
+                &widget,
+                &confirm_title,
+                &confirm_detail,
+                runtime_for_click.clone(),
+                run,
+            );
+        } else {
+            run();
+        }
+    });
+    metric_card.card.add_controller(click);
+}
+
 fn execute_action_async(
     action_cfg: crate::core::config::ActionConfig,
     tx: async_channel::Sender<ActionUpdate>,
     handle: tokio::runtime::Handle,
-    global_max_output: usize,
+    config: Rc<RefCell<ConfigManager>>,
     result_card_id: Option<String>,
 ) {
+    static NEXT_ACTION_INVOCATION: AtomicU64 = AtomicU64::new(1);
+    let invocation_id = NEXT_ACTION_INVOCATION.fetch_add(1, Ordering::Relaxed);
     let action_id = action_cfg.id.clone();
     let command_parts = action_cfg.command.clone().unwrap_or_default();
     let timeout = action_cfg.timeout;
+    // Read the global cap at invocation time so an app-only hot reload also
+    // constrains already-created action controls.
+    let global_max_output = config.borrow().config().app.max_output_bytes;
     let max_output = action_cfg
         .max_output_bytes
         .unwrap_or(global_max_output)
@@ -2374,6 +3699,7 @@ fn execute_action_async(
         };
         let _ = tx.try_send(ActionUpdate {
             action_id,
+            invocation_id,
             result_card_id,
             result,
         });
@@ -2410,6 +3736,7 @@ fn execute_action_async(
 
         let _ = tx.try_send(ActionUpdate {
             action_id,
+            invocation_id,
             result_card_id,
             result,
         });
@@ -2540,86 +3867,395 @@ fn do_reload_config(config: &Rc<RefCell<ConfigManager>>) -> bool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(value: CardValue) -> MetricResult {
+        MetricResult {
+            value,
+            subtitle: Some("same".into()),
+            tooltip: Some("same".into()),
+            state: MetricState::Normal,
+            cached: false,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn collection_health_distinguishes_collector_fallback_from_cache_hits() {
+        let mut stale = result(CardValue::Text("cached-looking".into()));
+        stale.state = MetricState::Stale;
+        stale.cached = true;
+        assert_eq!(
+            metric_result_collection_health(&stale),
+            CollectionHealth::Failed
+        );
+        assert_eq!(CollectionHealth::cache_hit(), CollectionHealth::Healthy);
+        assert_eq!(
+            metric_result_collection_health(&result(CardValue::Text("ok".into()))),
+            CollectionHealth::Healthy
+        );
+        assert_eq!(
+            metric_result_collection_health(&MetricResult::error("failed")),
+            CollectionHealth::Failed
+        );
+    }
+
+    #[test]
+    fn equivalent_results_skip_identical_gtk_updates() {
+        let current = result(CardValue::Text("ok".into()));
+        assert!(results_equivalent(&current, &current, None));
+    }
+
+    #[test]
+    fn numeric_minimum_change_requires_derived_text_to_match() {
+        let mut previous = result(CardValue::Number {
+            value: 10.0,
+            unit: Some("W".into()),
+            decimals: 1,
+        });
+        let mut current = previous.clone();
+        current.value = CardValue::Number {
+            value: 10.2,
+            unit: Some("W".into()),
+            decimals: 1,
+        };
+        let display = DisplayConfig {
+            minimum_change: Some(1.0),
+            columns_after: None,
+            columns: None,
+            card_width: None,
+            card_height: None,
+            fixed_size: None,
+            logo_svg: None,
+            background_svg: None,
+            colors: Default::default(),
+            states: Vec::new(),
+            transition: None,
+        };
+        assert!(results_equivalent(&previous, &current, Some(&display)));
+        current.subtitle = Some("changed derived status".into());
+        assert!(!results_equivalent(&previous, &current, Some(&display)));
+        previous.metadata = Some(serde_json::json!({"level":"normal"}));
+        assert!(!results_equivalent(&previous, &current, Some(&display)));
+    }
+
+    #[test]
+    fn signal_backed_builtins_do_not_keep_independent_card_pollers() {
+        let cards = default_builtin_cards();
+        for id in ["battery", "battery-temp", "network-status"] {
+            let card = cards.iter().find(|card| card.id == id).unwrap();
+            assert_eq!(task_policy(card).workload, Workload::Event);
+        }
+        let power = cards.iter().find(|card| card.id == "power").unwrap();
+        assert_eq!(task_policy(power).workload, Workload::Normal);
+    }
+
+    #[test]
+    fn source_keys_share_descriptors_without_card_ids() {
+        let source = Some(SourceConfig::Builtin("network".into()));
+        assert_eq!(source_key_for(source.as_ref()), "builtin:network");
+        let left = source_key_for(Some(&SourceConfig::Text("same".into())));
+        let right = source_key_for(Some(&SourceConfig::Text("same".into())));
+        assert_eq!(left, right);
+        assert!(!left.contains("card"));
+    }
+
+    #[test]
+    fn http_source_keys_are_stable_across_header_insertion_order() {
+        let mut first_headers = std::collections::HashMap::new();
+        first_headers.insert("Accept".into(), "application/json".into());
+        first_headers.insert("X-Token".into(), "secret".into());
+        let mut second_headers = std::collections::HashMap::new();
+        second_headers.insert("X-Token".into(), "secret".into());
+        second_headers.insert("Accept".into(), "application/json".into());
+        let source = |headers| {
+            SourceConfig::Http(crate::core::config::HttpSourceConfig {
+                url: "https://example.invalid/status".into(),
+                method: Some("GET".into()),
+                headers: Some(headers),
+                body: None,
+                timeout_seconds: 5,
+                max_output_bytes: 1024,
+                parser: None,
+            })
+        };
+        assert_eq!(
+            source_key_for(Some(&source(first_headers))),
+            source_key_for(Some(&source(second_headers)))
+        );
+    }
+
+    #[test]
+    fn file_event_matches_atomic_replacement_paths() {
+        let target = std::path::Path::new("/tmp/pulsedeck-state");
+        assert!(file_event_matches_target(Some(target), None, target));
+        assert!(file_event_matches_target(
+            Some(std::path::Path::new("/tmp/temporary")),
+            Some(target),
+            target
+        ));
+        assert!(!file_event_matches_target(
+            Some(std::path::Path::new("/tmp/other")),
+            None,
+            target
+        ));
+        let relative = std::path::Path::new("relative-file");
+        let absolute = std::env::current_dir().unwrap().join(relative);
+        assert!(file_event_matches_target(Some(&absolute), None, relative));
+    }
+
+    #[test]
+    fn generated_plugin_pages_layer_over_the_default_page_registry() {
+        let mut config = AppConfig::default();
+        config.pages.push(crate::core::config::PageConfig {
+            id: "plugin-page".into(),
+            title: "Plugin".into(),
+            icon: None,
+            order: 40,
+            kind: None,
+            plugin: None,
+        });
+        let pages = effective_pages(&config, true);
+        for id in ["monitor", "actions", "settings", "plugin-page"] {
+            assert!(pages.iter().any(|page| page.id == id));
+        }
+    }
+
+    #[test]
+    fn empty_configuration_uses_one_parsed_default_card_registry() {
+        let config = AppConfig::default();
+        assert_eq!(
+            effective_card_config(&config, "cpu", true)
+                .and_then(|card| card.source)
+                .and_then(|source| source.builtin_metric().map(str::to_owned)),
+            Some("cpu".into())
+        );
+        let mut configured = config;
+        configured.cards.push(CardConfig {
+            id: "disabled".into(),
+            title: "Disabled".into(),
+            page: "monitor".into(),
+            order: 1,
+            renderer: crate::model::card_model::RendererKind::Value,
+            refresh_interval: 30,
+            enabled: false,
+            icon: None,
+            description: None,
+            source: Some(SourceConfig::Builtin("uptime".into())),
+            display: None,
+            cache_ttl_seconds: None,
+            schedule: None,
+            click_action: None,
+            kind: None,
+            plugin: None,
+            runtime: crate::core::config::CardRuntimeConfig::default(),
+        });
+        assert!(effective_card_config(&configured, "cpu", false).is_none());
+    }
+
+    #[test]
+    fn stateful_source_nodes_include_sampling_policy_without_card_identity() {
+        let mut first = AppConfig::default();
+        first.cards = default_builtin_cards();
+        let cpu = first.cards.iter().find(|card| card.id == "cpu").unwrap();
+        let mut slow = cpu.clone();
+        slow.refresh_interval = 60;
+        let first_key = source_node_key(&source_key_for(cpu.source.as_ref()), cpu, 1);
+        let slow_key = source_node_key(&source_key_for(slow.source.as_ref()), &slow, 1);
+        let renamed_key = source_node_key(&source_key_for(cpu.source.as_ref()), cpu, 2);
+        assert_ne!(first_key, slow_key);
+        assert_ne!(first_key, renamed_key);
+        assert_eq!(
+            source_key_for(cpu.source.as_ref()),
+            source_key_for(cpu.source.as_ref())
+        );
+        assert!(!first_key.contains("different-card-id"));
+    }
+
+    #[test]
+    fn removing_a_default_card_override_rebinds_the_shipped_card() {
+        let default_cpu = default_builtin_cards()
+            .into_iter()
+            .find(|card| card.id == "cpu")
+            .unwrap();
+        let mut override_cpu = default_cpu.clone();
+        override_cpu.title = "Override".into();
+
+        let mut previous_raw = AppConfig::default();
+        previous_raw.cards = vec![override_cpu.clone()];
+        let next_raw = AppConfig::default();
+        let mut previous = previous_raw.clone();
+        previous.cards = effective_cards(&previous_raw, true);
+        let mut next = next_raw.clone();
+        next.cards = effective_cards(&next_raw, true);
+        let changed = changed_card_ids(&previous, &next);
+        assert!(changed.iter().any(|id| id == "cpu"));
+
+        let scheduler = Rc::new(RefCell::new(Scheduler::new()));
+        scheduler.borrow_mut().register_with_policy(
+            "cpu",
+            override_cpu.refresh_interval,
+            &override_cpu.page,
+            task_policy(&override_cpu),
+        );
+        let source_key = source_key_for(override_cpu.source.as_ref());
+        let sampling_consumer_key = 1;
+        let card_metas = Rc::new(RefCell::new(HashMap::from([(
+            "cpu".into(),
+            CardMeta {
+                page_id: override_cpu.page.clone(),
+                interval_secs: override_cpu.refresh_interval,
+                source_node_key: source_node_key(&source_key, &override_cpu, sampling_consumer_key),
+                source_key,
+                config_epoch: 0,
+                sampling_consumer_key,
+            },
+        )])));
+        let source_nodes = Arc::new(Mutex::new(HashMap::new()));
+
+        reconcile_scheduler_cards(
+            &scheduler,
+            &card_metas,
+            &source_nodes,
+            &previous,
+            &next,
+            &changed,
+            1,
+        );
+
+        assert!(scheduler.borrow().generation("cpu").is_some());
+        let metas = card_metas.borrow();
+        let meta = metas.get("cpu").expect("default card remains registered");
+        assert_eq!(meta.config_epoch, 1);
+        assert_eq!(meta.source_key, source_key_for(default_cpu.source.as_ref()));
+    }
+
+    #[test]
+    fn scheduled_reload_keeps_an_inflight_slot_without_duplicate_registration() {
+        let mut previous = AppConfig::default();
+        let mut card = default_builtin_cards()
+            .into_iter()
+            .find(|card| card.id == "cpu")
+            .unwrap();
+        card.id = "scheduled".into();
+        card.schedule = Some("daily@00:00".into());
+        card.refresh_interval = 60;
+        previous.cards = vec![card.clone()];
+        let mut next = previous.clone();
+        next.cards[0].title = "Reloaded".into();
+
+        let scheduler = Rc::new(RefCell::new(Scheduler::new()));
+        scheduler.borrow_mut().register_with_policy(
+            &card.id,
+            card.refresh_interval,
+            &card.page,
+            task_policy(&card),
+        );
+        assert_eq!(scheduler.borrow_mut().poll(), vec![card.id.clone()]);
+        scheduler.borrow_mut().mark_started(&card.id);
+        let generation = scheduler.borrow().generation(&card.id).unwrap();
+        let active_slot = scheduler.borrow().next_run(&card.id).unwrap();
+
+        let card_metas = Rc::new(RefCell::new(HashMap::new()));
+        card_metas.borrow_mut().insert(
+            card.id.clone(),
+            CardMeta {
+                page_id: card.page.clone(),
+                interval_secs: card.refresh_interval,
+                source_key: source_key_for(card.source.as_ref()),
+                source_node_key: source_node_key(&source_key_for(card.source.as_ref()), &card, 1),
+                config_epoch: 0,
+                sampling_consumer_key: 1,
+            },
+        );
+        let source_nodes = Arc::new(Mutex::new(HashMap::new()));
+
+        reconcile_scheduler_cards(
+            &scheduler,
+            &card_metas,
+            &source_nodes,
+            &previous,
+            &next,
+            &[card.id.clone()],
+            1,
+        );
+
+        assert!(scheduler.borrow().is_running(&card.id));
+        assert_eq!(scheduler.borrow().generation(&card.id), Some(generation));
+        assert_eq!(scheduler.borrow().next_run(&card.id), Some(active_slot));
+        assert!(scheduler.borrow_mut().poll().is_empty());
+    }
+
+    #[test]
+    fn action_completion_reverse_links_all_enabled_cards() {
+        let config: crate::core::config::AppConfig = toml::from_str(
+            "schema_version=4\n[[cards]]\nid='two'\ntitle='Two'\npage='monitor'\nenabled=true\nclick_action='toggle'\nsource={text='two'}\n\
+             [[cards]]\nid='one'\ntitle='One'\npage='monitor'\nenabled=true\nclick_action='toggle'\nsource={text='one'}\n\
+             [[cards]]\nid='disabled'\ntitle='Disabled'\npage='monitor'\nenabled=false\nclick_action='toggle'\nsource={text='disabled'}\n\
+             [[cards]]\nid='other'\ntitle='Other'\npage='monitor'\nenabled=true\nclick_action='other'\nsource={text='other'}\n",
+        )
+        .unwrap();
+        assert_eq!(linked_card_ids(&config, "toggle"), ["one", "two"]);
+        assert_eq!(linked_card_ids(&config, "other"), ["other"]);
+    }
+
+    #[test]
+    fn action_lookup_reads_the_current_definition_after_reload() {
+        let mut manager = ConfigManager::new(std::path::PathBuf::new());
+        *manager.config_mut() = toml::from_str(
+            "schema_version=4\n[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle'\nsource={text='state'}\n\
+             [[actions]]\nid='toggle'\nname='Toggle'\npage='actions'\ncommand=['old-command']\nmax_output_bytes=100\n",
+        )
+        .unwrap();
+        let config = Rc::new(RefCell::new(manager));
+        assert_eq!(
+            current_card_action(&config, "service").and_then(|action| action.command),
+            Some(vec!["old-command".into()])
+        );
+        config.borrow_mut().config_mut().actions[0].command = Some(vec!["new-command".into()]);
+        config.borrow_mut().config_mut().actions[0].max_output_bytes = Some(8);
+        let current = current_card_action(&config, "service").unwrap();
+        assert_eq!(current.command, Some(vec!["new-command".into()]));
+        assert_eq!(current.max_output_bytes, Some(8));
+    }
+}
+
+fn effective_pages(
+    config: &AppConfig,
+    use_default_registry: bool,
+) -> Vec<crate::core::config::PageConfig> {
+    if !use_default_registry {
+        return config.pages.clone();
+    }
+    let mut pages = default_pages();
+    for configured in &config.pages {
+        if let Some(existing) = pages.iter_mut().find(|page| page.id == configured.id) {
+            *existing = configured.clone();
+        } else {
+            pages.push(configured.clone());
+        }
+    }
+    pages
+}
+
+fn default_pages() -> Vec<crate::core::config::PageConfig> {
+    toml::from_str::<AppConfig>(DEFAULT_CONFIG)
+        .map(|config| config.pages)
+        .unwrap_or_default()
+}
+
 fn default_builtin_cards() -> Vec<CardConfig> {
-    vec![
-        card(
-            "cpu",
-            "CPU 使用率",
-            "monitor",
-            10,
-            "progress",
-            5,
-            "cpu",
-            Some("computer-symbolic"),
-            Some("处理器总占用"),
-        ),
-        card(
-            "memory",
-            "内存使用",
-            "monitor",
-            20,
-            "progress",
-            10,
-            "memory",
-            Some("chip-symbolic"),
-            Some("已用 / 总量"),
-        ),
-        card(
-            "battery",
-            "电池电量",
-            "monitor",
-            30,
-            "progress",
-            30,
-            "battery_capacity",
-            Some("battery-level-100-symbolic"),
-            Some("当前剩余容量"),
-        ),
-        card(
-            "battery-temp",
-            "电池温度",
-            "monitor",
-            40,
-            "value",
-            30,
-            "battery_temperature",
-            Some("sensors-temperature-symbolic"),
-            Some("电池当前温度"),
-        ),
-        card(
-            "uptime",
-            "运行时间",
-            "monitor",
-            50,
-            "value",
-            60,
-            "uptime",
-            Some("hourglass-symbolic"),
-            Some("系统已运行时长"),
-        ),
-        card(
-            "power",
-            "实时功耗",
-            "monitor",
-            60,
-            "value",
-            15,
-            "power",
-            Some("battery-symbolic"),
-            Some("瞬时与平均功耗"),
-        ),
-        card(
-            "network-status",
-            "网络状态",
-            "monitor",
-            70,
-            "status",
-            15,
-            "network",
-            Some("network-wireless-signal-excellent-symbolic"),
-            Some("连接状态与 IP 地址"),
-        ),
-    ]
+    toml::from_str::<AppConfig>(DEFAULT_CONFIG)
+        .map(|config| {
+            config
+                .cards
+                .into_iter()
+                .filter(|card| card.enabled)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn compact_grid_preference_path() -> PathBuf {
@@ -2648,41 +4284,4 @@ fn save_compact_grid_preference(compact: bool) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temporary, if compact { "compact\n" } else { "normal\n" })?;
     std::fs::rename(temporary, path)
-}
-
-fn card(
-    id: &str,
-    title: &str,
-    page: &str,
-    order: i32,
-    renderer: &str,
-    interval: u64,
-    metric: &str,
-    icon: Option<&str>,
-    desc: Option<&str>,
-) -> CardConfig {
-    use crate::model::card_model::RendererKind;
-    CardConfig {
-        id: id.to_string(),
-        title: title.to_string(),
-        page: page.to_string(),
-        order,
-        renderer: match renderer {
-            "progress" => RendererKind::Progress,
-            "status" => RendererKind::Status,
-            _ => RendererKind::Value,
-        },
-        refresh_interval: interval,
-        enabled: true,
-        icon: icon.map(|s| s.to_string()),
-        description: desc.map(|s| s.to_string()),
-        source: Some(SourceConfig::Builtin(metric.to_string())),
-        display: None,
-        cache_ttl_seconds: None,
-        schedule: None,
-        click_action: None,
-        kind: None,
-        plugin: None,
-        runtime: crate::core::config::CardRuntimeConfig::default(),
-    }
 }

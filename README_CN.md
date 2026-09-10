@@ -23,7 +23,8 @@ _未启用任何可选 Cargo feature 的暗色默认构建：左侧为标准布�
 - 支持固定间隔或 `daily@08:00,20:00` 等时间计划，并按时间槽缓存。
 - 全局及单卡片响应式尺寸，适配移动端和桌面布局。
 - 页面不可见时停止轮询。
-- 统一管理前台正常、空闲省电、外接供电、后台及 Codex 事件唤醒状态，设置即时生效。
+- 使用纯事实到策略模型，分别管理已映射／活动／空闲状态、工作与视觉级别、屏幕抑制、
+  Agent 通知和可选的应用内空闲视图，设置即时生效。
 - 文件和网络状态事件驱动更新，临近刷新合并唤醒，共享系统快照并去重持久缓存写入。
 - 限制子进程输出、HTTP 响应大小和执行时间。
 - 可选、独立编译的 ScrcpyForge 设备控制页面。
@@ -31,25 +32,37 @@ _未启用任何可选 Cargo feature 的暗色默认构建：左侧为标准布�
   记忆和完成提示音。
 - 页面工具栏可在配置的普通网格与六列紧凑网格间切换，并跨启动记忆上次选择。
 
-## 运行与低功耗模式
+## 运行与低功耗策略
 
-PulseDeck 使用一套由普通卡片与可选插件共享的事件驱动运行管理器。只有点击、触摸、
-按键、滚动、切换页面和手动刷新等真实输入会重置用户空闲时间；自动刷新、动画、文件
-事件和网络响应都不会重置。
-多个条件同时满足时，优先级依次为：后台、外接电源、Agent 重要事件提醒、新任务保护、
-稳定空闲、前台正常。
+PulseDeck 将运行事实与纯策略计算分开。策略快照分别表达窗口可见性、用户活动、工作级别、
+视觉级别、屏幕抑制、空闲视图、供电、温度和 Agent 状态。已映射但失去键盘焦点的窗口
+因此不会被误判为后台。
 
-| 模式 | 进入条件 | 显示与工作策略 |
-| --- | --- | --- |
-| 前台正常 | 窗口已映射，且没有更高优先级模式。 | 使用卡片原始计划、正常动画速率和完整插件展示。 |
-| 空闲省电 | 超过 `idle_timeout_seconds` 无真实输入，再经过 `idle_stability_seconds` 稳定期。 | 按卡片成本降低刷新频率，PetCard 降至 1 FPS，ScrcpyForge 只取元数据而不取预览帧。`dim` 或适合 OLED 的 `minimal` 遮罩只影响 PulseDeck，不会修改系统亮度。 |
-| 外接电源实时 | 电源上报在线，且启用 `external_realtime`。 | 符合策略的卡片可提高刷新频率，外接电源也可阻止进入空闲。命令和 HTTP 卡片除非单独选择加入，否则保持原始间隔。PulseDeck 不修改 CPU governor。 |
-| Agent 保护／提醒 | 新 Agent 任务开始，或出现独立的完成、失败、取消、等待输入、等待确认或异常中止事件。 | 新任务只在最初的保护截止时间前保持正常视觉亮度，等待不会延长时间。重要事件可播放一次提示音，并在配置的提醒时段内恢复正常显示与刷新策略。 |
-| 后台 | 应用窗口取消映射。 | 释放屏幕抑制，暂停普通卡片工作，移除 PetCard 帧定时器，并停止 ScrcpyForge 预览；固定生命周期监听和已配置通知仍可用。 |
+只有点击／触摸、按键、滚动、拖动、切换页面、手动刷新、对话框响应和插件控制等真实
+输入会重置空闲时间；自动刷新、动画、文件事件、Agent hook 和网络响应都不会重置。
 
-温热及更高等级的热状态只会降低昂贵的插件展示工作，不会改变外接电源判定：
-ScrcpyForge 会降低预览与健康检查频率，设备过热或发生节流时 PetCard 会冻结在当前帧。
-任何真实输入都会立即恢复前台界面。
+| 状态 | B2 默认行为 |
+| --- | --- |
+| 已映射且活动 | 便宜监视工作按基础间隔运行；继承的高成本命令/HTTP 使用 30 分钟下限。 |
+| 已映射但非活动或本地空闲 | 白天仍保持相同的完整工作；焦点、空闲和宽限仅用于诊断/界面。 |
+| 夜间静默 | 按本地时钟暂停普通周期本地/远程工作；电源、电池、温度、网络、Agent 信号和显式一次性请求仍可用。 |
+| 未映射 | 暂停普通工作和插件轮询；排队的手动/事件请求等重新映射后执行。 |
+
+`profile = "performance" | "balanced" | "eco"` 仍是严格 v4 兼容/诊断字段，不是有效的设置页控制；
+已映射白天默认工作均为完整策略。自动识别的高成本命令/HTTP 至少间隔 30 分钟；确实便宜的来源可显式标为
+`normal`／`live`。显式单卡 `inactive_behavior`／`idle_behavior` 仍属于用户主动覆盖。
+`screen_inhibit = "never" | "while-active" | "while-mapped"` 与刷新独立，只请求抑制
+空闲熄屏，不阻止系统休眠。`idle_view = "none" | "dim" | "minimal"` 只影响
+PulseDeck，不修改系统亮度。静默按本地时钟使用半开区间 `[start,end)`，起止小时相同则禁用；
+手动/事件请求仍可执行。
+
+外接电源不会清除 Low/Critical 电池阶段，也不会让工作超过白天的 Full；`external_boost`
+仅保留为严格 v4 兼容/诊断字段，不是有效的设置页控制，默认关闭。电池低电量滞回默认是 20/25%，临界电量滞回是
+10/15%。供电/温度信号回退保持有界（供电 15–300 秒、温度 15–60 秒）。观察租约默认 300 秒，
+在夜间静默中临时恢复到期的监视工作，并且只由真实映射窗口输入续期；Agent、网络、文件、动画和自动
+刷新事件都不会续期。温热只用于诊断；Hot/Throttled 独立限制工作并冻结 PetCard。
+Agent 状态可驱动 PetCard 和去重通知，但不能让普通卡片、全局亮度或屏幕抑制保持满档。
+完整策略、缓存、动作失效和有界恢复见 [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md)。
 
 ## 页面布局模式
 
@@ -116,23 +129,23 @@ PulseDeck 还会自动扫描同级的 `config.d/` 目录。该目录第一层的
 子目录与其他扩展名会被忽略。因此导出卡片或页面只需复制一个文件，不需要维护 include
 列表；把扩展名改为 `.disabled` 即可停用模块。
 
-配置采用严格且不自动迁移的 schema v3。文件根部必须包含 `schema_version = 3`；未知字段、
-废弃别名和未知枚举值会使配置加载失败，而不是被静默忽略。此后 schema 发生变化时，
-仓库示例与实际使用的本地配置必须同时更新。
+配置采用严格 schema v4，正常启动绝不会自动迁移。文件根部必须包含
+`schema_version = 4`；未知字段、废弃别名和未知枚举值会使配置加载失败，而不是被静默
+忽略。v3 文件需显式运行 `pulsedeck config migrate`。
 
 建议从 [config/config.example.toml](config/config.example.toml) 开始。仓库同时提供
 内容一致的 [config/config.example.json](config/config.example.json)。当前 TOML schema
 及实用卡片示例见 [config/CARD_GUIDE.md](config/CARD_GUIDE.md)。
 PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 [docs/PET_CARD.md](docs/PET_CARD.md)。
-统一运行模式、调度策略、插件适配和功耗验证方法见
+统一运行策略、调度行为、插件适配和功耗验证方法见
 [docs/RUNTIME_POWER.md](docs/RUNTIME_POWER.md)。
 
 顶层配置包括：
 
-- `schema_version`：必填的配置接口版本，当前为 `3`。
+- `schema_version`：必填的配置接口版本，当前为 `4`。
 - `[app]`：标题、日志、输出限制和配置重载。
-- `[runtime]`：前台常亮、低功耗显示与刷新、外接供电行为及 Agent 保护/通知。
+- `[runtime]`：兼容诊断字段（`profile`、`external_boost`）、非活动／空闲行为、屏幕抑制、空闲视图、夜间静默、观察租约、供电／温度采样、电池滞回和 Agent 通知。
 - `[ui]`：默认页面、普通网格列数和卡片尺寸；工具栏普通/紧凑选择作为 UI 状态单独保存。
 - `[[pages]]`：按顺序排列的导航页面。
 - `[[cards]]`：由可配置数据源提供内容的卡片。
@@ -141,7 +154,7 @@ PetCard 的构建、hook、动画、尺寸、功耗和提示音行为见
 模块同样以 schema 版本开头，并可提供便于识别的名称：
 
 ```toml
-schema_version = 3
+schema_version = 4
 name = "workstation"
 
 [[cards]]
@@ -163,6 +176,7 @@ name = "workstation"
 ```sh
 pulsedeck config check
 pulsedeck config check /path/to/config.toml
+pulsedeck config migrate # 显式执行 v3 -> v4，并创建 .v3.bak 备份
 pulsedeck config add builtin cpu --id cpu-personal --title "CPU" --renderer progress --refresh 5s
 pulsedeck config add command --id kernel --title "内核" --renderer text --refresh 1h --module 50-workstation.toml -- uname -r
 pulsedeck config format # 规范化主文件及模块；会移除注释
@@ -211,12 +225,13 @@ PulseDeck 会自动创建 `config.d/90-scrcpy-forge.toml`；未编译该 feature
 此文件，已有配置也不会被覆盖。`src/plugins/scrcpy_forge/config.example.toml` 是可直接
 复制到 `config.d/` 的完整独立模块，仅用于显式自定义默认值。
 它连接到单独安装的 ScrcpyForge 后端；PulseDeck 不持有 ADB 或 scrcpy 进程。服务
-程序、URL 和脚本均可配置。预览与健康检查遵循统一运行模式：
+程序、URL 和脚本均可配置。预览与健康检查在插件内映射通用工作级别：
 
-- 前台正常模式使用配置的预览间隔。
-- 空闲模式保留轻量设备与脚本元数据，但不请求预览帧。
-- 页面隐藏或应用进入后台时停止预览工作，不继续轮询。
-- 热压力会降低预览与健康检查频率，未变化的画面则通过 ETag/内容哈希缓存复用。
+- `Full` 使用配置的预览间隔。
+- `Reduced` 降低预览与健康检查频率。
+- `Minimal` 保留轻量设备与脚本元数据，但不请求预览帧。
+- `Suspended` 或页面隐藏时停止预览工作，不继续轮询。
+- 未变化的画面继续通过 ETag／内容哈希缓存复用。
 
 ScrcpyForge（简称 SF）是基于 ADB 与 scrcpy 的多设备 Android 自动化项目，提供设备
 控制、画面预览与脚本自动化能力。项目介绍与使用说明见
@@ -252,10 +267,12 @@ ScrcpyForge（简称 SF）是基于 ADB 与 scrcpy 的多设备 Android 自动�
 - 占四格和占六格会跟随当前三列或六列页面网格重排，因此切换工具栏布局时周围卡片
   会立即重新排列。
 
-PetCard 同样遵循运行模式：活跃任务使用配置的动画速率（最高 12 FPS），空闲模式降至
-1 FPS；卡片隐藏或应用后台时直接移除帧定时器，离线及单帧状态没有动画定时器。活跃
-任务只保留最初的亮度保护截止时间，等待输入或确认不会延长；完成提示音由全局运行
-设置控制。详见 [docs/PET_CARD.md](docs/PET_CARD.md)。
+PetCard 同样遵循通用视觉策略：窗口已映射时，无论活动还是非活动，活跃 Agent 状态在白天或
+夜间观察租约内都使用配置的动画速率（最高 12 FPS）。没有观察租约时，夜间静默冻结所有循环动画，
+但继续接收 Agent 状态；持续循环的非 Agent 状态白天限制为 1 FPS。完成／错误等有限动画可作为事件确认播放一次。Hot/Throttled
+冻结当前帧，Warm/Unknown 不降速；卡片隐藏或应用后台时移除帧定时器，离线及单帧状态没有
+动画定时器。Agent 动画不会提升普通刷新、远程工作、亮度或屏幕抑制。完成提示音由全局 Agent
+通知设置控制。详见 [docs/PET_CARD.md](docs/PET_CARD.md)。
 
 ![PetCard 正在工作并占四格展示](docs/images/pulsedeck-petcard-working.png)
 
@@ -269,7 +286,7 @@ _暗色完整仪表盘：PetCard 处于工作状态，并使用占四格展示�
 - `src/execution`：为用户操作和数据源提供有边界的子进程执行。
 - `src/plugins`：可选外部集成。
 - `docs/PET_CARD.md`：可选 Codex PetCard 的构建、hook 与资源配置。
-- `docs/RUNTIME_POWER.md`：统一运行模式、省电策略和验证方法。
+- `docs/RUNTIME_POWER.md`：统一运行策略、省电行为和验证方法。
 - `config`：可移植示例和卡片指南。
 - `data`：桌面入口和应用图标。
 

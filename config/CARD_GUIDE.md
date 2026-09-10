@@ -4,19 +4,20 @@
 `title`、`order`、`renderer` 和数据源即可。内置渲染器包括 `value`、
 `progress`、`status`、`text`、`action`；`list` 和 `composite` 只由插件卡片产出，
 普通数据源卡片选择它们会显示空白（见文末「配置限制与严格字段」）。数据源包括
-`builtin`、`file`、`command`、`http` 和 `text`。v3 用按类型分组的紧凑数据源，
-不再使用通用的 `type/program/args/options` 字段袋。
+`builtin`、`file`、`command`、`http` 和 `text`。v4 继续使用按类型分组的紧凑数据源，
+不使用通用的 `type/program/args/options` 字段袋。
 
-当前配置接口固定为 schema v3，文件第一项必须是：
+当前配置接口固定为 schema v4，文件第一项必须是：
 
 ```toml
-schema_version = 3
+schema_version = 4
 ```
 
-PulseDeck 不迁移或忽略旧接口：版本不符、未知字段、旧别名和未知枚举值都会使整份配置
-加载失败；热重载失败时继续保留上一次成功加载的运行配置。修改 schema 时应同时修改
-实际使用的 `~/.config/pulsedeck/config.toml`，而不是在程序中增加兼容分支。
-启动时被拒绝的配置也不会被默认配置或可选卡片自动写回覆盖。
+正常启动不会自动迁移或忽略旧接口：版本不符、未知字段、旧别名和未知枚举值都会使整份
+配置加载失败；热重载失败时继续保留上一次成功加载的运行配置。启动时被拒绝的配置也
+不会被默认配置或可选卡片自动写回覆盖。v3 用户应显式运行
+`pulsedeck config migrate`；它会连同同级 `config.d/` 一起转换，成功后保留
+`.v3.bak` 备份，转换会规范化格式且不保留注释。
 
 ## 配置目录与模块
 
@@ -32,7 +33,7 @@ config.d/
 └── 90-scrcpy-forge.toml
 ```
 
-每个模块都必须有 `schema_version = 3`，可选 `name = "workstation"` 仅用于标识。普通
+每个模块都必须有 `schema_version = 4`，可选 `name = "workstation"` 仅用于标识。普通
 模块可包含任意完整的 `[[pages]]`、`[[cards]]`、`[[actions]]`；因此导出一张卡片时，
 把卡片及其引用的 action 放进同一个文件即可。复制到另一台机器后无需修改主配置。
 示例见 [`config/config.d/50-custom.example.toml`](config.d/50-custom.example.toml)。
@@ -41,12 +42,12 @@ config.d/
 显式设置：
 
 ```toml
-schema_version = 3
+schema_version = 4
 name = "workstation"
 replace_existing = true
 
 [runtime]
-idle_power_saving = false     # 只写差异，其余字段继承主配置
+profile = "performance"      # 兼容/诊断字段；不改变 B2 策略
 
 [[cards]]
 id = "cpu"                   # 有意替换更早文件中的 cpu
@@ -56,7 +57,7 @@ id = "cpu"                   # 有意替换更早文件中的 cpu
 只有 `replace_existing = true` 的模块才能包含 `[app]`、`[ui]`、`[runtime]`；这三个段按
 字段覆盖，未声明字段继续继承主配置。页面、卡片和操作仍按完整 ID 条目替换。设置页修改
 会把发生变化的字段写回最后拥有该段的模块，不会把模块内容摊平到 `config.toml`。把文件改名为 `.disabled` 可临时停用；
-删除、加入模块或改变页面/卡片数量后应重启应用，普通值与颜色修改可热重载。任一模块
+删除、加入模块或改变页面/卡片数量后应重启应用，普通值、颜色和 action 命令/限制可热重载。任一模块
 解析失败时整次重载回滚，继续使用上一次成功配置。
 
 修改后可先运行 `pulsedeck config check`；它会校验主文件、全部启用模块、覆盖关系以及
@@ -131,24 +132,30 @@ click_action = "action-id"     # 可选，点击整张卡片时执行对应 [[ac
 `refresh` 必须带 `s`、`m`、`h` 或 `d` 单位。设置 `schedule` 后，应用按每日固定时间生成独立
 缓存周期。失败任务会进行有上限的退避，避免持续快速重试。
 
-调度器保留这里的原始间隔，再根据统一运行模式计算实际间隔。普通模式使用原值；
-空闲模式按卡片类别降频；检测到外接电源在线时只对明确允许的低开销指标升频；后台暂停非必要
-刷新。模式变化会立即重算下一次截止时间，手动刷新始终立即执行。临近任务会在小窗口
-内合并唤醒，但不会提前执行固定时间计划。
+调度器保留每张卡的原始间隔，再按统一策略快照中的工作级别计算实际间隔。映射且处于白天时，
+默认 `Full` 使用原始间隔，不受焦点、非活动宽限或本地空闲影响；`Reduced`／`Minimal` 只由
+电池安全或真实热压力等策略上限触发；`Suspended`（应用未映射）是硬停止。显式单卡
+`inactive_behavior`／`idle_behavior` 仍是用户主动覆盖。文件和网络状态可由事件唤醒，并保留
+有界 watchdog；后台收到的手动／事件请求会排队，在允许时执行。临近任务会合并唤醒，但不会
+提前执行固定时间计划。
 
 可用 `[cards.runtime]` 覆盖自动分类：
 
 ```toml
 [cards.runtime]
-class = "command"
-# 精确取值：auto、system-realtime、network-rate、network-status、battery-thermal、
-# command、http、file、static；省略时为 auto，并按数据源自动归类。
-idle_behavior = "throttle"     # throttle 或 pause
-idle_multiplier = 8.0
-external_realtime = false      # 高开销命令/HTTP 默认不要打开
-realtime_multiplier = 0.75
+workload = "expensive"          # auto | live | normal | expensive | event
+inactive_behavior = "inherit"   # inherit | keep | throttle | pause
+idle_behavior = "pause"         # inherit | keep | throttle | pause
+inactive_interval_seconds = 120  # 可选；throttle 时使用，且不会快于 refresh
+idle_interval_seconds = 300      # 可选
 minimum_interval_seconds = 5
 ```
+
+`auto` 将 command／HTTP 识别为 `expensive`，file／text／电池容量和温度／CPU 温度／内置网络状态识别为 `event`，
+内置网络吞吐识别为 `live`，有状态功耗和其他内置指标识别为 `normal`。继承的高成本任务白天至少间隔 30 分钟；
+把确实便宜的命令或 HTTP 卡显式标为 `normal`／`live` 可退出该下限。`keep` 保持原始间隔；
+`throttle` 使用显式间隔或内置倍率；`pause` 停止周期刷新；`inherit` 使用工作量默认值。
+外接电源行为属于全局 `external_boost`；B2 映射白天已是 `Full`，它不会越过电池/温度安全上限，也不提供单卡外接电源倍率。
 
 `click_action` 只引用已有 `[[actions]].id`，不会在卡片中重复保存命令。是否显示
 二次确认由对应 action 的 `confirm` 控制；设置 `visible = false` 可只保留点击入口，
@@ -544,21 +551,45 @@ cache_ttl = "4h"
 
 ## 运行与省电
 
-全局 `[runtime]` 的推荐默认值见 `config.example.toml`。应用前台且
-`keep_screen_on = true` 时同时抑制熄屏和休眠；进入空闲模式只改变应用内显示与刷新，
-不会释放常亮。应用后台立即释放抑制并暂停非必要调度。真实点击、触摸、滚动、键盘、
-拖动、页面切换、手动刷新和插件控制会重置空闲时间；自动刷新、网络请求、动画及状态
-文件变化不会。
+全局 `[runtime]` 的推荐默认值见 `config.example.toml`。`profile` 可选
+`performance`、`balanced`（默认）或 `eco`，仅保留为兼容/诊断字段，不是设置页控制；映射白天的默认监控均为 `Full`；焦点、
+`inactive_grace_seconds` 和本地空闲只保留诊断/界面含义。未映射才进入 `Suspended`。
+
+`screen_inhibit` 可选 `never`、`while-active`（默认）或 `while-mapped`，只请求抑制
+空闲熄屏，不阻止系统休眠，并且与刷新、Agent、供电及空闲视觉独立。`idle_view` 可选
+`none`（默认）、`dim` 或 `minimal`；后两者只改变应用内显示，不修改系统亮度。
+真实点击、触摸、滚动、键盘、拖动、页面切换、手动刷新和插件控制会重置空闲时间并续期
+`observation_lease_seconds`；自动刷新、网络请求、动画、Agent hook 及状态文件变化不会。
+租约默认 300 秒，仍受五分钟硬上限约束。
+
+夜间静默按本地时钟使用半开区间 `[start,end)`，不依赖用户是否空闲；起止小时相同则禁用。
+静默暂停普通周期本地/远程工作，但电源、电池、温度、网络、Agent 信号和手动/事件一次性
+请求仍可用。真实输入会在租约期限内恢复到期的监视工作；只有真实输入能续期，后台事件不会：
+
+```toml
+quiet_hours_enabled = true
+quiet_hours_start_hour = 0
+quiet_hours_end_hour = 8
+```
+
+外接电源不会清除电池安全阶段或提升映射白天已为 `Full` 的工作；`external_boost` 默认关闭，
+仅保留为严格 v4 兼容/诊断字段，不是设置页控制。电池安全滞回默认 Low 进入/退出 20/25%，Critical 进入/退出
+10/15%；Low 将普通工作限制为 `Reduced`，Critical 限制为 `Minimal`。温热只记录诊断，
+Hot/Throttled 才限制工作并冻结 PetCard；供电与温度分别采样，供电信号回退周期为有界的
+15–300 秒。
 
 手动刷新单张卡片后，刷新按钮会暂时禁用，结果返回后自动恢复；旧值在刷新期间保持可见。
-加载、错误和不可用状态使用与渲染器无关的静态提示，因此列表或组合卡片不会继续显示
-上一次成功内容。确认对话框打开期间持有最长五分钟的交互保护，用户响应后立即释放。
+只有成功的非缓存结果会替换 last-good 缓存；Loading、Unavailable、Error 不覆盖它，失败时
+可继续显示带 stale 标记的上次成功值。等价结果不会触发 GTK 更新或刷新磁盘缓存年龄。
 
-网络连接状态通过 NetworkManager D-Bus 读取并由 GIO 网络事件触发，不再为每次刷新
-启动多个 `nmcli`。CPU/内存/Swap 等相邻采集会复用短时 `/proc` 快照。配置中的
-`minimum_change` 先比较稳定的主数值，动态 subtitle/tooltip 不会绕过阈值并造成 GTK
-重复重绘。电池 sysfs 中带符号的 `power_now`、`power_avg` 和 `current_now` 会按绝对
-功率读取，充放电方向仍以电池 `status` 为准。
+网络连接状态通过共享的 NetworkManager 快照、信号和有界 watchdog 更新，不再为每张卡重复
+打开阻塞查询。CPU/内存/Swap 等相邻采集会复用短时 `/proc` 快照；CPU、网络吞吐和功率平均
+仍保留数学上需要的采样间隔与窗口。配置中的 `minimum_change` 先比较稳定的主数值，动态
+subtitle/tooltip 变化会按等价语义决定是否重绘。电池 sysfs 中带符号的 `power_now`、
+`power_avg` 和 `current_now` 会按绝对功率读取，充放电方向仍以电池 `status` 为准。
+文件/网络/供电/Agent 边沿按来源与任务合并；运行中新增边沿最多产生一次最新修订的 follow-up。
+静默退出或成功重载不会把固定计划全部提前到 now，远程/高开销启动至少按 500ms 槽位分散。
+动作完成（成功或失败）会按 `click_action` 反向失效所有关联启用卡片，隐藏入口也不例外。
 
 ## 可选 ScrcpyForge 页面
 
@@ -568,11 +599,11 @@ cache_ttl = "4h"
 
 该页面不属于通用卡片系统，默认不会编译。使用
 `cargo build --release --features scrcpy-forge` 启用，独立配置模块见
-`src/plugins/scrcpy_forge/config.example.toml`。页面不可见时停止预览和健康请求；
-重新进入后自动恢复。空闲模式仅更新设备元数据，不下载预览 PNG；服务端支持 ETag
-时未变化图片不传输，客户端内容哈希未变化时不重建纹理。每台设备拥有对应的预览卡和
-脚本卡。温度达到 warm 或更高等级时，预览和健康检查间隔自动延长；hot/throttled
-状态下 PetCard 动画冻结在当前帧并移除动画定时器。
+`src/plugins/scrcpy_forge/config.example.toml`。页面不可见或工作级别为 `Suspended` 时
+停止预览和健康请求，重新进入后自动恢复；`Reduced` 降低频率，`Minimal` 仅更新设备
+元数据而不下载预览 PNG。服务端支持 ETag 时未变化图片不传输，客户端内容哈希未变化
+时不重建纹理。每台设备拥有对应的预览卡和脚本卡。温热只显示诊断；
+`hot`／`throttled` 状态才会降低通用工作级别，PetCard 动画冻结在当前帧并移除定时器。
 
 ## 可选 PetCard
 
@@ -584,7 +615,7 @@ Codex hook、四格/六格/全屏尺寸、离线回落和完成提示音见
 
 ## 配置限制与严格字段
 
-schema v3 使用严格字段解析。以下限制会直接影响配置是否可被加载：
+schema v4 使用严格字段解析。以下限制会直接影响配置是否可被加载：
 
 - `renderer = "list"` / `"composite"`：普通数据源（builtin/command/file/http/text）
   无法产出列表或组合值，选择后卡片显示空白；仅插件卡片内部使用。
@@ -594,7 +625,7 @@ schema v3 使用严格字段解析。以下限制会直接影响配置是否可�
   `["sh", "-c", "..."]`，或把本地脚本路径作为 `run` 第一项。
 - HTTP 解析器只有 `json_path`、`regex`、`number`、`first_line`；不存在
   `parser.steps`、`template` 或 `divide` 接口。
-- `[cards.runtime].class` 只接受本文列出的精确值，不接受 `system`、`network`、
-  `battery`、`thermal` 等旧别名。
+- `[cards.runtime].workload` 只接受 `auto`、`live`、`normal`、`expensive`、`event`；
+  v3 的 `class`、倍率和单卡外接电源字段会被拒绝。
 - `schedule`：仅支持 `daily@HH:MM,HH:MM` 一种格式，没有 cron。
 - 页面与卡片的 `id` 各自类型内唯一；卡片引用的 `page` 必须存在。

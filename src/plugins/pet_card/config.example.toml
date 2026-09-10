@@ -2,7 +2,7 @@
 # Build with: cargo build --release --features pet-card
 # Frame paths are relative to asset_root. Missing animations fall back to emoji.
 
-schema_version = 3
+schema_version = 4
 
 [[cards]]
 id = "codex-pet"
@@ -22,10 +22,9 @@ offline_after_seconds = 180
 fps = 12
 done_hold_seconds = 5
 offline_normal_after_seconds = 300
-pause_when_unmapped = true
 show_status = true
 # Completion notification is enabled globally with
-# [runtime].codex_completion_sound. This optional path replaces the desktop
+# [runtime].agent_completion_sound. This optional path replaces the desktop
 # theme's "complete" event for PetCard events.
 # completion_sound_file = "/home/you/.local/share/sounds/codex-done.oga"
 

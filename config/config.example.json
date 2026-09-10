@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "app": {
     "title": "PulseDeck",
     "reload_on_change": true,
@@ -7,24 +7,25 @@
     "max_output_bytes": 20000
   },
   "runtime": {
-    "keep_screen_on": true,
-    "idle_power_saving": true,
+    "inactive_grace_seconds": 15,
+    "screen_inhibit": "while-active",
     "idle_timeout_seconds": 60,
     "idle_stability_seconds": 10,
+    "idle_view": "none",
     "idle_visual_brightness_percent": 15,
-    "refresh_saving_strength": "balanced",
-    "external_realtime": true,
-    "external_prevents_idle": true,
-    "external_sample_seconds": 10,
-    "external_enter_samples": 3,
-    "external_exit_samples": 2,
-    "codex_keep_bright": true,
-    "codex_protection_minutes": 60,
-    "codex_attention_seconds": 15,
-    "codex_completion_sound": true,
+    "quiet_hours_enabled": false,
+    "quiet_hours_start_hour": 0,
+    "quiet_hours_end_hour": 8,
+    "power_sample_seconds": 30,
+    "thermal_sample_seconds": 30,
+    "agent_attention_seconds": 15,
+    "agent_completion_sound": true,
     "bring_to_foreground_on_attention": false,
-    "cpu_activity_hint": false,
-    "idle_display": "dim"
+    "observation_lease_seconds": 300,
+    "battery_low_enter_percent": 20,
+    "battery_low_exit_percent": 25,
+    "battery_critical_enter_percent": 10,
+    "battery_critical_exit_percent": 15
   },
   "ui": {
     "default_page": "monitor",

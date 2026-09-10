@@ -519,6 +519,37 @@ impl Page {
         self.has_actions = true;
     }
 
+    pub fn add_action_card_with_resolver(
+        &mut self,
+        action_id: &str,
+        name: &str,
+        description: &str,
+        icon_name: &str,
+        resolve: impl Fn(&str) -> Option<(bool, String, String)> + 'static,
+        on_click: impl Fn(&str) + 'static,
+        on_dialog_open: impl Fn() + 'static,
+        on_dialog_response: impl Fn() + 'static,
+    ) {
+        let card = ActionCard::new_with_resolver(
+            action_id,
+            name,
+            description,
+            icon_name,
+            resolve,
+            on_click,
+            on_dialog_open,
+            on_dialog_response,
+        );
+        card.card.set_size_request(-1, self.fitted_card_height());
+        if self.compact_grid {
+            card.card.add_css_class("compact-card");
+        }
+        self.action_flow.append(&card.card);
+        self.action_flow.set_visible(true);
+        self.action_cards.insert(action_id.to_string(), card);
+        self.has_actions = true;
+    }
+
     pub fn flow_insert(&self, widget: &impl IsA<gtk::Widget>) {
         self.metric_flow.append(widget);
         self.metric_flow.set_visible(true);

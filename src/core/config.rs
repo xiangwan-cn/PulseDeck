@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::model::card_model::{CardState, RendererKind, StatusLevel};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,47 +124,93 @@ impl ConfigFragment {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeProfile {
+    Performance,
+    #[default]
+    Balanced,
+    Eco,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenInhibitMode {
+    Never,
+    #[default]
+    WhileActive,
+    WhileMapped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleViewMode {
+    #[default]
+    None,
+    Dim,
+    Minimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    #[serde(default = "default_true")]
-    pub keep_screen_on: bool,
-    #[serde(default = "default_true")]
-    pub idle_power_saving: bool,
+    #[serde(default)]
+    pub profile: RuntimeProfile,
+    #[serde(default = "default_inactive_grace")]
+    pub inactive_grace_seconds: u64,
+    #[serde(default)]
+    pub screen_inhibit: ScreenInhibitMode,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
     #[serde(default = "default_idle_stability")]
     pub idle_stability_seconds: u64,
+    #[serde(default)]
+    pub idle_view: IdleViewMode,
     #[serde(default = "default_idle_brightness")]
     pub idle_visual_brightness_percent: u8,
-    #[serde(default = "default_refresh_saving")]
-    pub refresh_saving_strength: String,
-    #[serde(default = "default_true")]
-    pub external_realtime: bool,
-    #[serde(default = "default_true")]
-    pub external_prevents_idle: bool,
+    #[serde(default)]
+    pub quiet_hours_enabled: bool,
+    #[serde(default)]
+    pub quiet_hours_start_hour: u8,
+    #[serde(default = "default_quiet_hours_end")]
+    pub quiet_hours_end_hour: u8,
+    #[serde(default)]
+    pub external_boost: bool,
     #[serde(default = "default_power_sample_seconds")]
-    pub external_sample_seconds: u64,
-    #[serde(default = "default_power_enter_samples")]
-    pub external_enter_samples: u32,
-    #[serde(default = "default_power_exit_samples")]
-    pub external_exit_samples: u32,
+    pub power_sample_seconds: u64,
+    #[serde(default = "default_thermal_sample_seconds")]
+    pub thermal_sample_seconds: u64,
+    #[serde(default = "default_agent_attention_seconds")]
+    pub agent_attention_seconds: u64,
     #[serde(default = "default_true")]
-    pub codex_keep_bright: bool,
-    #[serde(default = "default_codex_protection_minutes")]
-    pub codex_protection_minutes: u64,
-    #[serde(default = "default_codex_attention_seconds")]
-    pub codex_attention_seconds: u64,
-    #[serde(default = "default_true")]
-    pub codex_completion_sound: bool,
+    pub agent_completion_sound: bool,
     #[serde(default)]
     pub bring_to_foreground_on_attention: bool,
-    #[serde(default)]
-    pub cpu_activity_hint: bool,
-    #[serde(default = "default_idle_display")]
-    pub idle_display: String,
+    /// A real user-observation lease temporarily permits explicitly observed
+    /// work during quiet hours. It is capped at five minutes by the runtime.
+    #[serde(default = "default_observation_lease_seconds")]
+    pub observation_lease_seconds: u64,
+    /// Battery safety thresholds are intentionally separate from display
+    /// colour thresholds. Enter/exit pairs provide generic hysteresis.
+    #[serde(default = "default_battery_low_enter_percent")]
+    pub battery_low_enter_percent: u8,
+    #[serde(default = "default_battery_low_exit_percent")]
+    pub battery_low_exit_percent: u8,
+    #[serde(default = "default_battery_critical_enter_percent")]
+    pub battery_critical_enter_percent: u8,
+    #[serde(default = "default_battery_critical_exit_percent")]
+    pub battery_critical_exit_percent: u8,
 }
 
+pub const HARD_MAX_OBSERVATION_LEASE_SECONDS: u64 = 300;
+pub const DEFAULT_BATTERY_LOW_ENTER_PERCENT: u8 = 20;
+pub const DEFAULT_BATTERY_LOW_EXIT_PERCENT: u8 = 25;
+pub const DEFAULT_BATTERY_CRITICAL_ENTER_PERCENT: u8 = 10;
+pub const DEFAULT_BATTERY_CRITICAL_EXIT_PERCENT: u8 = 15;
+
+fn default_inactive_grace() -> u64 {
+    15
+}
 fn default_idle_timeout() -> u64 {
     60
 }
@@ -174,49 +220,58 @@ fn default_idle_stability() -> u64 {
 fn default_idle_brightness() -> u8 {
     15
 }
-fn default_refresh_saving() -> String {
-    "balanced".into()
+fn default_quiet_hours_end() -> u8 {
+    8
 }
 fn default_power_sample_seconds() -> u64 {
-    10
+    30
 }
-fn default_power_enter_samples() -> u32 {
-    3
+fn default_thermal_sample_seconds() -> u64 {
+    30
 }
-fn default_power_exit_samples() -> u32 {
-    2
-}
-fn default_codex_protection_minutes() -> u64 {
-    60
-}
-fn default_codex_attention_seconds() -> u64 {
+fn default_agent_attention_seconds() -> u64 {
     15
 }
-fn default_idle_display() -> String {
-    "dim".into()
+fn default_observation_lease_seconds() -> u64 {
+    HARD_MAX_OBSERVATION_LEASE_SECONDS
+}
+fn default_battery_low_enter_percent() -> u8 {
+    DEFAULT_BATTERY_LOW_ENTER_PERCENT
+}
+fn default_battery_low_exit_percent() -> u8 {
+    DEFAULT_BATTERY_LOW_EXIT_PERCENT
+}
+fn default_battery_critical_enter_percent() -> u8 {
+    DEFAULT_BATTERY_CRITICAL_ENTER_PERCENT
+}
+fn default_battery_critical_exit_percent() -> u8 {
+    DEFAULT_BATTERY_CRITICAL_EXIT_PERCENT
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            keep_screen_on: true,
-            idle_power_saving: true,
+            profile: RuntimeProfile::Balanced,
+            inactive_grace_seconds: default_inactive_grace(),
+            screen_inhibit: ScreenInhibitMode::WhileActive,
             idle_timeout_seconds: default_idle_timeout(),
             idle_stability_seconds: default_idle_stability(),
+            idle_view: IdleViewMode::None,
             idle_visual_brightness_percent: default_idle_brightness(),
-            refresh_saving_strength: default_refresh_saving(),
-            external_realtime: true,
-            external_prevents_idle: true,
-            external_sample_seconds: default_power_sample_seconds(),
-            external_enter_samples: default_power_enter_samples(),
-            external_exit_samples: default_power_exit_samples(),
-            codex_keep_bright: true,
-            codex_protection_minutes: default_codex_protection_minutes(),
-            codex_attention_seconds: default_codex_attention_seconds(),
-            codex_completion_sound: true,
+            quiet_hours_enabled: false,
+            quiet_hours_start_hour: 0,
+            quiet_hours_end_hour: default_quiet_hours_end(),
+            external_boost: false,
+            power_sample_seconds: default_power_sample_seconds(),
+            thermal_sample_seconds: default_thermal_sample_seconds(),
+            agent_attention_seconds: default_agent_attention_seconds(),
+            agent_completion_sound: true,
             bring_to_foreground_on_attention: false,
-            cpu_activity_hint: false,
-            idle_display: default_idle_display(),
+            observation_lease_seconds: default_observation_lease_seconds(),
+            battery_low_enter_percent: default_battery_low_enter_percent(),
+            battery_low_exit_percent: default_battery_low_exit_percent(),
+            battery_critical_enter_percent: default_battery_critical_enter_percent(),
+            battery_critical_exit_percent: default_battery_critical_exit_percent(),
         }
     }
 }
@@ -225,41 +280,47 @@ impl Default for RuntimeConfig {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_screen_on: Option<bool>,
+    pub profile: Option<RuntimeProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_power_saving: Option<bool>,
+    pub inactive_grace_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_inhibit: Option<ScreenInhibitMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_stability_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_view: Option<IdleViewMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_visual_brightness_percent: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_saving_strength: Option<String>,
+    pub quiet_hours_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_realtime: Option<bool>,
+    pub quiet_hours_start_hour: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_prevents_idle: Option<bool>,
+    pub quiet_hours_end_hour: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_sample_seconds: Option<u64>,
+    pub external_boost: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_enter_samples: Option<u32>,
+    pub power_sample_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_exit_samples: Option<u32>,
+    pub thermal_sample_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_keep_bright: Option<bool>,
+    pub agent_attention_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_protection_minutes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_attention_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_completion_sound: Option<bool>,
+    pub agent_completion_sound: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bring_to_foreground_on_attention: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_activity_hint: Option<bool>,
+    pub observation_lease_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_display: Option<String>,
+    pub battery_low_enter_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_low_exit_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_critical_enter_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_critical_exit_percent: Option<u8>,
 }
 
 impl RuntimeOverride {
@@ -267,24 +328,27 @@ impl RuntimeOverride {
         apply_overrides!(
             self,
             target,
-            keep_screen_on,
-            idle_power_saving,
+            profile,
+            inactive_grace_seconds,
+            screen_inhibit,
             idle_timeout_seconds,
             idle_stability_seconds,
+            idle_view,
             idle_visual_brightness_percent,
-            refresh_saving_strength,
-            external_realtime,
-            external_prevents_idle,
-            external_sample_seconds,
-            external_enter_samples,
-            external_exit_samples,
-            codex_keep_bright,
-            codex_protection_minutes,
-            codex_attention_seconds,
-            codex_completion_sound,
+            quiet_hours_enabled,
+            quiet_hours_start_hour,
+            quiet_hours_end_hour,
+            external_boost,
+            power_sample_seconds,
+            thermal_sample_seconds,
+            agent_attention_seconds,
+            agent_completion_sound,
             bring_to_foreground_on_attention,
-            cpu_activity_hint,
-            idle_display
+            observation_lease_seconds,
+            battery_low_enter_percent,
+            battery_low_exit_percent,
+            battery_critical_enter_percent,
+            battery_critical_exit_percent
         );
     }
 
@@ -293,24 +357,27 @@ impl RuntimeOverride {
             self,
             previous,
             next,
-            keep_screen_on,
-            idle_power_saving,
+            profile,
+            inactive_grace_seconds,
+            screen_inhibit,
             idle_timeout_seconds,
             idle_stability_seconds,
+            idle_view,
             idle_visual_brightness_percent,
-            refresh_saving_strength,
-            external_realtime,
-            external_prevents_idle,
-            external_sample_seconds,
-            external_enter_samples,
-            external_exit_samples,
-            codex_keep_bright,
-            codex_protection_minutes,
-            codex_attention_seconds,
-            codex_completion_sound,
+            quiet_hours_enabled,
+            quiet_hours_start_hour,
+            quiet_hours_end_hour,
+            external_boost,
+            power_sample_seconds,
+            thermal_sample_seconds,
+            agent_attention_seconds,
+            agent_completion_sound,
             bring_to_foreground_on_attention,
-            cpu_activity_hint,
-            idle_display
+            observation_lease_seconds,
+            battery_low_enter_percent,
+            battery_low_exit_percent,
+            battery_critical_enter_percent,
+            battery_critical_exit_percent
         );
     }
 }
@@ -554,39 +621,37 @@ pub struct CardConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CardRuntimeConfig {
-    #[serde(default, skip_serializing_if = "is_default_runtime_class")]
-    pub class: CardRuntimeClass,
-    #[serde(default, skip_serializing_if = "is_default_idle_behavior")]
-    pub idle_behavior: CardIdleBehavior,
+    #[serde(default, skip_serializing_if = "is_default_workload")]
+    pub workload: CardWorkload,
+    #[serde(default, skip_serializing_if = "is_inherit_behavior")]
+    pub inactive_behavior: CardWorkBehavior,
+    #[serde(default, skip_serializing_if = "is_inherit_behavior")]
+    pub idle_behavior: CardWorkBehavior,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_multiplier: Option<f64>,
+    pub inactive_interval_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_realtime: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realtime_multiplier: Option<f64>,
+    pub idle_interval_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum CardRuntimeClass {
+#[serde(rename_all = "lowercase")]
+pub enum CardWorkload {
     #[default]
     Auto,
-    SystemRealtime,
-    NetworkRate,
-    NetworkStatus,
-    BatteryThermal,
-    Command,
-    Http,
-    File,
-    Static,
+    Live,
+    Normal,
+    Expensive,
+    Event,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum CardIdleBehavior {
+pub enum CardWorkBehavior {
     #[default]
+    Inherit,
+    Keep,
     Throttle,
     Pause,
 }
@@ -594,11 +659,11 @@ pub enum CardIdleBehavior {
 impl Default for CardRuntimeConfig {
     fn default() -> Self {
         Self {
-            class: CardRuntimeClass::Auto,
-            idle_behavior: CardIdleBehavior::Throttle,
-            idle_multiplier: None,
-            external_realtime: None,
-            realtime_multiplier: None,
+            workload: CardWorkload::Auto,
+            inactive_behavior: CardWorkBehavior::Inherit,
+            idle_behavior: CardWorkBehavior::Inherit,
+            inactive_interval_seconds: None,
+            idle_interval_seconds: None,
             minimum_interval_seconds: None,
         }
     }
@@ -643,12 +708,12 @@ fn is_default_card_runtime(value: &CardRuntimeConfig) -> bool {
     *value == CardRuntimeConfig::default()
 }
 
-fn is_default_runtime_class(value: &CardRuntimeClass) -> bool {
-    *value == CardRuntimeClass::Auto
+fn is_default_workload(value: &CardWorkload) -> bool {
+    *value == CardWorkload::Auto
 }
 
-fn is_default_idle_behavior(value: &CardIdleBehavior) -> bool {
-    *value == CardIdleBehavior::Throttle
+fn is_inherit_behavior(value: &CardWorkBehavior) -> bool {
+    *value == CardWorkBehavior::Inherit
 }
 
 pub(crate) fn parse_duration(value: &str) -> Result<u64, String> {
@@ -1354,10 +1419,32 @@ mod tests {
     }
 
     #[test]
+    fn empty_root_with_disabled_capability_module_keeps_default_registry() {
+        let dir = TestDir::new();
+        let root = dir.path().join("config.toml");
+        let modules = dir.path().join("config.d");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(&root, "schema_version = 4\n").unwrap();
+        std::fs::write(
+            modules.join("70-system-cards.toml"),
+            "schema_version = 4\n[[cards]]\nid = 'system-load'\ntitle = 'Load'\npage = 'monitor'\nenabled = false\n",
+        )
+        .unwrap();
+
+        let mut manager = ConfigManager::new(root);
+        manager.load().unwrap();
+        assert!(manager.config().cards.iter().all(|card| !card.enabled));
+        assert!(manager.uses_default_card_registry());
+    }
+
+    #[test]
     fn current_json_example_is_valid() {
         let config: AppConfig =
             serde_json::from_str(include_str!("../../config/config.example.json")).unwrap();
+        let toml_config: AppConfig =
+            toml::from_str(include_str!("../../config/config.example.toml")).unwrap();
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.runtime, toml_config.runtime);
         assert_eq!(config.app.title, "PulseDeck");
         assert!(config.cards.iter().any(|card| card.id == "cpu"));
         assert!(config.cards.iter().any(|card| {
@@ -1376,7 +1463,7 @@ mod tests {
     #[test]
     fn plugin_page_options_are_generic() {
         let config: AppConfig = toml::from_str(
-            "schema_version=3\n[[pages]]\nid='plugin-page'\ntitle='Plugin'\nkind='example'\n[pages.plugin]\nvalue=7\n",
+            "schema_version=4\n[[pages]]\nid='plugin-page'\ntitle='Plugin'\nkind='example'\n[pages.plugin]\nvalue=7\n",
         )
         .unwrap();
         let page = &config.pages[0];
@@ -1388,7 +1475,7 @@ mod tests {
     #[test]
     fn cards_can_reference_hidden_click_actions() {
         let config: AppConfig = toml::from_str(
-            "schema_version=3\n[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle-service'\n\
+            "schema_version=4\n[[cards]]\nid='service'\ntitle='Service'\npage='monitor'\nclick_action='toggle-service'\n\
              [[actions]]\nid='toggle-service'\nname='Toggle'\npage='actions'\nvisible=false\nconfirm=true\n\
              confirm_title='Confirm toggle?'\nconfirm_detail='Changes the service state.'\n",
         )
@@ -1412,7 +1499,7 @@ mod tests {
     #[test]
     fn omitted_optional_ui_fields_receive_current_defaults() {
         let config: AppConfig =
-            toml::from_str("schema_version=3\n[ui]\ndefault_page='monitor'\n").unwrap();
+            toml::from_str("schema_version=4\n[ui]\ndefault_page='monitor'\n").unwrap();
         assert_eq!(config.ui.card_columns, 3);
         assert_eq!(config.ui.card_height, 133);
         assert!(config.ui.fixed_card_size);
@@ -1421,7 +1508,7 @@ mod tests {
     #[test]
     fn standard_cards_decode_visual_states_and_multicolor_backgrounds() {
         let config: AppConfig = toml::from_str(
-            "schema_version=3\n[[cards]]\nid='thermal'\ntitle='Thermal'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='thermal'\ntitle='Thermal'\npage='monitor'\n\
              [cards.display.transition]\nduration_ms=240\n\
              [[cards.display.states]]\nname='hot'\nmin=45.0\nlabel='Too hot'\n\
              [cards.display.states.colors]\naccent='#e01b24'\nbackground=['#e01b24','#9141ac']\n",
@@ -1437,7 +1524,7 @@ mod tests {
     #[test]
     fn standard_cards_decode_restrained_svg_artwork_options() {
         let config: AppConfig = toml::from_str(
-            "schema_version=3\n[[cards]]\nid='illustrated'\ntitle='Illustrated'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='illustrated'\ntitle='Illustrated'\npage='monitor'\n\
              [cards.display.logo_svg]\npath='logos/card.svg'\nsize=28\nopacity=0.95\n\
              [cards.display.background_svg]\npath='backgrounds/card.svg'\nopacity=0.16\nfit='cover'\nposition='top-right'\n",
         )
@@ -1460,38 +1547,57 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_v3_runtime_fields_and_unknown_v4_enums_are_rejected() {
+        for runtime in [
+            "keep_screen_on=true",
+            "idle_power_saving=true",
+            "codex_protection_minutes=60",
+            "profile='turbo'",
+            "screen_inhibit='always'",
+        ] {
+            let document = format!("schema_version=4\n[runtime]\n{runtime}\n");
+            assert!(toml::from_str::<AppConfig>(&document).is_err(), "{runtime}");
+        }
+    }
+
+    #[test]
     fn obsolete_generic_card_fields_are_rejected() {
         assert!(toml::from_str::<AppConfig>("[app]\ntitle='missing version'\n").is_err());
         assert!(toml::from_str::<AppConfig>(
-            "schema_version=3\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
              [cards.source]\ntype='command'\nshell=true\n"
         )
         .is_err());
         assert!(toml::from_str::<AppConfig>(
-            "schema_version=3\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
              [cards.source]\ntype='http'\n[cards.source.parser]\ntype='number'\nsteps=[]\n"
         )
         .is_err());
         assert!(toml::from_str::<AppConfig>(
-            "schema_version=3\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
              [cards.source]\ntype='static'\n"
         )
         .is_err());
         assert!(toml::from_str::<AppConfig>(
-            "schema_version=3\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
              [cards.runtime]\nclass='system'\n"
         )
         .is_err());
         assert!(toml::from_str::<AppConfig>(
-            "schema_version=3\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\nrefresh_interval=5\n"
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\n\
+             [cards.runtime]\nworkload='burst'\n"
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "schema_version=4\n[[cards]]\nid='legacy'\ntitle='Legacy'\npage='monitor'\nrefresh_interval=5\n"
         )
         .is_err());
     }
 
     #[test]
-    fn compact_v3_card_syntax_round_trips_without_default_noise() {
+    fn compact_v4_card_syntax_round_trips_without_default_noise() {
         let config: ConfigFragment = toml::from_str(
-            "schema_version=3\nname='personal'\nreplace_existing=true\n\
+            "schema_version=4\nname='personal'\nreplace_existing=true\n\
              [[cards]]\nid='kernel'\ntitle='Kernel'\npage='monitor'\nrefresh='1h'\n\
              source={command={run=['uname','-r'],timeout='5s'}}\n",
         )
@@ -1515,17 +1621,17 @@ mod tests {
         std::fs::create_dir_all(&modules).unwrap();
         std::fs::write(
             &root,
-            "schema_version=3\n[[pages]]\nid='monitor'\ntitle='Monitor'\n",
+            "schema_version=4\n[[pages]]\nid='monitor'\ntitle='Monitor'\n",
         )
         .unwrap();
         std::fs::write(
             modules.join("20-second.json"),
-            r#"{"schema_version":3,"cards":[{"id":"second","title":"Second","page":"monitor"}]}"#,
+            r#"{"schema_version":4,"cards":[{"id":"second","title":"Second","page":"monitor"}]}"#,
         )
         .unwrap();
         std::fs::write(
             modules.join("10-first.toml"),
-            "schema_version=3\n[[cards]]\nid='first'\ntitle='First'\npage='monitor'\n",
+            "schema_version=4\n[[cards]]\nid='first'\ntitle='First'\npage='monitor'\n",
         )
         .unwrap();
         std::fs::write(
@@ -1560,7 +1666,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             &root,
-            "schema_version=3\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
              [cards.display.logo_svg]\npath='backgrounds/card.svg'\n\
              [cards.display.background_svg]\npath='backgrounds/card.svg'\n",
         )
@@ -1572,7 +1678,7 @@ mod tests {
 
         std::fs::write(
             &root,
-            "schema_version=3\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='svg-card'\ntitle='SVG'\npage='monitor'\n\
              [cards.display.background_svg]\npath='backgrounds/missing.svg'\n",
         )
         .unwrap();
@@ -1588,7 +1694,7 @@ mod tests {
         let root = directory.path().join("config.toml");
         std::fs::write(
             &root,
-            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
              [cards.display.background_svg]\npath='card.png'\n",
         )
         .unwrap();
@@ -1603,7 +1709,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             &root,
-            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
              [cards.display.background_svg]\npath='card.svg'\nopacity=1.1\n",
         )
         .unwrap();
@@ -1612,12 +1718,73 @@ mod tests {
 
         std::fs::write(
             &root,
-            "schema_version=3\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
+            "schema_version=4\n[[cards]]\nid='image-card'\ntitle='Image'\npage='monitor'\n\
              [cards.display.logo_svg]\npath='card.svg'\nsize=65\n",
         )
         .unwrap();
         let error = manager.load().unwrap_err().to_string();
         assert!(error.contains("logo_svg size must be between 8 and 64"));
+    }
+
+    #[test]
+    fn quiet_hours_reject_out_of_range_hours() {
+        let dir = TestDir::new();
+        let root = dir.path().join("config.toml");
+        std::fs::write(
+            &root,
+            "schema_version=4\n[runtime]\nquiet_hours_enabled=true\nquiet_hours_start_hour=24\nquiet_hours_end_hour=8\n",
+        )
+        .unwrap();
+        let mut manager = ConfigManager::new(root);
+        assert!(manager
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("quiet_hours_start_hour"));
+    }
+
+    #[test]
+    fn observation_lease_and_battery_thresholds_decode_with_defaults() {
+        let config: AppConfig = toml::from_str("schema_version=4\n").unwrap();
+        assert_eq!(config.runtime.observation_lease_seconds, 300);
+        assert_eq!(config.runtime.battery_low_enter_percent, 20);
+        assert_eq!(config.runtime.battery_low_exit_percent, 25);
+        assert_eq!(config.runtime.battery_critical_enter_percent, 10);
+        assert_eq!(config.runtime.battery_critical_exit_percent, 15);
+    }
+
+    #[test]
+    fn invalid_observation_lease_is_rejected() {
+        let dir = TestDir::new();
+        let root = dir.path().join("config.toml");
+        std::fs::write(
+            &root,
+            "schema_version=4\n[runtime]\nobservation_lease_seconds=0\n",
+        )
+        .unwrap();
+        let mut manager = ConfigManager::new(root);
+        assert!(manager
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("observation_lease_seconds"));
+    }
+
+    #[test]
+    fn invalid_battery_hysteresis_is_rejected() {
+        let dir = TestDir::new();
+        let root = dir.path().join("config.toml");
+        std::fs::write(
+            &root,
+            "schema_version=4\n[runtime]\nbattery_low_enter_percent=20\nbattery_low_exit_percent=15\nbattery_critical_enter_percent=10\nbattery_critical_exit_percent=12\n",
+        )
+        .unwrap();
+        let mut manager = ConfigManager::new(root);
+        assert!(manager
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("battery thresholds"));
     }
 
     #[test]
@@ -1627,7 +1794,7 @@ mod tests {
         std::fs::write(&root, "schema_version=2\n").unwrap();
         let mut manager = ConfigManager::new(root);
         let error = manager.load().unwrap_err().to_string();
-        assert!(error.contains("unsupported schema_version 2; expected 3"));
+        assert!(error.contains("unsupported schema_version 2; expected 4"));
     }
 
     #[test]
@@ -1636,10 +1803,10 @@ mod tests {
         let root = directory.path().join("config.toml");
         let modules = directory.path().join("config.d");
         std::fs::create_dir_all(&modules).unwrap();
-        std::fs::write(&root, "schema_version=3\n").unwrap();
+        std::fs::write(&root, "schema_version=4\n").unwrap();
         std::fs::write(
             modules.join("10-card.toml"),
-            "schema_version=3\n[[cards]]\nid='same'\ntitle='First'\npage='monitor'\n",
+            "schema_version=4\n[[cards]]\nid='same'\ntitle='First'\npage='monitor'\n",
         )
         .unwrap();
 
@@ -1647,7 +1814,7 @@ mod tests {
         manager.load().unwrap();
         std::fs::write(
             modules.join("20-duplicate.toml"),
-            "schema_version=3\n[[cards]]\nid='same'\ntitle='Duplicate'\npage='monitor'\n",
+            "schema_version=4\n[[cards]]\nid='same'\ntitle='Duplicate'\npage='monitor'\n",
         )
         .unwrap();
 
@@ -1664,16 +1831,16 @@ mod tests {
         let modules = directory.path().join("config.d");
         let card_module = modules.join("10-card.toml");
         std::fs::create_dir_all(&modules).unwrap();
-        std::fs::write(&root, "schema_version=3\n").unwrap();
+        std::fs::write(&root, "schema_version=4\n").unwrap();
         std::fs::write(
             &card_module,
-            "schema_version=3\n[[cards]]\nid='module-card'\ntitle='Module'\npage='monitor'\n",
+            "schema_version=4\n[[cards]]\nid='module-card'\ntitle='Module'\npage='monitor'\n",
         )
         .unwrap();
 
         let mut manager = ConfigManager::new(root.clone());
         manager.load().unwrap();
-        manager.config_mut().runtime.keep_screen_on = false;
+        manager.config_mut().runtime.screen_inhibit = ScreenInhibitMode::Never;
         manager.config_mut().cards[0].enabled = false;
         manager.save().unwrap();
 
@@ -1681,7 +1848,7 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(&root).unwrap()).unwrap();
         let saved_module: ConfigFragment =
             toml::from_str(&std::fs::read_to_string(&card_module).unwrap()).unwrap();
-        assert!(!saved_root.runtime.keep_screen_on);
+        assert_eq!(saved_root.runtime.screen_inhibit, ScreenInhibitMode::Never);
         assert!(saved_root.cards.is_empty());
         assert!(!saved_module.cards[0].enabled);
     }
@@ -1692,10 +1859,10 @@ mod tests {
         let root = directory.path().join("config.toml");
         let modules = directory.path().join("config.d");
         std::fs::create_dir_all(&modules).unwrap();
-        std::fs::write(&root, "schema_version=3\n").unwrap();
+        std::fs::write(&root, "schema_version=4\n").unwrap();
         std::fs::write(
             modules.join("10-invalid.toml"),
-            "schema_version=3\n[app]\ntitle='Missing explicit replacement'\n",
+            "schema_version=4\n[app]\ntitle='Missing explicit replacement'\n",
         )
         .unwrap();
         let mut manager = ConfigManager::new(root);
@@ -1712,14 +1879,14 @@ mod tests {
         std::fs::create_dir_all(&modules).unwrap();
         std::fs::write(
             &root,
-            "schema_version=3\n[runtime]\nkeep_screen_on=false\nidle_power_saving=false\n\
+            "schema_version=4\n[runtime]\nscreen_inhibit='never'\nprofile='performance'\n\
              [[cards]]\nid='shared'\ntitle='Default'\npage='monitor'\n",
         )
         .unwrap();
         std::fs::write(
             &override_module,
-            "schema_version=3\nname='personal'\nreplace_existing=true\n\
-             [runtime]\nkeep_screen_on=true\n\
+            "schema_version=4\nname='personal'\nreplace_existing=true\n\
+             [runtime]\nscreen_inhibit='while-mapped'\n\
              [[cards]]\nid='shared'\ntitle='Custom'\npage='monitor'\n",
         )
         .unwrap();
@@ -1727,10 +1894,16 @@ mod tests {
         let mut manager = ConfigManager::new(root.clone());
         manager.load().unwrap();
         assert_eq!(manager.config().cards[0].title, "Custom");
-        assert!(manager.config().runtime.keep_screen_on);
-        assert!(!manager.config().runtime.idle_power_saving);
+        assert_eq!(
+            manager.config().runtime.screen_inhibit,
+            ScreenInhibitMode::WhileMapped
+        );
+        assert_eq!(
+            manager.config().runtime.profile,
+            RuntimeProfile::Performance
+        );
         manager.config_mut().cards[0].title = "Saved Custom".into();
-        manager.config_mut().runtime.keep_screen_on = false;
+        manager.config_mut().runtime.screen_inhibit = ScreenInhibitMode::Never;
         manager.save().unwrap();
 
         let saved_root: AppConfig =
@@ -1738,20 +1911,20 @@ mod tests {
         let saved_override: ConfigFragment =
             toml::from_str(&std::fs::read_to_string(&override_module).unwrap()).unwrap();
         assert_eq!(saved_root.cards[0].title, "Default");
-        assert!(!saved_root.runtime.keep_screen_on);
+        assert_eq!(saved_root.runtime.screen_inhibit, ScreenInhibitMode::Never);
         assert_eq!(saved_override.cards[0].title, "Saved Custom");
         assert_eq!(
             saved_override
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.keep_screen_on),
-            Some(false)
+                .and_then(|runtime| runtime.screen_inhibit),
+            Some(ScreenInhibitMode::Never)
         );
         assert_eq!(
             saved_override
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.idle_power_saving),
+                .and_then(|runtime| runtime.profile),
             None
         );
     }
