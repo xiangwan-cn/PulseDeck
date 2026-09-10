@@ -65,6 +65,7 @@ pub struct MetricCard {
     base_icon: Option<String>,
     style_class: String,
     style_provider: Option<gtk::CssProvider>,
+    style_display: Option<gtk::gdk::Display>,
     customization: Option<DisplayConfig>,
     visual_rules: Vec<VisualRule>,
     active_state_class: Option<String>,
@@ -278,6 +279,7 @@ impl MetricCard {
             base_icon: model.icon.clone(),
             style_class,
             style_provider: None,
+            style_display: None,
             customization: None,
             visual_rules: Vec::new(),
             active_state_class: None,
@@ -457,18 +459,24 @@ impl MetricCard {
             }
             return;
         }
-        let provider = self.style_provider.get_or_insert_with(|| {
-            let provider = gtk::CssProvider::new();
+        if self.style_provider.is_none() {
+            self.style_provider = Some(gtk::CssProvider::new());
+        }
+        if self.style_display.is_none() {
             if let Some(display) = gtk::gdk::Display::default() {
-                gtk::style_context_add_provider_for_display(
-                    &display,
-                    &provider,
-                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                );
+                if let Some(provider) = &self.style_provider {
+                    gtk::style_context_add_provider_for_display(
+                        &display,
+                        provider,
+                        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                    );
+                    self.style_display = Some(display);
+                }
             }
-            provider
-        });
-        provider.load_from_data(&css);
+        }
+        if let Some(provider) = &self.style_provider {
+            provider.load_from_data(&css);
+        }
     }
 
     fn set_logo_svg(&mut self, config: Option<&CardLogoSvgConfig>) {
@@ -665,6 +673,19 @@ impl MetricCard {
             Some("warning") => value.add_css_class("metric-value-warning"),
             Some("critical") | Some("error") => value.add_css_class("metric-value-critical"),
             _ => {}
+        }
+    }
+}
+
+impl Drop for MetricCard {
+    fn drop(&mut self) {
+        // Per-card providers are registered at display scope. Remove the
+        // provider before releasing it so a hot-reloaded/removed card does
+        // not leave its selector rules attached to the display forever.
+        if let (Some(display), Some(provider)) =
+            (self.style_display.take(), self.style_provider.take())
+        {
+            gtk::style_context_remove_provider_for_display(&display, &provider);
         }
     }
 }

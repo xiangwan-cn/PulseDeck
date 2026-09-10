@@ -25,6 +25,12 @@ impl crate::plugins::PagePlugin for Plugin {
         let config: PageConfig = options.clone().try_into().map_err(|error| {
             crate::core::error::AppError::Plugin(format!("invalid scrcpy-forge config: {error}"))
         })?;
-        Ok(page::build(context.handle.clone(), config, context.runtime.clone()).upcast())
+        Ok(page::build(
+            context.handle.clone(),
+            config,
+            context.runtime.clone(),
+            context.shutdown.clone(),
+        )
+        .upcast())
     }
 }

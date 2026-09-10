@@ -1,6 +1,6 @@
-use crate::execution::subprocess::run_command;
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
+use std::sync::{atomic::AtomicBool, Arc};
 
 pub struct CommandMetric {
     program: String,
@@ -30,14 +30,21 @@ impl CommandMetric {
         }
     }
 
-    pub fn collect_no_ctx(&mut self, global_max_output: usize) -> MetricResult {
+    pub fn collect_no_ctx(
+        &mut self,
+        global_max_output: usize,
+        shutdown: Arc<AtomicBool>,
+    ) -> MetricResult {
         let max_output = self.max_output_bytes.min(global_max_output).max(1);
-        let output = crate::tokio_handle().block_on(run_command(
-            &self.program,
-            &self.args,
-            self.timeout_secs,
-            max_output,
-        ));
+        let output = crate::tokio_handle().block_on(
+            crate::execution::subprocess::run_command_with_shutdown(
+                &self.program,
+                &self.args,
+                self.timeout_secs,
+                max_output,
+                shutdown,
+            ),
+        );
         match output {
             Ok(output) if output.success => self.render_success(output.stdout),
             Ok(output) => MetricResult {

@@ -29,6 +29,8 @@ impl CardPlugin for Plugin {
             config,
             context.presentation.clone(),
             context.runtime.clone(),
+            context.handle.clone(),
+            context.shutdown.clone(),
         )?
         .upcast())
     }

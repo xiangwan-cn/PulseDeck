@@ -1,5 +1,8 @@
 /target/
 
+# Local analysis and generated documents.
+/docs/
+
 # Local Codex project instructions (machine-specific development policy).
 /AGENTS.md
 

@@ -39,6 +39,13 @@ fn main() -> glib::ExitCode {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_commit = env!("PULSEDECK_GIT_COMMIT"),
+        binary = ?std::env::current_exe().ok(),
+        "PulseDeck starting"
+    );
+
     let _ = &*TOKIO_RT;
 
     let app = adw::Application::new(

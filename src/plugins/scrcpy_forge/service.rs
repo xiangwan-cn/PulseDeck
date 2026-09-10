@@ -4,7 +4,7 @@ use super::config::{Endpoints, PageConfig};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::{Child, Command, Stdio},
     rc::Rc,
     sync::Arc,
@@ -73,6 +73,44 @@ pub struct Client {
 struct CachedPreview {
     etag: Option<String>,
     bytes: bytes::Bytes,
+    last_used: Instant,
+}
+
+fn preview_cache_key(serial: &str, has_session: bool) -> String {
+    format!(
+        "{serial}:{}",
+        if has_session { "session" } else { "device" }
+    )
+}
+
+const MAX_PREVIEW_CACHE_ENTRIES: usize = 32;
+const MAX_PREVIEW_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Option<bytes::Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|length| length as usize)
+            .unwrap_or(64 * 1024)
+            .min(limit),
+    );
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes::Bytes::from(bytes))
 }
 impl Client {
     pub fn new(config: &PageConfig) -> Self {
@@ -154,9 +192,9 @@ impl Client {
                 } else {
                     client.endpoint(&client.endpoints.device_preview, &d.serial)
                 };
-                let cache_key = path.clone();
+                let cache_key = preview_cache_key(&d.serial, has_session);
                 crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
-                let cached = client.previews.lock().await.get(&cache_key).cloned();
+                let cached = client.cached_preview(&cache_key).await;
                 let mut request = client.http.get(client.url(&path));
                 if let Some(etag) = cached.as_ref().and_then(|value| value.etag.as_deref()) {
                     request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -173,15 +211,9 @@ impl Client {
                                 .get(reqwest::header::ETAG)
                                 .and_then(|value| value.to_str().ok())
                                 .map(str::to_owned);
-                            let bytes = response.bytes().await.ok();
+                            let bytes = response_bytes_limited(response, MAX_PREVIEW_BYTES).await;
                             if let Some(bytes) = bytes.as_ref() {
-                                client.previews.lock().await.insert(
-                                    cache_key,
-                                    CachedPreview {
-                                        etag,
-                                        bytes: bytes.clone(),
-                                    },
-                                );
+                                client.store_preview(cache_key, etag, bytes.clone()).await;
                             }
                             bytes
                         } else {
@@ -226,6 +258,16 @@ impl Client {
             }
             previews.push((device, png));
         }
+        let active_keys = previews
+            .iter()
+            .map(|(device, _)| {
+                preview_cache_key(
+                    &device.serial,
+                    device.state == "device" && sessions.contains(&device.serial),
+                )
+            })
+            .collect();
+        self.prune_previews(active_keys).await;
         Ok(Snapshot {
             devices: previews,
             scripts,
@@ -307,6 +349,49 @@ impl Client {
     async fn invalidate_metadata(&self) {
         *self.metadata.lock().await = None;
     }
+
+    async fn cached_preview(&self, key: &str) -> Option<CachedPreview> {
+        let mut previews = self.previews.lock().await;
+        let preview = previews.get_mut(key)?;
+        preview.last_used = Instant::now();
+        Some(preview.clone())
+    }
+
+    async fn store_preview(&self, key: String, etag: Option<String>, bytes: bytes::Bytes) {
+        let mut previews = self.previews.lock().await;
+        previews.insert(
+            key,
+            CachedPreview {
+                etag,
+                bytes,
+                last_used: Instant::now(),
+            },
+        );
+        while previews.len() > MAX_PREVIEW_CACHE_ENTRIES
+            || previews
+                .values()
+                .map(|preview| preview.bytes.len())
+                .sum::<usize>()
+                > MAX_PREVIEW_CACHE_BYTES
+        {
+            let Some(oldest_key) = previews
+                .iter()
+                .min_by_key(|(_, preview)| preview.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            previews.remove(&oldest_key);
+        }
+    }
+
+    async fn prune_previews(&self, active_keys: HashSet<String>) {
+        self.previews
+            .lock()
+            .await
+            .retain(|key, _| active_keys.contains(key));
+    }
+
     pub async fn start_session(&self, serial: &str) -> anyhow::Result<()> {
         self.http
             .post(self.url(&self.endpoint(&self.endpoints.session_start, serial)))
@@ -368,17 +453,31 @@ impl DaemonController {
         if self.running() {
             return Ok(());
         }
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = command.spawn()?;
         *self.0.borrow_mut() = Some(child);
         Ok(())
     }
     pub fn stop(&self) {
         if let Some(mut child) = self.0.borrow_mut().take() {
+            #[cfg(unix)]
+            {
+                let process_group = -(child.id() as libc::pid_t);
+                unsafe {
+                    let _ = libc::kill(process_group, libc::SIGTERM);
+                    let _ = libc::kill(process_group, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }

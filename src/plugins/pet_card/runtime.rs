@@ -1,8 +1,13 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gio::prelude::*;
@@ -19,6 +24,11 @@ use crate::core::runtime::{
 };
 use crate::plugins::{CardPresentation, CardPresentationHandle};
 
+const RUNTIME_DATA_KEY: &str = "pulsedeck-pet-runtime";
+const MAX_FRAME_CACHE_STATES: usize = 3;
+const MAX_MISSING_FRAME_WARNINGS: usize = 512;
+const MAX_STATE_FILE_BYTES: usize = 128 * 1024;
+
 #[derive(Debug, Deserialize)]
 struct StateEvent {
     state: String,
@@ -31,8 +41,13 @@ struct StateEvent {
     event_id: Option<String>,
 }
 
+struct LoadedFrames {
+    frames: Vec<gdk::Texture>,
+    failures: Vec<(PathBuf, String)>,
+}
+
 struct Runtime {
-    root: gtk::Box,
+    root: glib::WeakRef<gtk::Box>,
     picture: gtk::Picture,
     fallback: gtk::Label,
     status: gtk::Label,
@@ -40,6 +55,11 @@ struct Runtime {
     frames: RefCell<Vec<gdk::Texture>>,
     frame_cache: RefCell<HashMap<String, Vec<gdk::Texture>>>,
     cache_order: RefCell<VecDeque<String>>,
+    loading_states: RefCell<HashMap<String, u64>>,
+    missing_frame_warnings: RefCell<HashSet<PathBuf>>,
+    frame_load_generation: Cell<u64>,
+    state_load_generation: Cell<u64>,
+    state_load_running: Cell<bool>,
     frame_index: Cell<usize>,
     visual_policy: Cell<VisualPolicy>,
     animation_source: RefCell<Option<glib::SourceId>>,
@@ -52,6 +72,8 @@ struct Runtime {
     current_presentation: Cell<CardPresentation>,
     presentation: Option<CardPresentationHandle>,
     runtime: RuntimeHandle,
+    handle: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
 }
 
 pub fn build(
@@ -59,6 +81,8 @@ pub fn build(
     config: PetConfig,
     presentation: Option<CardPresentationHandle>,
     runtime_handle: RuntimeHandle,
+    tokio_handle: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<gtk::Box, AppError> {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
     root.add_css_class("card");
@@ -94,7 +118,7 @@ pub fn build(
 
     let preferred_presentation = load_presentation(&config.presentation_file);
     let runtime = Rc::new(Runtime {
-        root: root.clone(),
+        root: root.downgrade(),
         picture,
         fallback,
         status,
@@ -102,6 +126,11 @@ pub fn build(
         frames: RefCell::new(Vec::new()),
         frame_cache: RefCell::new(HashMap::new()),
         cache_order: RefCell::new(VecDeque::new()),
+        loading_states: RefCell::new(HashMap::new()),
+        missing_frame_warnings: RefCell::new(HashSet::new()),
+        frame_load_generation: Cell::new(0),
+        state_load_generation: Cell::new(0),
+        state_load_running: Cell::new(false),
         frame_index: Cell::new(0),
         visual_policy: Cell::new(VisualPolicy::Stopped),
         animation_source: RefCell::new(None),
@@ -114,6 +143,8 @@ pub fn build(
         current_presentation: Cell::new(CardPresentation::Normal),
         presentation,
         runtime: runtime_handle,
+        handle: tokio_handle,
+        shutdown,
     });
     Runtime::setup_presentation_menu(&runtime);
     runtime.set_state("offline", None, true);
@@ -121,9 +152,17 @@ pub fn build(
     Runtime::watch_visual_policy(&runtime);
     Runtime::watch_mapping(&runtime);
 
-    // The signal closure owns the runtime for exactly as long as the widget.
-    let keep_alive = runtime.clone();
-    root.connect_destroy(move |_| keep_alive.stop_timers());
+    // Store the controller on the widget itself, but explicitly steal it from
+    // the widget during destroy. This keeps the runtime alive while the card
+    // is mounted without leaving the Runtime -> root -> Runtime cycle behind.
+    unsafe {
+        root.set_data(RUNTIME_DATA_KEY, runtime);
+    }
+    root.connect_destroy(move |root| unsafe {
+        if let Some(runtime) = root.steal_data::<Rc<Runtime>>(RUNTIME_DATA_KEY) {
+            runtime.stop_timers();
+        }
+    });
     Ok(root)
 }
 
@@ -136,7 +175,10 @@ impl Runtime {
         let popover = gtk::Popover::new();
         popover.set_has_arrow(true);
         popover.set_autohide(true);
-        popover.set_parent(&this.root);
+        let Some(root) = this.root.upgrade() else {
+            return;
+        };
+        popover.set_parent(&root);
 
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         menu.set_margin_top(6);
@@ -178,7 +220,7 @@ impl Runtime {
             )));
             menu_popover.popup();
         });
-        this.root.add_controller(gesture);
+        root.add_controller(gesture);
 
         let double_click = gtk::GestureClick::new();
         double_click.set_button(gdk::BUTTON_PRIMARY);
@@ -194,9 +236,8 @@ impl Runtime {
                 }
             }
         });
-        this.root.add_controller(double_click);
-        this.root
-            .set_tooltip_text(Some("双击依次切换大小；长按可直接选择显示方式"));
+        root.add_controller(double_click);
+        root.set_tooltip_text(Some("双击依次切换大小；长按可直接选择显示方式"));
     }
 
     fn watch_state_file(this: &Rc<Self>) -> Result<(), AppError> {
@@ -231,14 +272,44 @@ impl Runtime {
     }
 
     fn load_state(self: &Rc<Self>) {
-        let Ok(data) = std::fs::read_to_string(&self.config.state_file) else {
-            self.set_state("offline", None, true);
+        if self.shutdown.load(Ordering::Acquire) {
             return;
-        };
-        let Ok(event) = serde_json::from_str::<StateEvent>(&data) else {
-            tracing::warn!(path = ?self.config.state_file, "ignored invalid pet-card state");
+        }
+        let generation = self.state_load_generation.get().wrapping_add(1);
+        self.state_load_generation.set(generation);
+        if self.state_load_running.replace(true) {
             return;
-        };
+        }
+        let path = self.config.state_file.clone();
+        let handle = self.handle.clone();
+        let weak = Rc::downgrade(self);
+        let join = handle.spawn_blocking(move || read_state_file(path));
+        glib::MainContext::default().spawn_local(async move {
+            let loaded = join.await.unwrap_or_else(|error| {
+                Err(format!("读取 PetCard 状态 worker 失败: {error}"))
+            });
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            if runtime.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            runtime.state_load_running.set(false);
+            if runtime.state_load_generation.get() != generation {
+                runtime.load_state();
+                return;
+            }
+            match loaded {
+                Ok(Some(event)) => runtime.apply_state_event(event),
+                Ok(None) => runtime.set_state("offline", None, true),
+                Err(error) => {
+                    tracing::warn!(path = ?runtime.config.state_file, %error, "ignored invalid pet-card state");
+                }
+            }
+        });
+    }
+
+    fn apply_state_event(self: &Rc<Self>, event: StateEvent) {
         let now = now_ms();
         let max_age = self.config.offline_after_seconds.saturating_mul(1000);
         if now.saturating_sub(event.timestamp_ms) >= max_age {
@@ -337,29 +408,23 @@ impl Runtime {
         self.status
             .set_text(detail.unwrap_or_else(|| state_label(state)));
         self.fallback.set_text(state_emoji(state));
+        self.frame_load_generation
+            .set(self.frame_load_generation.get().wrapping_add(1));
 
         let animation = self
             .config
             .animations
             .get(state)
-            .or_else(|| self.config.animations.get("default"));
-        let textures = animation
-            .map(|value| self.load_frames(state, value))
-            .unwrap_or_default();
-        self.frames.replace(textures);
-        self.frame_index.set(0);
-        if let Some(texture) = self.frames.borrow().first() {
-            self.picture.set_paintable(Some(texture));
-            self.picture.set_visible(true);
-            self.fallback.set_visible(false);
+            .or_else(|| self.config.animations.get("default"))
+            .cloned();
+        let generation = self.frame_load_generation.get();
+        if let Some(textures) = self.cached_frames(state) {
+            self.apply_frames(textures);
         } else {
-            self.picture.set_paintable(Option::<&gdk::Texture>::None);
-            self.picture.set_visible(false);
-            self.fallback.set_visible(true);
-            return;
-        }
-        if self.frames.borrow().len() > 1 {
-            self.apply_runtime_snapshot(&self.runtime.snapshot());
+            self.apply_frames(Vec::new());
+            if let Some(animation) = animation {
+                self.load_frames_async(state, animation, generation);
+            }
         }
     }
 
@@ -380,53 +445,138 @@ impl Runtime {
             }
             Err(error) => {
                 tracing::debug!(%error, "completion sound player unavailable");
-                self.root.error_bell();
+                if let Some(root) = self.root.upgrade() {
+                    root.error_bell();
+                }
             }
         }
     }
 
-    fn load_frames(&self, state: &str, animation: &AnimationConfig) -> Vec<gdk::Texture> {
-        if let Some(frames) = self.frame_cache.borrow().get(state) {
-            return frames.clone();
+    fn cached_frames(&self, state: &str) -> Option<Vec<gdk::Texture>> {
+        let frames = self.frame_cache.borrow().get(state).cloned();
+        if frames.is_some() {
+            let mut order = self.cache_order.borrow_mut();
+            order.retain(|key| key != state);
+            order.push_back(state.to_string());
         }
-        let frames = animation
+        frames
+    }
+
+    fn apply_frames(self: &Rc<Self>, frames: Vec<gdk::Texture>) {
+        self.frames.replace(frames);
+        self.frame_index.set(0);
+        if let Some(texture) = self.frames.borrow().first() {
+            self.picture.set_paintable(Some(texture));
+            self.picture.set_visible(true);
+            self.fallback.set_visible(false);
+        } else {
+            self.picture.set_paintable(Option::<&gdk::Texture>::None);
+            self.picture.set_visible(false);
+            self.fallback.set_visible(true);
+            return;
+        }
+        if self.frames.borrow().len() > 1 {
+            self.apply_runtime_snapshot(&self.runtime.snapshot());
+        }
+    }
+
+    fn load_frames_async(
+        self: &Rc<Self>,
+        state: &str,
+        animation: AnimationConfig,
+        generation: u64,
+    ) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .loading_states
+            .borrow_mut()
+            .insert(state.to_string(), generation)
+            .is_some()
+        {
+            return;
+        }
+        let state = state.to_string();
+        let asset_root = self.config.asset_root.clone();
+        let known_missing = self.missing_frame_warnings.borrow().clone();
+        let paths = animation
             .frames
-            .iter()
-            .filter_map(|path| {
-                let path = resolve_path(self.config.asset_root.as_deref(), path);
-                match gdk::Texture::from_file(&gio::File::for_path(&path)) {
-                    Ok(texture) => {
-                        crate::core::power_debug::increment(
-                            crate::core::power_debug::Counter::ImageDecode,
-                        );
-                        Some(texture)
-                    }
-                    Err(error) => {
-                        tracing::warn!(?path, %error, "failed to load pet frame");
-                        None
-                    }
-                }
-            })
+            .into_iter()
+            .map(|path| resolve_path(asset_root.as_deref(), &path))
+            .filter(|path| !known_missing.contains(path))
             .collect::<Vec<_>>();
+        if paths.is_empty() {
+            self.loading_states.borrow_mut().remove(&state);
+            self.cache_frames(&state, Vec::new());
+            return;
+        }
+        let handle = self.handle.clone();
+        let join = handle.spawn_blocking(move || load_frames(paths));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let loaded = match join.await {
+                Ok(loaded) => loaded,
+                Err(error) => LoadedFrames {
+                    frames: Vec::new(),
+                    failures: vec![(PathBuf::from("<worker>"), error.to_string())],
+                },
+            };
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            if runtime.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let current_load = runtime
+                .loading_states
+                .borrow_mut()
+                .remove(&state)
+                .is_some_and(|load_generation| load_generation == generation);
+            if !current_load {
+                return;
+            }
+            runtime.warn_frame_failures(loaded.failures);
+            runtime.cache_frames(&state, loaded.frames.clone());
+            if *runtime.current_state.borrow() == state {
+                runtime.apply_frames(loaded.frames);
+            }
+        });
+    }
+
+    fn cache_frames(&self, state: &str, frames: Vec<gdk::Texture>) {
         self.frame_cache
             .borrow_mut()
-            .insert(state.to_string(), frames.clone());
+            .insert(state.to_string(), frames);
         let mut order = self.cache_order.borrow_mut();
         order.retain(|key| key != state);
         order.push_back(state.to_string());
-        while order.len() > 3 {
+        while order.len() > MAX_FRAME_CACHE_STATES {
             if let Some(old) = order.pop_front() {
                 if old != state {
                     self.frame_cache.borrow_mut().remove(&old);
                 }
             }
         }
-        frames
+    }
+
+    fn warn_frame_failures(&self, failures: Vec<(PathBuf, String)>) {
+        let mut warned = self.missing_frame_warnings.borrow_mut();
+        for (path, error) in failures {
+            if warned.contains(&path) || warned.len() >= MAX_MISSING_FRAME_WARNINGS {
+                continue;
+            }
+            warned.insert(path.clone());
+            tracing::warn!(?path, %error, "failed to load pet frame");
+        }
     }
 
     fn start_animation(self: &Rc<Self>, animation: &AnimationConfig, cap: Option<u32>) {
         self.stop_animation();
-        if !self.root.is_mapped() {
+        let Some(root) = self.root.upgrade() else {
+            return;
+        };
+        if !root.is_mapped() {
             return;
         }
         let mut fps = animation.fps.unwrap_or(self.config.fps).clamp(1, 12);
@@ -440,10 +590,17 @@ impl Runtime {
             let Some(runtime) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
+            if runtime.shutdown.load(Ordering::Acquire) {
+                runtime.animation_source.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
             // B2's unmapped hard stop is unconditional. The retained
             // compatibility field is decoded below but cannot keep a hidden
             // animation alive.
-            if !runtime.root.is_mapped() {
+            let Some(root) = runtime.root.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !root.is_mapped() {
                 runtime.animation_source.borrow_mut().take();
                 return glib::ControlFlow::Break;
             }
@@ -486,14 +643,17 @@ impl Runtime {
     }
 
     fn watch_mapping(this: &Rc<Self>) {
+        let Some(root) = this.root.upgrade() else {
+            return;
+        };
         let weak = Rc::downgrade(this);
-        this.root.connect_map(move |_| {
+        root.connect_map(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 runtime.apply_runtime_snapshot(&runtime.runtime.snapshot());
             }
         });
         let weak = Rc::downgrade(this);
-        this.root.connect_unmap(move |_| {
+        root.connect_unmap(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 runtime.stop_animation();
             }
@@ -517,7 +677,10 @@ impl Runtime {
                 animation.r#loop,
             )
         });
-        let should_animate = self.root.is_mapped()
+        let Some(root) = self.root.upgrade() else {
+            return;
+        };
+        let should_animate = root.is_mapped()
             && self.frames.borrow().len() > 1
             && matches!(policy, VisualPolicy::Full | VisualPolicy::Capped(_));
         if self.visual_policy.get() == policy
@@ -527,8 +690,7 @@ impl Runtime {
         }
         self.visual_policy.set(policy);
         self.stop_animation();
-        if !self.root.is_mapped() || matches!(policy, VisualPolicy::Stopped | VisualPolicy::Frozen)
-        {
+        if !root.is_mapped() || matches!(policy, VisualPolicy::Stopped | VisualPolicy::Frozen) {
             return;
         }
         let Some(animation) = animation else {
@@ -588,6 +750,12 @@ impl Runtime {
     }
 
     fn stop_timers(&self) {
+        self.frame_load_generation
+            .set(self.frame_load_generation.get().wrapping_add(1));
+        self.loading_states.borrow_mut().clear();
+        if let Some(presentation) = &self.presentation {
+            presentation.close();
+        }
         self.stop_animation();
         if let Some(source) = self.offline_source.borrow_mut().take() {
             source.remove();
@@ -597,9 +765,45 @@ impl Runtime {
         }
         self.cancel_presentation_reset();
         self.monitor.borrow_mut().take();
+        self.frames.replace(Vec::new());
         self.frame_cache.borrow_mut().clear();
         self.cache_order.borrow_mut().clear();
     }
+}
+
+fn load_frames(paths: Vec<PathBuf>) -> LoadedFrames {
+    let mut loaded = LoadedFrames {
+        frames: Vec::new(),
+        failures: Vec::new(),
+    };
+    for path in paths {
+        match gdk::Texture::from_file(&gio::File::for_path(&path)) {
+            Ok(texture) => {
+                crate::core::power_debug::increment(crate::core::power_debug::Counter::ImageDecode);
+                loaded.frames.push(texture);
+            }
+            Err(error) => loaded.failures.push((path, error.to_string())),
+        }
+    }
+    loaded
+}
+
+fn read_state_file(path: PathBuf) -> Result<Option<StateEvent>, String> {
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取文件失败: {error}")),
+    };
+    let mut bytes = Vec::with_capacity(MAX_STATE_FILE_BYTES.min(8192).saturating_add(1));
+    file.take((MAX_STATE_FILE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取文件失败: {error}"))?;
+    if bytes.len() > MAX_STATE_FILE_BYTES {
+        return Err(format!("状态文件超过 {} 字节限制", MAX_STATE_FILE_BYTES));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("状态 JSON 无效: {error}"))
 }
 
 fn state_file_event_matches(

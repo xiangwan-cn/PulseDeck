@@ -1,5 +1,6 @@
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
+use std::io::Read;
 
 use super::traits::MetricContext;
 
@@ -16,9 +17,10 @@ impl FileMetric {
         }
     }
 
-    pub fn collect(&mut self, _ctx: &MetricContext) -> MetricResult {
-        let content = match std::fs::read_to_string(&self.path) {
-            Ok(c) => c,
+    pub fn collect(&mut self, _ctx: &MetricContext, max_output: usize) -> MetricResult {
+        let limit = max_output.max(1);
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
             Err(e) => {
                 return MetricResult {
                     value: CardValue::Text("不可用".into()),
@@ -28,6 +30,37 @@ impl FileMetric {
                     cached: false,
                     metadata: None,
                 }
+            }
+        };
+        let mut bytes = Vec::with_capacity(limit.min(8192).saturating_add(1));
+        if let Err(error) = file
+            .take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+        {
+            return MetricResult {
+                value: CardValue::Text("不可用".into()),
+                subtitle: None,
+                tooltip: Some(format!("读取文件失败 {}: {}", self.path.display(), error)),
+                state: MetricState::Unavailable,
+                cached: false,
+                metadata: None,
+            };
+        }
+        if bytes.len() > limit {
+            return MetricResult::error(format!(
+                "文件内容超过 {} 字节限制: {}",
+                limit,
+                self.path.display()
+            ));
+        }
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(error) => {
+                return MetricResult::error(format!(
+                    "文件不是有效 UTF-8 {}: {}",
+                    self.path.display(),
+                    error
+                ));
             }
         };
 

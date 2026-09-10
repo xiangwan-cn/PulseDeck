@@ -5,6 +5,7 @@
 
 use crate::core::config::{CardConfig, PageConfig};
 use crate::core::error::AppError;
+use std::sync::{atomic::AtomicBool, Arc};
 
 #[cfg(feature = "pet-card")]
 pub mod pet_card;
@@ -22,6 +23,7 @@ pub struct PluginContext {
         allow(dead_code)
     )]
     pub runtime: crate::core::runtime::RuntimeHandle,
+    pub shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,16 +39,37 @@ pub enum CardPresentation {
 #[derive(Clone)]
 pub struct CardPresentationHandle {
     sender: async_channel::Sender<CardPresentation>,
+    // Cloned receivers are used only to discard the previous pending request
+    // when the bounded channel is full. The presentation owner still has the
+    // receiver returned by channel(), so requests remain delivered to the
+    // single GLib projection task.
+    drain: async_channel::Receiver<CardPresentation>,
 }
 
 impl CardPresentationHandle {
     pub fn channel() -> (Self, async_channel::Receiver<CardPresentation>) {
-        let (sender, receiver) = async_channel::unbounded();
-        (Self { sender }, receiver)
+        let (sender, receiver) = async_channel::bounded(1);
+        (
+            Self {
+                sender,
+                drain: receiver.clone(),
+            },
+            receiver,
+        )
     }
 
     pub fn request(&self, presentation: CardPresentation) {
-        let _ = self.sender.try_send(presentation);
+        match self.sender.try_send(presentation) {
+            Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
+            Err(async_channel::TrySendError::Full(presentation)) => {
+                let _ = self.drain.try_recv();
+                let _ = self.sender.try_send(presentation);
+            }
+        }
+    }
+
+    pub fn close(&self) {
+        self.sender.close();
     }
 }
 

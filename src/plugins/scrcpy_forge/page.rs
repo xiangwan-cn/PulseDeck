@@ -3,8 +3,13 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
     time::Duration,
 };
 
@@ -14,7 +19,7 @@ use gtk::{
 };
 
 use super::config::{CardConfig, PageConfig as ScrcpyForgeConfig};
-use super::service::{Client, DaemonController, Device, Snapshot};
+use super::service::{Client, DaemonController, Device, SessionMetrics, Snapshot};
 use crate::core::runtime::{RuntimeHandle, WorkLevel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +28,86 @@ enum PreviewMode {
     Reduced,
     MetadataOnly,
     Stopped,
+}
+
+struct DecodedPreview {
+    hash: u64,
+    texture: gtk::gdk::Texture,
+}
+
+struct DecodedSnapshot {
+    devices: Vec<(Device, Option<DecodedPreview>)>,
+    scripts: Vec<String>,
+    runs: Vec<super::service::ScriptRun>,
+    sessions: Vec<String>,
+    metrics: HashMap<String, SessionMetrics>,
+}
+
+const MAX_PREVIEW_DECODE_TASKS: usize = 2;
+static PREVIEW_DECODE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_PREVIEW_DECODE_TASKS)));
+
+async fn decode_snapshot(
+    snapshot: Snapshot,
+    handle: &tokio::runtime::Handle,
+    permits: Arc<tokio::sync::Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<DecodedSnapshot> {
+    let permit = until_shutdown(permits.acquire_owned(), shutdown.clone())
+        .await?
+        .ok()?;
+    until_shutdown(
+        handle.spawn_blocking(move || {
+            let _permit = permit;
+            let devices = snapshot
+                .devices
+                .into_iter()
+                .map(|(device, png)| {
+                    let preview = png.and_then(|png| {
+                        let mut hasher = DefaultHasher::new();
+                        png.hash(&mut hasher);
+                        let hash = hasher.finish();
+                        gtk::gdk::Texture::from_bytes(&glib::Bytes::from(png.as_ref()))
+                            .ok()
+                            .map(|texture| {
+                                crate::core::power_debug::increment(
+                                    crate::core::power_debug::Counter::ImageDecode,
+                                );
+                                DecodedPreview { hash, texture }
+                            })
+                    });
+                    (device, preview)
+                })
+                .collect();
+            DecodedSnapshot {
+                devices,
+                scripts: snapshot.scripts,
+                runs: snapshot.runs,
+                sessions: snapshot.sessions,
+                metrics: snapshot.metrics,
+            }
+        }),
+        shutdown,
+    )
+    .await?
+    .ok()
+}
+
+async fn until_shutdown<F, T>(future: F, shutdown: Arc<AtomicBool>) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => Some(result),
+        _ = wait_for_shutdown(shutdown) => None,
+    }
+}
+
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn preview_mode(level: WorkLevel, periodic_refresh_paused: bool) -> PreviewMode {
@@ -41,6 +126,7 @@ pub fn build(
     handle: tokio::runtime::Handle,
     cfg: ScrcpyForgeConfig,
     runtime: RuntimeHandle,
+    shutdown: Arc<AtomicBool>,
 ) -> gtk::ScrolledWindow {
     let mut cards = if cfg.cards.is_empty() {
         default_cards()
@@ -81,6 +167,7 @@ pub fn build(
                 daemon.clone(),
                 handle.clone(),
                 runtime.clone(),
+                shutdown.clone(),
             )),
             "devices" => {
                 devices_cfg = Some(card);
@@ -97,17 +184,24 @@ pub fn build(
     let preview_height = cfg.preview_height.max(1);
     let preview_width = (cfg.card_width - 20).max(1);
 
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = async_channel::bounded(1);
     let busy = Rc::new(Cell::new(false));
     let request = {
         let client = client.clone();
         let handle = handle.clone();
         let tx = tx.clone();
+        let shutdown = shutdown.clone();
         move |include_previews: bool| {
             let client = client.clone();
             let tx = tx.clone();
+            let shutdown = shutdown.clone();
             handle.spawn(async move {
-                let _ = tx.try_send(client.snapshot(include_previews).await);
+                let Some(result) =
+                    until_shutdown(client.snapshot(include_previews), shutdown).await
+                else {
+                    return;
+                };
+                let _ = tx.try_send(result);
             });
         }
     };
@@ -119,8 +213,14 @@ pub fn build(
             let _ = visibility_tx.try_send(());
         }
     });
+    let visibility_shutdown = visibility_tx.clone();
+    let snapshot_shutdown = tx.clone();
     flow.connect_unmap(move |_| {
         let _ = visibility_tx.try_send(());
+    });
+    flow.connect_destroy(move |_| {
+        visibility_shutdown.close();
+        snapshot_shutdown.close();
     });
     let weak_flow = flow.downgrade();
     let preview_seconds = cfg.preview_interval_seconds.max(1);
@@ -154,9 +254,10 @@ pub fn build(
         }
     });
     let weak_update_flow = flow.downgrade();
+    let decode_permits = PREVIEW_DECODE_PERMITS.clone();
+    let decode_shutdown = shutdown.clone();
     glib::MainContext::default().spawn_local(async move {
         while let Ok(result) = rx.recv().await {
-            busy.set(false);
             let Some(update_flow) = weak_update_flow.upgrade() else {
                 break;
             };
@@ -164,11 +265,28 @@ pub fn build(
             if preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused)
                 == PreviewMode::Stopped
             {
+                busy.set(false);
                 continue;
             }
             match result {
                 Ok(snapshot) => {
                     crate::core::error_limiter::recovered("scrcpy-forge:snapshot");
+                    let Some(snapshot) = decode_snapshot(
+                        snapshot,
+                        &handle,
+                        decode_permits.clone(),
+                        decode_shutdown.clone(),
+                    )
+                    .await
+                    else {
+                        busy.set(false);
+                        crate::core::error_limiter::warn(
+                            "scrcpy-forge:decode",
+                            "ScrcpyForge preview decode task failed",
+                        );
+                        continue;
+                    };
+                    let render_started = std::time::Instant::now();
                     render_snapshot(
                         &update_flow,
                         &device_views,
@@ -181,7 +299,15 @@ pub fn build(
                         &cfg,
                         preview_width,
                         preview_height,
-                    )
+                        decode_shutdown.clone(),
+                    );
+                    let render_elapsed = render_started.elapsed();
+                    if render_elapsed >= Duration::from_millis(100) {
+                        tracing::warn!(
+                            elapsed_ms = render_elapsed.as_millis() as u64,
+                            "ScrcpyForge GTK projection exceeded budget"
+                        );
+                    }
                 }
                 Err(error) => {
                     scripts_signature.set(0);
@@ -191,6 +317,10 @@ pub fn build(
                     );
                 }
             }
+            // Keep the request gate closed until worker-side decode and the
+            // main-thread widget projection both finish. Otherwise a second
+            // snapshot can overtake this one while it is still being decoded.
+            busy.set(false);
         }
     });
 
@@ -207,6 +337,7 @@ fn backend_card(
     daemon: DaemonController,
     handle: tokio::runtime::Handle,
     runtime: RuntimeHandle,
+    shutdown: Arc<AtomicBool>,
 ) -> GtkBox {
     let card_shell = shell(card, cfg);
     let card_box = card_shell.root;
@@ -230,7 +361,7 @@ fn backend_card(
     connect_row.append(&endpoint);
     connect_row.append(&connect);
     body.append(&connect_row);
-    let (connect_tx, connect_rx) = async_channel::unbounded();
+    let (connect_tx, connect_rx) = async_channel::bounded(1);
     let connect_lease = Rc::new(RefCell::new(None));
     connect.connect_clicked({
         let client = client.clone();
@@ -239,6 +370,7 @@ fn backend_card(
         let connect_tx = connect_tx.clone();
         let runtime = runtime.clone();
         let connect_lease = connect_lease.clone();
+        let shutdown = shutdown.clone();
         move |_| {
             let value = endpoint.text().trim().to_owned();
             if value.is_empty() {
@@ -247,11 +379,13 @@ fn backend_card(
             connect_lease.replace(Some(runtime.begin_interaction(Duration::from_secs(30))));
             let client = client.clone();
             let tx = connect_tx.clone();
+            let shutdown = shutdown.clone();
             handle.spawn(async move {
+                let Some(result) = until_shutdown(client.connect(&value), shutdown).await else {
+                    return;
+                };
                 let _ = tx.try_send(
-                    client
-                        .connect(&value)
-                        .await
+                    result
                         .map(|_| format!("已连接 {value}"))
                         .map_err(|e| e.to_string()),
                 );
@@ -259,16 +393,20 @@ fn backend_card(
         }
     });
     glib::MainContext::default().spawn_local({
-        let status = status.clone();
+        let weak_status = status.downgrade();
         let connect_lease = connect_lease.clone();
         async move {
             while let Ok(result) = connect_rx.recv().await {
                 connect_lease.borrow_mut().take();
+                let Some(status) = weak_status.upgrade() else {
+                    break;
+                };
                 status.set_text(&result.unwrap_or_else(|e| format!("连接失败：{e}")));
             }
         }
     });
     let changing = Rc::new(Cell::new(false));
+    let toggle_shutdown = shutdown.clone();
     toggle.connect_active_notify({
         let daemon = daemon.clone();
         let status = status.clone();
@@ -293,13 +431,15 @@ fn backend_card(
                 status.set_text("正在停止…");
                 daemon.stop();
                 let client = client.clone();
+                let shutdown = toggle_shutdown.clone();
                 handle.spawn(async move {
-                    let _ = client.shutdown().await;
+                    let _ = until_shutdown(client.shutdown(), shutdown).await;
                 });
             }
         }
     });
     let (tx, rx) = async_channel::bounded(1);
+    let health_shutdown = tx.clone();
     let mode_rx = runtime.subscribe();
     let (visible_tx, visible_rx) = async_channel::bounded::<()>(1);
     status.connect_map({
@@ -308,12 +448,18 @@ fn backend_card(
             let _ = visible_tx.try_send(());
         }
     });
+    let visible_shutdown = visible_tx.clone();
     status.connect_unmap(move |_| {
         let _ = visible_tx.try_send(());
+    });
+    status.connect_destroy(move |_| {
+        visible_shutdown.close();
+        health_shutdown.close();
     });
     let weak_status = status.downgrade();
     let weak_toggle = toggle.downgrade();
     let base_interval = cfg.health_interval_seconds.max(1);
+    let health_cancel = shutdown.clone();
     glib::MainContext::default().spawn_local(async move {
         loop {
             let (Some(status), Some(toggle)) = (weak_status.upgrade(), weak_toggle.upgrade())
@@ -325,8 +471,14 @@ fn backend_card(
             if status.is_mapped() && mode != PreviewMode::Stopped {
                 let client = client.clone();
                 let tx = tx.clone();
+                let health_cancel = health_cancel.clone();
                 handle.spawn(async move {
-                    let _ = tx.try_send(client.healthy().await);
+                    let Some(healthy) = until_shutdown(client.healthy(), health_cancel).await
+                    else {
+                        tx.close();
+                        return;
+                    };
+                    let _ = tx.try_send(healthy);
                 });
                 if let Ok(healthy) = rx.recv().await {
                     status.set_text(if healthy { "运行中" } else { "已停止" });
@@ -348,7 +500,7 @@ fn backend_card(
             let visible = Box::pin(visible_rx.recv());
             let first = futures_util::future::select(timer, mode);
             let _ = futures_util::future::select(Box::pin(first), visible).await;
-            if mode_rx.is_closed() || visible_rx.is_closed() {
+            if mode_rx.is_closed() || visible_rx.is_closed() || rx.is_closed() {
                 break;
             }
         }
@@ -360,7 +512,7 @@ fn render_snapshot(
     flow: &FlowBox,
     device_views: &Rc<RefCell<HashMap<String, DevicePairWidgets>>>,
     scripts_signature: &Rc<Cell<u64>>,
-    snapshot: Snapshot,
+    snapshot: DecodedSnapshot,
     client: &Client,
     handle: &tokio::runtime::Handle,
     devices_config: Option<&CardConfig>,
@@ -368,6 +520,7 @@ fn render_snapshot(
     page_config: &ScrcpyForgeConfig,
     preview_width: i32,
     preview_height: i32,
+    shutdown: Arc<AtomicBool>,
 ) {
     let serials: std::collections::HashSet<&str> = snapshot
         .devices
@@ -408,7 +561,7 @@ fn render_snapshot(
             }
         });
         pair.preview
-            .update(device, png.as_deref(), snapshot.metrics.get(&device.serial));
+            .update(device, png.as_ref(), snapshot.metrics.get(&device.serial));
     }
 
     let signature = script_state_signature(&snapshot);
@@ -422,6 +575,7 @@ fn render_snapshot(
                     &snapshot,
                     client.clone(),
                     handle.clone(),
+                    shutdown.clone(),
                 ));
             }
         }
@@ -481,18 +635,13 @@ impl DevicePreviewWidgets {
     fn update(
         &self,
         device: &Device,
-        png: Option<&[u8]>,
+        preview: Option<&DecodedPreview>,
         metrics: Option<&super::service::SessionMetrics>,
     ) {
-        if let Some(png) = png {
-            let mut hasher = DefaultHasher::new();
-            png.hash(&mut hasher);
-            let hash = hasher.finish();
-            if hash != self.frame_hash.get() {
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from(png)) {
-                    self.picture.set_paintable(Some(&texture));
-                    self.frame_hash.set(hash);
-                }
+        if let Some(preview) = preview {
+            if preview.hash != self.frame_hash.get() {
+                self.picture.set_paintable(Some(&preview.texture));
+                self.frame_hash.set(preview.hash);
             }
         } else {
             self.picture.set_paintable(gtk::gdk::Paintable::NONE);
@@ -515,7 +664,7 @@ impl DevicePreviewWidgets {
     }
 }
 
-fn script_state_signature(snapshot: &Snapshot) -> u64 {
+fn script_state_signature(snapshot: &DecodedSnapshot) -> u64 {
     let mut h = DefaultHasher::new();
     snapshot.scripts.hash(&mut h);
     snapshot.sessions.hash(&mut h);
@@ -539,9 +688,10 @@ fn script_state_signature(snapshot: &Snapshot) -> u64 {
 
 fn script_controls(
     device: Device,
-    snapshot: &Snapshot,
+    snapshot: &DecodedSnapshot,
     client: Client,
     handle: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
 ) -> GtkBox {
     let box_ = GtkBox::new(Orientation::Vertical, 7);
     let device_serial = device.serial.clone();
@@ -598,7 +748,8 @@ fn script_controls(
     button.set_sensitive(stopping || (device.state == "device" && !snapshot.scripts.is_empty()));
     let has_session = snapshot.sessions.contains(&device.serial);
     let action_serial = device_serial.clone();
-    let (tx, rx) = async_channel::unbounded::<Result<String, String>>();
+    let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+    let action_shutdown = shutdown.clone();
     button.connect_clicked({
         let status = status.clone();
         let rx = rx.clone();
@@ -610,30 +761,43 @@ fn script_controls(
             let serial = action_serial.clone();
             let selected = scripts.get(combo.selected() as usize).cloned();
             let tx = tx.clone();
+            let shutdown = action_shutdown.clone();
             handle.spawn(async move {
-                let result = async {
-                    if stopping {
-                        client.stop_script(&serial).await?;
-                        Ok("已停止".into())
-                    } else if let Some(script) = selected {
-                        if !has_session {
-                            client.start_session(&serial).await?;
+                let Some(result) = until_shutdown(
+                    async {
+                        if stopping {
+                            client.stop_script(&serial).await?;
+                            Ok("已停止".into())
+                        } else if let Some(script) = selected {
+                            if !has_session {
+                                client.start_session(&serial).await?;
+                            }
+                            client.run_script(&serial, &script).await?;
+                            Ok(format!("运行中 · {script}"))
+                        } else {
+                            anyhow::bail!("未选择脚本")
                         }
-                        client.run_script(&serial, &script).await?;
-                        Ok(format!("运行中 · {script}"))
-                    } else {
-                        anyhow::bail!("未选择脚本")
-                    }
-                }
+                    },
+                    shutdown,
+                )
                 .await
-                .map_err(|e: anyhow::Error| e.to_string());
+                else {
+                    return;
+                };
+                let result = result.map_err(|e: anyhow::Error| e.to_string());
                 let _ = tx.try_send(result);
             });
             let status = status.clone();
-            let button = button.clone();
+            let weak_status = status.downgrade();
+            let weak_button = button.downgrade();
             let rx = rx.clone();
             glib::MainContext::default().spawn_local(async move {
                 if let Ok(result) = rx.recv().await {
+                    let (Some(status), Some(button)) =
+                        (weak_status.upgrade(), weak_button.upgrade())
+                    else {
+                        return;
+                    };
                     match result {
                         Ok(message) => status.set_text(&message),
                         Err(error) => status.set_text(&format!("失败：{error}")),
@@ -670,13 +834,19 @@ fn script_controls(
         let client = profile_client.clone();
         let handle = profile_handle.clone();
         let serial = device_serial.clone();
+        let shutdown = shutdown.clone();
         move |combo| {
             let value = profile_id(combo.selected()).to_string();
             let client = client.clone();
             let serial = serial.clone();
+            let shutdown = shutdown.clone();
             handle.spawn(async move {
-                if let Err(error) = client.set_script_profile(&serial, &value).await {
-                    tracing::warn!(%error,%serial,"failed to set script profile");
+                if let Some(result) =
+                    until_shutdown(client.set_script_profile(&serial, &value), shutdown).await
+                {
+                    if let Err(error) = result {
+                        tracing::warn!(%error,%serial,"failed to set script profile");
+                    }
                 }
             });
         }
@@ -685,13 +855,19 @@ fn script_controls(
         let client = profile_client;
         let handle = profile_handle;
         let serial = device_serial;
+        let shutdown = shutdown;
         move |combo| {
             let value = profile_id(combo.selected()).to_string();
             let client = client.clone();
             let serial = serial.clone();
+            let shutdown = shutdown.clone();
             handle.spawn(async move {
-                if let Err(error) = client.set_preview_profile(&serial, &value).await {
-                    tracing::warn!(%error,%serial,"failed to set preview profile");
+                if let Some(result) =
+                    until_shutdown(client.set_preview_profile(&serial, &value), shutdown).await
+                {
+                    if let Err(error) = result {
+                        tracing::warn!(%error,%serial,"failed to set preview profile");
+                    }
                 }
             });
         }

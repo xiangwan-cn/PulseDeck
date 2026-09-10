@@ -326,10 +326,34 @@ impl Scheduler {
                 generation: runtime.generation,
             }));
         }
+        self.compact_heap_if_needed();
     }
 
     pub fn unregister(&mut self, card_id: &str) {
         self.runtimes.remove(card_id);
+        self.compact_heap_if_needed();
+    }
+
+    /// Registration and policy changes invalidate heap entries by generation.
+    /// BinaryHeap cannot remove those entries in place, so periodically rebuild
+    /// it from the still-current runtime slots to keep repeated hot reloads
+    /// from turning stale scheduling metadata into an unbounded allocation.
+    fn compact_heap_if_needed(&mut self) {
+        let limit = self.runtimes.len().saturating_mul(4).saturating_add(32);
+        if self.heap.len() <= limit {
+            return;
+        }
+        let mut compacted = BinaryHeap::with_capacity(self.runtimes.len());
+        while let Some(Reverse(task)) = self.heap.pop() {
+            if self.runtimes.get(&task.card_id).is_some_and(|runtime| {
+                runtime.enabled
+                    && runtime.generation == task.generation
+                    && runtime.next_run == task.next_run
+            }) {
+                compacted.push(Reverse(task));
+            }
+        }
+        self.heap = compacted;
     }
 
     pub fn is_running(&self, card_id: &str) -> bool {
@@ -598,6 +622,7 @@ impl Scheduler {
 
     pub fn next_task(&mut self) -> Option<Instant> {
         if self.work_level == WorkLevel::Suspended {
+            self.compact_heap_if_needed();
             return None;
         }
         let mut deferred = Vec::new();
@@ -637,6 +662,7 @@ impl Scheduler {
             break Some(task.next_run);
         };
         self.heap.extend(deferred);
+        self.compact_heap_if_needed();
         result
     }
 
@@ -721,6 +747,7 @@ impl Scheduler {
             ready.push(task.card_id);
         }
         self.heap.extend(deferred);
+        self.compact_heap_if_needed();
         ready
     }
 

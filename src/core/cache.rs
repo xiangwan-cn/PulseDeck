@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -24,7 +24,16 @@ struct DiskMetric {
 struct MemoryMetric {
     entry: DiskMetric,
     last_disk_write: Instant,
+    last_access: Instant,
+    bytes: usize,
 }
+
+const MAX_MEMORY_CACHE_ENTRIES: usize = 256;
+const MAX_MEMORY_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DISK_CACHE_ENTRIES: usize = 512;
+const MAX_DISK_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DISK_CACHE_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+const STALE_TEMPORARY_FILE_AGE_SECONDS: u64 = 60 * 60;
 
 static MEMORY_CACHE: LazyLock<Mutex<HashMap<String, MemoryMetric>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -33,6 +42,13 @@ static MEMORY_CACHE: LazyLock<Mutex<HashMap<String, MemoryMetric>>> =
 struct InvalidationState {
     generation: u64,
     dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    pub memory_entries: usize,
+    pub memory_bytes: usize,
+    pub invalidation_entries: usize,
 }
 
 // Keep the invalidation state separate from the value cache. The state lock is
@@ -45,6 +61,8 @@ static INVALIDATIONS: LazyLock<Mutex<HashMap<String, InvalidationState>>> =
 // descriptor cannot race through one temporary pathname.
 static CACHE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static INVALIDATION_GENERATION_SEED: AtomicU64 = AtomicU64::new(1);
+static DISK_CLEANUP_TICK: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_LAST_GOOD_MAX_STALENESS_SECONDS: u64 = 86_400;
 
 /// Cache files are namespaced by a stable descriptor hash, not by a card id.
@@ -80,25 +98,134 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn read_entry(source_key: &str) -> Option<DiskMetric> {
-    if let Some(entry) = MEMORY_CACHE
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(source_key).map(|entry| entry.entry.clone()))
+fn entry_size(entry: &DiskMetric) -> usize {
+    serde_json::to_vec(entry)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+fn insert_memory_entry(
+    cache: &mut HashMap<String, MemoryMetric>,
+    source_key: String,
+    entry: DiskMetric,
+    last_disk_write: Instant,
+) {
+    let now = Instant::now();
+    cache.insert(
+        source_key,
+        MemoryMetric {
+            bytes: entry_size(&entry),
+            entry,
+            last_disk_write,
+            last_access: now,
+        },
+    );
+
+    while cache.len() > MAX_MEMORY_CACHE_ENTRIES
+        || cache.values().map(|value| value.bytes).sum::<usize>() > MAX_MEMORY_CACHE_BYTES
     {
-        return Some(entry);
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.last_access)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn cleanup_disk_cache() {
+    let tick = DISK_CLEANUP_TICK.fetch_add(1, Ordering::Relaxed);
+    if !tick.is_multiple_of(32) {
+        return;
+    }
+
+    let dir = cache_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let now = now_secs();
+    let mut files: Vec<(PathBuf, u64, u64)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(now);
+        let age = now.saturating_sub(modified);
+
+        if file_name.starts_with("source-") && file_name.ends_with(".json") {
+            if age > MAX_DISK_CACHE_AGE_SECONDS {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+            let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            files.push((entry.path(), modified, size));
+        } else if file_name.starts_with("source-")
+            && file_name.contains(".json.tmp-")
+            && age > STALE_TEMPORARY_FILE_AGE_SECONDS
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+
+    files.sort_by_key(|(_, modified, _)| *modified);
+    let mut total_bytes: u64 = files.iter().map(|(_, _, size)| *size).sum();
+    while files.len() > MAX_DISK_CACHE_ENTRIES || total_bytes > MAX_DISK_CACHE_BYTES {
+        let Some((path, _, size)) = files.first().cloned() else {
+            break;
+        };
+        files.remove(0);
+        if fs::remove_file(path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+}
+
+/// Run the low-priority disk janitor from a worker instead of the GTK main
+/// context. It is intentionally public so application startup can schedule a
+/// single cleanup even before the first successful source write.
+pub fn cleanup() {
+    cleanup_disk_cache();
+}
+
+fn read_entry(source_key: &str) -> Option<DiskMetric> {
+    if let Ok(mut cache) = MEMORY_CACHE.lock() {
+        if let Some(cached) = cache.get_mut(source_key) {
+            cached.last_access = Instant::now();
+            return Some(cached.entry.clone());
+        }
     }
     crate::core::power_debug::increment(crate::core::power_debug::Counter::DiskRead);
-    let entry: DiskMetric = serde_json::from_slice(&fs::read(path(source_key)).ok()?).ok()?;
+    let cache_path = path(source_key);
+    if fs::metadata(&cache_path)
+        .ok()
+        .is_some_and(|metadata| metadata.len() > MAX_DISK_CACHE_BYTES)
+    {
+        return None;
+    }
+    let entry: DiskMetric = serde_json::from_slice(&fs::read(cache_path).ok()?).ok()?;
     if let Ok(mut cache) = MEMORY_CACHE.lock() {
-        cache.insert(
+        insert_memory_entry(
+            &mut cache,
             source_key.to_string(),
-            MemoryMetric {
-                entry: entry.clone(),
-                last_disk_write: Instant::now()
-                    .checked_sub(Duration::from_secs(300))
-                    .unwrap_or_else(Instant::now),
-            },
+            entry.clone(),
+            Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap_or_else(Instant::now),
         );
     }
     Some(entry)
@@ -148,15 +275,28 @@ pub fn load_with_budget(
     period: Option<&str>,
     max_output_bytes: usize,
 ) -> Option<MetricResult> {
-    let invalidations = INVALIDATIONS.lock().ok()?;
-    if invalidations
-        .get(source_key)
-        .is_some_and(|state| state.dirty)
-    {
+    let generation = {
+        let invalidations = INVALIDATIONS.lock().ok()?;
+        if invalidations
+            .get(source_key)
+            .is_some_and(|state| state.dirty)
+        {
+            return None;
+        }
+        invalidations
+            .get(source_key)
+            .map(|state| state.generation)
+            .unwrap_or_default()
+    };
+    let entry = read_entry(source_key)?;
+    let still_current = INVALIDATIONS.lock().ok().is_some_and(|invalidations| {
+        invalidations
+            .get(source_key)
+            .is_none_or(|state| !state.dirty && state.generation == generation)
+    });
+    if !still_current {
         return None;
     }
-    let entry = read_entry(source_key)?;
-    drop(invalidations);
     if !valid_entry(&entry, period) || !result_within_output_budget(&entry.result, max_output_bytes)
     {
         return None;
@@ -210,15 +350,85 @@ pub fn invalidation_token(source_key: &str) -> u64 {
     INVALIDATIONS
         .lock()
         .ok()
-        .and_then(|states| states.get(source_key).map(|state| state.generation))
+        .map(|mut states| {
+            states
+                .entry(source_key.to_string())
+                .or_insert_with(|| InvalidationState {
+                    generation: INVALIDATION_GENERATION_SEED.fetch_add(1, Ordering::Relaxed),
+                    dirty: false,
+                })
+                .generation
+        })
         .unwrap_or_default()
+}
+
+/// Check a worker generation without creating bookkeeping for a source that
+/// may already have been removed by configuration reconciliation.
+pub fn matches_invalidation_generation(source_key: &str, generation: u64) -> bool {
+    INVALIDATIONS.lock().ok().is_some_and(|states| {
+        states
+            .get(source_key)
+            .is_some_and(|state| state.generation == generation)
+    })
 }
 
 pub fn invalidate(source_key: &str) {
     if let Ok(mut states) = INVALIDATIONS.lock() {
-        let state = states.entry(source_key.to_string()).or_default();
+        let state = states
+            .entry(source_key.to_string())
+            .or_insert_with(|| InvalidationState {
+                generation: INVALIDATION_GENERATION_SEED.fetch_add(1, Ordering::Relaxed),
+                dirty: false,
+            });
         state.generation = state.generation.wrapping_add(1);
         state.dirty = true;
+    }
+}
+
+/// Release in-memory cache and invalidation bookkeeping when a source node is
+/// removed by a configuration reload. The disk entry is retained for the
+/// bounded janitor so a temporarily removed card does not cause needless
+/// external work if it is added again.
+pub fn forget(source_key: &str) {
+    if let Ok(mut invalidations) = INVALIDATIONS.lock() {
+        invalidations.remove(source_key);
+    }
+    if let Ok(mut cache) = MEMORY_CACHE.lock() {
+        cache.remove(source_key);
+    }
+}
+
+/// Drop in-memory values and invalidation generations that no longer belong to
+/// a live card. Disk entries are intentionally left to the janitor so a
+/// temporarily removed source can still be reused without making a blocking
+/// filesystem operation part of configuration reconciliation.
+pub fn prune(active_source_keys: &HashSet<String>) {
+    if let Ok(mut invalidations) = INVALIDATIONS.lock() {
+        invalidations.retain(|key, _| active_source_keys.contains(key));
+    }
+    if let Ok(mut cache) = MEMORY_CACHE.lock() {
+        cache.retain(|key, _| active_source_keys.contains(key));
+    }
+}
+
+pub fn stats() -> CacheStats {
+    let invalidation_entries = INVALIDATIONS
+        .lock()
+        .map(|states| states.len())
+        .unwrap_or_default();
+    let (memory_entries, memory_bytes) = MEMORY_CACHE
+        .lock()
+        .map(|cache| {
+            (
+                cache.len(),
+                cache.values().map(|entry| entry.bytes).sum::<usize>(),
+            )
+        })
+        .unwrap_or_default();
+    CacheStats {
+        memory_entries,
+        memory_bytes,
+        invalidation_entries,
     }
 }
 
@@ -253,13 +463,14 @@ pub fn store_if_current(
         let invalidations = INVALIDATIONS
             .lock()
             .map_err(|_| io::Error::other("cache invalidation lock poisoned"))?;
-        if invalidations
-            .get(source_key)
-            .copied()
-            .unwrap_or_default()
-            .generation
-            != token
-        {
+        let Some(current) = invalidations.get(source_key) else {
+            // A source was removed and its bookkeeping was pruned while this
+            // worker was still finishing. A missing state is a tombstone, not
+            // a fresh generation; reject the old result instead of allowing it
+            // to recreate an inactive cache entry.
+            return Ok(false);
+        };
+        if current.generation != token {
             return Ok(false);
         }
     }
@@ -297,7 +508,9 @@ pub fn store_if_current(
         let mut invalidations = INVALIDATIONS
             .lock()
             .map_err(|_| io::Error::other("cache invalidation lock poisoned"))?;
-        let current = invalidations.get(source_key).copied().unwrap_or_default();
+        let Some(current) = invalidations.get(source_key).copied() else {
+            return Ok(false);
+        };
         if current.generation != token {
             return Ok(false);
         }
@@ -311,6 +524,9 @@ pub fn store_if_current(
     let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = target.with_extension(format!("json.tmp-{}-{sequence}", std::process::id()));
     let bytes = serde_json::to_vec(&entry).map_err(io::Error::other)?;
+    if bytes.len() as u64 > MAX_DISK_CACHE_BYTES {
+        return Ok(false);
+    }
     if let Err(error) = fs::write(&temporary, bytes) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -323,7 +539,10 @@ pub fn store_if_current(
     let mut invalidations = INVALIDATIONS
         .lock()
         .map_err(|_| io::Error::other("cache invalidation lock poisoned"))?;
-    let current = invalidations.get(source_key).copied().unwrap_or_default();
+    let Some(current) = invalidations.get(source_key).copied() else {
+        let _ = fs::remove_file(&temporary);
+        return Ok(false);
+    };
     if current.generation != token {
         let _ = fs::remove_file(&temporary);
         return Ok(false);
@@ -337,16 +556,13 @@ pub fn store_if_current(
     let mut cache = MEMORY_CACHE
         .lock()
         .map_err(|_| io::Error::other("cache lock poisoned"))?;
-    cache.insert(
-        source_key.to_owned(),
-        MemoryMetric {
-            entry,
-            last_disk_write,
-        },
-    );
+    insert_memory_entry(&mut cache, source_key.to_owned(), entry, last_disk_write);
     if let Some(state) = invalidations.get_mut(source_key) {
         state.dirty = false;
     }
+    drop(cache);
+    drop(invalidations);
+    cleanup_disk_cache();
     Ok(true)
 }
 
@@ -439,6 +655,15 @@ mod tests {
             load_last_good(&key, None).unwrap().value,
             normal("old").value
         );
+    }
+
+    #[test]
+    fn removed_source_rejects_a_worker_with_an_old_token() {
+        let key = format!("test:removed-source:{}", std::process::id());
+        let token = invalidation_token(&key);
+        forget(&key);
+        assert!(!matches_invalidation_generation(&key, token));
+        assert!(!store_if_current(&key, None, &normal("stale"), token).unwrap());
     }
 
     #[test]

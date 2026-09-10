@@ -3,6 +3,7 @@ use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
 
 use super::traits::MetricContext;
+use std::sync::{atomic::Ordering, Arc};
 
 pub struct HttpMetric {
     url: String,
@@ -44,15 +45,21 @@ impl HttpMetric {
 
     pub fn collect(&mut self, ctx: &MetricContext, global_max_output: usize) -> MetricResult {
         let max_output = self.max_output_bytes.min(global_max_output).max(1);
-        let result = ctx.runtime.block_on(http_fetch(
-            &ctx.http_client,
-            &self.url,
-            &self.method,
-            &self.headers,
-            self.body.as_deref(),
-            self.timeout_secs,
-            max_output,
-        ));
+        let shutdown = ctx.shutdown.clone();
+        let result = ctx.runtime.block_on(async {
+            tokio::select! {
+                result = http_fetch(
+                    &ctx.http_client,
+                    &self.url,
+                    &self.method,
+                    &self.headers,
+                    self.body.as_deref(),
+                    self.timeout_secs,
+                    max_output,
+                ) => result,
+                _ = wait_for_shutdown(shutdown) => Err("HTTP 请求因应用关闭而取消".to_string()),
+            }
+        });
 
         match result {
             Ok(body) => {
@@ -125,14 +132,37 @@ async fn http_fetch(
         return Err(format!("响应超过 {} 字节限制", max_output_bytes));
     }
 
-    let bytes = resp
-        .bytes()
+    let bytes = response_bytes_limited(resp, max_output_bytes).await?;
+    String::from_utf8(bytes).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
+}
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let limit = limit.max(1);
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .map_or(64 * 1024, |length| length.min(limit as u64) as usize),
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("读取响应失败: {e}"))?;
-    if bytes.len() > max_output_bytes {
-        return Err(format!("响应超过 {} 字节限制", max_output_bytes));
+        .map_err(|error| format!("读取响应失败: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("响应超过 {} 字节限制", limit));
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes.to_vec()).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
+    Ok(bytes)
+}
+
+async fn wait_for_shutdown(shutdown: Arc<std::sync::atomic::AtomicBool>) {
+    while !shutdown.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn parse_response(

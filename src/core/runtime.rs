@@ -45,13 +45,20 @@ struct AgentRuntime {
     active: bool,
 }
 
+struct RuntimeSubscriber {
+    id: u64,
+    sender: async_channel::Sender<RuntimeSnapshot>,
+    drain: async_channel::Receiver<RuntimeSnapshot>,
+}
+
 const MAX_SEEN_AGENT_EVENTS: usize = 4096;
 
 pub struct RuntimeManager {
     self_weak: Weak<RuntimeManager>,
     config: RefCell<RuntimeConfig>,
     snapshot: RefCell<RuntimeSnapshot>,
-    subscribers: RefCell<Vec<async_channel::Sender<RuntimeSnapshot>>>,
+    subscribers: RefCell<Vec<RuntimeSubscriber>>,
+    next_subscriber: Cell<u64>,
     mapped: Cell<bool>,
     active: Cell<bool>,
     inactive_since: Cell<Option<Instant>>,
@@ -78,6 +85,41 @@ pub struct RuntimeHandle {
     manager: Rc<RuntimeManager>,
 }
 
+/// A runtime state subscription with an explicit lifetime boundary. The
+/// manager keeps a second receiver to implement latest-wins delivery on a
+/// bounded channel; this wrapper removes that subscriber when the consumer
+/// task is dropped so the drain receiver cannot keep it alive indefinitely.
+pub struct RuntimeSubscription {
+    receiver: async_channel::Receiver<RuntimeSnapshot>,
+    manager: Weak<RuntimeManager>,
+    id: u64,
+}
+
+impl RuntimeSubscription {
+    pub async fn recv(&self) -> Result<RuntimeSnapshot, async_channel::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&self) -> Result<RuntimeSnapshot, async_channel::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
+    }
+}
+
+impl Drop for RuntimeSubscription {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager
+                .subscribers
+                .borrow_mut()
+                .retain(|subscriber| subscriber.id != self.id);
+        }
+    }
+}
+
 pub struct InteractionLease {
     manager: Weak<RuntimeManager>,
     id: u64,
@@ -99,6 +141,7 @@ impl RuntimeManager {
             config: RefCell::new(config),
             snapshot: RefCell::new(RuntimeSnapshot::default()),
             subscribers: RefCell::new(Vec::new()),
+            next_subscriber: Cell::new(0),
             mapped: Cell::new(true),
             active: Cell::new(true),
             inactive_since: Cell::new(None),
@@ -172,11 +215,21 @@ impl RuntimeManager {
         self.snapshot.borrow().clone()
     }
 
-    pub fn subscribe(&self) -> async_channel::Receiver<RuntimeSnapshot> {
-        let (tx, rx) = async_channel::unbounded();
+    pub fn subscribe(&self) -> RuntimeSubscription {
+        let (tx, rx) = async_channel::bounded(1);
         let _ = tx.try_send(self.snapshot());
-        self.subscribers.borrow_mut().push(tx);
-        rx
+        let id = self.next_subscriber.get().wrapping_add(1);
+        self.next_subscriber.set(id);
+        self.subscribers.borrow_mut().push(RuntimeSubscriber {
+            id,
+            sender: tx,
+            drain: rx.clone(),
+        });
+        RuntimeSubscription {
+            receiver: rx,
+            manager: self.self_weak.clone(),
+            id,
+        }
     }
 
     /// Close controller-owned subscriptions before application teardown. The
@@ -402,9 +455,16 @@ impl RuntimeManager {
     }
 
     fn broadcast(&self, snapshot: RuntimeSnapshot) {
-        self.subscribers
-            .borrow_mut()
-            .retain(|sender| sender.try_send(snapshot.clone()).is_ok() || !sender.is_closed());
+        self.subscribers.borrow_mut().retain(|subscriber| {
+            match subscriber.sender.try_send(snapshot.clone()) {
+                Ok(()) => true,
+                Err(async_channel::TrySendError::Full(snapshot)) => {
+                    let _ = subscriber.drain.try_recv();
+                    subscriber.sender.try_send(snapshot).is_ok() || !subscriber.sender.is_closed()
+                }
+                Err(async_channel::TrySendError::Closed(_)) => false,
+            }
+        });
     }
 
     fn schedule_deadline(&self, now: Instant, cfg: &RuntimeConfig) {
@@ -540,7 +600,7 @@ impl RuntimeHandle {
         self.manager.snapshot()
     }
 
-    pub fn subscribe(&self) -> async_channel::Receiver<RuntimeSnapshot> {
+    pub fn subscribe(&self) -> RuntimeSubscription {
         self.manager.subscribe()
     }
 
@@ -679,6 +739,16 @@ mod tests {
         manager.shutdown();
         assert!(rx.try_recv().is_err());
         assert!(manager.deadline_source.borrow().is_none());
+    }
+
+    #[test]
+    fn dropping_subscription_removes_the_manager_entry() {
+        let _guard = GLIB_TEST_LOCK.lock().unwrap();
+        let manager = RuntimeManager::new(RuntimeConfig::default());
+        let rx = manager.subscribe();
+        assert_eq!(manager.subscribers.borrow().len(), 1);
+        drop(rx);
+        assert!(manager.subscribers.borrow().is_empty());
     }
 
     #[test]
