@@ -2,10 +2,16 @@ use gio::prelude::FileExt;
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Image, Label, Orientation};
 use regex::{Regex, RegexBuilder};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::core::config::{
     CardBackgroundSvgConfig, CardColorsConfig, CardLogoSvgConfig, CardTransitionConfig,
     CardVisualStateConfig, DisplayConfig,
+};
+use crate::core::text::{
+    bounded_joined_lines, bounded_text, MAX_UI_COLLECTION_ITEMS, MAX_UI_TEXT_BYTES,
 };
 use crate::model::card_model::{CardModel, CardState, CardValue, RendererKind, StatusLevel};
 use crate::rendering::{
@@ -28,6 +34,98 @@ pub enum RenderWidgets {
     List(ListWidgets),
     Composite(CompositeWidgets),
     Action(ActionWidgets),
+}
+
+/// One display-scoped provider owns all card-specific rules. Rebuilding one
+/// stylesheet on a customization change is cheaper and safer than registering
+/// one provider per card, especially during repeated configuration reloads.
+pub struct CardStyleRegistry {
+    display: gtk::gdk::Display,
+    provider: gtk::CssProvider,
+    rules: HashMap<String, String>,
+    batch_depth: usize,
+    dirty: bool,
+}
+
+impl CardStyleRegistry {
+    pub fn new(display: gtk::gdk::Display) -> Rc<RefCell<Self>> {
+        let provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        Rc::new(RefCell::new(Self {
+            display,
+            provider,
+            rules: HashMap::new(),
+            batch_depth: 0,
+            dirty: false,
+        }))
+    }
+
+    fn rebuild_now(&self) {
+        let stylesheet = self
+            .rules
+            .values()
+            .filter(|css| !css.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.provider.load_from_data(&stylesheet);
+    }
+
+    fn rebuild(&mut self) {
+        if self.batch_depth != 0 {
+            self.dirty = true;
+            return;
+        }
+        self.rebuild_now();
+    }
+
+    pub(crate) fn begin_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_add(1);
+    }
+
+    pub(crate) fn end_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 && self.dirty {
+            self.dirty = false;
+            self.rebuild_now();
+        }
+    }
+
+    fn update(&mut self, class: &str, css: String) {
+        if css.is_empty() {
+            self.rules.remove(class);
+        } else {
+            self.rules.insert(class.to_owned(), css);
+        }
+        self.rebuild();
+    }
+
+    fn remove(&mut self, class: &str) {
+        if self.rules.remove(class).is_some() {
+            self.rebuild();
+        }
+    }
+
+    /// Clear all card rules in one stylesheet transaction. Page rebuilds can
+    /// drop hundreds of cards at once; clearing first prevents each
+    /// `MetricCard::drop` from reparsing an ever-smaller stylesheet.
+    pub(crate) fn clear(&mut self) {
+        if self.rules.is_empty() {
+            return;
+        }
+        self.rules.clear();
+        self.rebuild();
+    }
+}
+
+impl Drop for CardStyleRegistry {
+    fn drop(&mut self) {
+        gtk::style_context_remove_provider_for_display(&self.display, &self.provider);
+    }
 }
 
 struct VisualRule {
@@ -64,8 +162,7 @@ pub struct MetricCard {
     pub renderer_kind: RendererKind,
     base_icon: Option<String>,
     style_class: String,
-    style_provider: Option<gtk::CssProvider>,
-    style_display: Option<gtk::gdk::Display>,
+    style_registry: Rc<RefCell<CardStyleRegistry>>,
     customization: Option<DisplayConfig>,
     visual_rules: Vec<VisualRule>,
     active_state_class: Option<String>,
@@ -74,7 +171,12 @@ pub struct MetricCard {
 }
 
 impl MetricCard {
-    pub fn new(model: &CardModel, layout: CardLayout, display: Option<&DisplayConfig>) -> Self {
+    pub fn new(
+        model: &CardModel,
+        layout: CardLayout,
+        display: Option<&DisplayConfig>,
+        style_registry: Rc<RefCell<CardStyleRegistry>>,
+    ) -> Self {
         let card = GtkBox::new(Orientation::Vertical, 0);
         card.add_css_class("card");
         card.add_css_class("pulsedeck-card");
@@ -117,7 +219,11 @@ impl MetricCard {
         // from the footer, which is reserved for live metric details.  The old
         // implementation reused `subtitle` for both and erased the description
         // as soon as the first metric result arrived.
-        let header_description = Label::new(model.subtitle.as_deref());
+        let header_subtitle = model
+            .subtitle
+            .as_deref()
+            .map(|subtitle| bounded_text(subtitle, MAX_UI_TEXT_BYTES));
+        let header_description = Label::new(header_subtitle.as_deref());
         header_description.set_halign(Align::Center);
         header_description.set_hexpand(true);
         header_description.add_css_class("metric-header-sub");
@@ -153,6 +259,7 @@ impl MetricCard {
         refresh_btn.set_valign(Align::Center);
         refresh_btn.add_css_class("flat");
         refresh_btn.set_tooltip_text(Some("刷新"));
+        refresh_btn.update_property(&[gtk::accessible::Property::Label("刷新指标")]);
 
         let compact_logo_picture = gtk::Picture::new();
         compact_logo_picture.set_halign(Align::End);
@@ -278,8 +385,7 @@ impl MetricCard {
             renderer_kind: model.renderer,
             base_icon: model.icon.clone(),
             style_class,
-            style_provider: None,
-            style_display: None,
+            style_registry,
             customization: None,
             visual_rules: Vec::new(),
             active_state_class: None,
@@ -321,8 +427,12 @@ impl MetricCard {
             }
             _ => None,
         };
-        self.card
-            .set_tooltip_text(display_model.tooltip.as_deref().or(fallback));
+        let tooltip = display_model
+            .tooltip
+            .as_deref()
+            .or(fallback)
+            .map(|value| bounded_text(value, MAX_UI_TEXT_BYTES));
+        self.card.set_tooltip_text(tooltip.as_deref());
         self.set_renderer_visible(matches!(
             display_model.state,
             CardState::Normal | CardState::Cached
@@ -365,7 +475,7 @@ impl MetricCard {
 
         if let Some(ref sub) = model.subtitle {
             if !sub.is_empty() {
-                self.footer.set_label(sub);
+                self.footer.set_label(&bounded_text(sub, MAX_UI_TEXT_BYTES));
                 self.footer.set_visible(true);
             } else {
                 self.footer.set_visible(false);
@@ -379,7 +489,7 @@ impl MetricCard {
                 .subtitle
                 .as_deref()
                 .filter(|value| !value.is_empty())
-                .map(|value| format!("{value} · 缓存"))
+                .map(|value| bounded_text(&format!("{value} · 缓存"), MAX_UI_TEXT_BYTES))
                 .unwrap_or_else(|| "缓存".into());
             self.footer.set_label(&label);
             self.footer.set_visible(true);
@@ -409,9 +519,7 @@ impl MetricCard {
         self.set_logo_svg(display.and_then(|display| display.logo_svg.as_ref()));
         let Some(display) = display else {
             self.visual_rules.clear();
-            if let Some(provider) = &self.style_provider {
-                provider.load_from_data("");
-            }
+            self.style_registry.borrow_mut().remove(&self.style_class);
             return;
         };
 
@@ -421,10 +529,24 @@ impl MetricCard {
             .enumerate()
             .map(|(index, config)| VisualRule {
                 regex: config.regex.as_deref().and_then(|pattern| {
-                    RegexBuilder::new(pattern)
+                    match RegexBuilder::new(pattern)
                         .case_insensitive(config.ignore_case)
                         .build()
-                        .ok()
+                    {
+                        Ok(regex) => Some(regex),
+                        Err(error) => {
+                            tracing::warn!(
+                                card = self
+                                    .model
+                                    .as_ref()
+                                    .map(|model| model.id.as_str())
+                                    .unwrap_or("unknown"),
+                                %error,
+                                "visual state regex could not be compiled"
+                            );
+                            None
+                        }
+                    }
                 }),
                 css_class: format!("card-state-rule-{}-{}", index, css_fragment(&config.name)),
                 config: config.clone(),
@@ -454,29 +576,12 @@ impl MetricCard {
             background_svg.as_ref(),
         );
         if css.is_empty() {
-            if let Some(provider) = &self.style_provider {
-                provider.load_from_data("");
-            }
+            self.style_registry.borrow_mut().remove(&self.style_class);
             return;
         }
-        if self.style_provider.is_none() {
-            self.style_provider = Some(gtk::CssProvider::new());
-        }
-        if self.style_display.is_none() {
-            if let Some(display) = gtk::gdk::Display::default() {
-                if let Some(provider) = &self.style_provider {
-                    gtk::style_context_add_provider_for_display(
-                        &display,
-                        provider,
-                        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                    );
-                    self.style_display = Some(display);
-                }
-            }
-        }
-        if let Some(provider) = &self.style_provider {
-            provider.load_from_data(&css);
-        }
+        self.style_registry
+            .borrow_mut()
+            .update(&self.style_class, css);
     }
 
     fn set_logo_svg(&mut self, config: Option<&CardLogoSvgConfig>) {
@@ -598,8 +703,8 @@ impl MetricCard {
     fn apply_density(&self, model: &CardModel) {
         let (mut chars, mut lines) = value_complexity(&model.value);
         if let Some(subtitle) = model.subtitle.as_deref() {
-            chars += subtitle.chars().count();
-            lines += subtitle.lines().count();
+            chars = chars.saturating_add(subtitle.chars().count());
+            lines = lines.saturating_add(subtitle.lines().count());
         }
         self.card.remove_css_class("content-medium");
         self.card.remove_css_class("content-dense");
@@ -679,14 +784,7 @@ impl MetricCard {
 
 impl Drop for MetricCard {
     fn drop(&mut self) {
-        // Per-card providers are registered at display scope. Remove the
-        // provider before releasing it so a hot-reloaded/removed card does
-        // not leave its selector rules attached to the display forever.
-        if let (Some(display), Some(provider)) =
-            (self.style_display.take(), self.style_provider.take())
-        {
-            gtk::style_context_remove_provider_for_display(&display, &provider);
-        }
+        self.style_registry.borrow_mut().remove(&self.style_class);
     }
 }
 
@@ -777,19 +875,36 @@ fn value_complexity(value: &crate::model::card_model::CardValue) -> (usize, usiz
         CardValue::Number { unit, .. } => (12 + unit.as_deref().map(str::len).unwrap_or(0), 1),
         CardValue::Percentage(_) => (8, 1),
         CardValue::Status { label, .. } => text_size(label),
-        CardValue::List(items) => (
-            items
-                .iter()
-                .map(|item| item.label.chars().count() + item.value.chars().count() + 2)
-                .sum(),
-            items.len().max(1),
+        CardValue::List(items) => items.iter().take(MAX_UI_COLLECTION_ITEMS).fold(
+            (0_usize, items.len().clamp(1, MAX_UI_COLLECTION_ITEMS)),
+            |(chars, lines), item| {
+                (
+                    chars.saturating_add(
+                        item.label
+                            .chars()
+                            .count()
+                            .saturating_add(item.value.chars().count())
+                            .saturating_add(2),
+                    ),
+                    lines,
+                )
+            },
         ),
-        CardValue::Composite(fields) => (
-            fields
-                .iter()
-                .map(|field| field.label.chars().count() + field.value.chars().count() + 1)
-                .sum(),
-            fields.len().max(1),
+        CardValue::Composite(fields) => fields.iter().take(MAX_UI_COLLECTION_ITEMS).fold(
+            (0_usize, fields.len().clamp(1, MAX_UI_COLLECTION_ITEMS)),
+            |(chars, lines), field| {
+                (
+                    chars.saturating_add(
+                        field
+                            .label
+                            .chars()
+                            .count()
+                            .saturating_add(field.value.chars().count())
+                            .saturating_add(1),
+                    ),
+                    lines,
+                )
+            },
         ),
         _ => (0, 1),
     }
@@ -807,23 +922,41 @@ fn source_state_class(state: CardState) -> &'static str {
 
 fn value_text(value: &CardValue) -> String {
     match value {
-        CardValue::Text(value) => value.clone(),
+        CardValue::Text(value) => bounded_text(value, MAX_UI_TEXT_BYTES),
         CardValue::Number { value, unit, .. } => unit
             .as_deref()
             .map(|unit| format!("{value}{unit}"))
             .unwrap_or_else(|| value.to_string()),
         CardValue::Percentage(value) => format!("{value}%"),
-        CardValue::Status { label, .. } => label.clone(),
-        CardValue::List(items) => items
-            .iter()
-            .map(|item| format!("{} {}", item.label, item.value))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        CardValue::Composite(fields) => fields
-            .iter()
-            .map(|field| format!("{} {}", field.label, field.value))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        CardValue::Status { label, .. } => bounded_text(label, MAX_UI_TEXT_BYTES),
+        CardValue::List(items) => bounded_joined_lines(
+            items
+                .iter()
+                .take(MAX_UI_COLLECTION_ITEMS.saturating_add(1))
+                .map(|item| {
+                    format!(
+                        "{} {}",
+                        bounded_text(&item.label, 16 * 1024),
+                        bounded_text(&item.value, 16 * 1024)
+                    )
+                }),
+            MAX_UI_COLLECTION_ITEMS,
+            MAX_UI_TEXT_BYTES,
+        ),
+        CardValue::Composite(fields) => bounded_joined_lines(
+            fields
+                .iter()
+                .take(MAX_UI_COLLECTION_ITEMS.saturating_add(1))
+                .map(|field| {
+                    format!(
+                        "{} {}",
+                        bounded_text(&field.label, 16 * 1024),
+                        bounded_text(&field.value, 16 * 1024)
+                    )
+                }),
+            MAX_UI_COLLECTION_ITEMS,
+            MAX_UI_TEXT_BYTES,
+        ),
         CardValue::Empty => String::new(),
     }
 }

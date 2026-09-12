@@ -1,3 +1,4 @@
+use crate::core::text::{bounded_text, MAX_UI_ERROR_BYTES, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
 use std::io::Read;
@@ -25,7 +26,10 @@ impl FileMetric {
                 return MetricResult {
                     value: CardValue::Text("不可用".into()),
                     subtitle: None,
-                    tooltip: Some(format!("读取文件失败 {}: {}", self.path.display(), e)),
+                    tooltip: Some(bounded_text(
+                        &format!("读取文件失败 {}: {}", self.path.display(), e),
+                        MAX_UI_ERROR_BYTES,
+                    )),
                     state: MetricState::Unavailable,
                     cached: false,
                     metadata: None,
@@ -40,26 +44,27 @@ impl FileMetric {
             return MetricResult {
                 value: CardValue::Text("不可用".into()),
                 subtitle: None,
-                tooltip: Some(format!("读取文件失败 {}: {}", self.path.display(), error)),
+                tooltip: Some(bounded_text(
+                    &format!("读取文件失败 {}: {}", self.path.display(), error),
+                    MAX_UI_ERROR_BYTES,
+                )),
                 state: MetricState::Unavailable,
                 cached: false,
                 metadata: None,
             };
         }
         if bytes.len() > limit {
-            return MetricResult::error(format!(
-                "文件内容超过 {} 字节限制: {}",
-                limit,
-                self.path.display()
+            return MetricResult::error(bounded_text(
+                &format!("文件内容超过 {} 字节限制: {}", limit, self.path.display()),
+                MAX_UI_ERROR_BYTES,
             ));
         }
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(error) => {
-                return MetricResult::error(format!(
-                    "文件不是有效 UTF-8 {}: {}",
-                    self.path.display(),
-                    error
+                return MetricResult::error(bounded_text(
+                    &format!("文件不是有效 UTF-8 {}: {}", self.path.display(), error),
+                    MAX_UI_ERROR_BYTES,
                 ));
             }
         };
@@ -70,7 +75,7 @@ impl FileMetric {
             content
         };
 
-        let trimmed = text.trim().to_string();
+        let trimmed = bounded_text(text.trim(), MAX_UI_TEXT_BYTES);
         if trimmed.is_empty() {
             MetricResult {
                 value: CardValue::Empty,

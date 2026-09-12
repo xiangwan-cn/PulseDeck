@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     LazyLock, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +27,16 @@ struct DiskMetric {
 struct MemoryMetric {
     entry: DiskMetric,
     last_disk_write: Instant,
-    last_access: Instant,
     bytes: usize,
+    lru_prev: Option<String>,
+    lru_next: Option<String>,
+}
+
+struct MemoryCache {
+    entries: HashMap<String, MemoryMetric>,
+    total_bytes: usize,
+    lru_head: Option<String>,
+    lru_tail: Option<String>,
 }
 
 const MAX_MEMORY_CACHE_ENTRIES: usize = 256;
@@ -35,8 +46,14 @@ const MAX_DISK_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DISK_CACHE_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const STALE_TEMPORARY_FILE_AGE_SECONDS: u64 = 60 * 60;
 
-static MEMORY_CACHE: LazyLock<Mutex<HashMap<String, MemoryMetric>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MEMORY_CACHE: LazyLock<Mutex<MemoryCache>> = LazyLock::new(|| {
+    Mutex::new(MemoryCache {
+        entries: HashMap::new(),
+        total_bytes: 0,
+        lru_head: None,
+        lru_tail: None,
+    })
+});
 
 #[derive(Debug, Default, Clone, Copy)]
 struct InvalidationState {
@@ -44,6 +61,7 @@ struct InvalidationState {
     dirty: bool,
 }
 
+#[cfg(feature = "power-debug")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheStats {
     pub memory_entries: usize,
@@ -72,8 +90,19 @@ fn path(source_key: &str) -> PathBuf {
     cache_dir().join(format!("source-{:032x}.json", stable_hash(source_key)))
 }
 
-pub fn cache_path(source_key: &str) -> PathBuf {
-    path(source_key)
+fn ensure_cache_dir() -> io::Result<PathBuf> {
+    let dir = cache_dir();
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// Return a stable, non-sensitive identifier for diagnostics. Source
+/// descriptors can contain HTTP credentials, request bodies, or command
+/// arguments; error keys must not copy those values into journal records.
+pub fn diagnostic_key(source_key: &str) -> String {
+    format!("cache:{:032x}", stable_hash(source_key))
 }
 
 fn stable_hash(value: &str) -> u128 {
@@ -101,43 +130,116 @@ fn now_secs() -> u64 {
 fn entry_size(entry: &DiskMetric) -> usize {
     serde_json::to_vec(entry)
         .map(|bytes| bytes.len())
-        .unwrap_or(0)
+        // A serialization failure must be treated as an uncacheable, very
+        // large entry. Counting it as zero would let it bypass byte-based LRU
+        // eviction indefinitely.
+        .unwrap_or(usize::MAX)
 }
 
 fn insert_memory_entry(
-    cache: &mut HashMap<String, MemoryMetric>,
+    cache: &mut MemoryCache,
     source_key: String,
     entry: DiskMetric,
     last_disk_write: Instant,
 ) {
-    let now = Instant::now();
-    cache.insert(
-        source_key,
-        MemoryMetric {
-            bytes: entry_size(&entry),
-            entry,
-            last_disk_write,
-            last_access: now,
-        },
-    );
-
-    while cache.len() > MAX_MEMORY_CACHE_ENTRIES
-        || cache.values().map(|value| value.bytes).sum::<usize>() > MAX_MEMORY_CACHE_BYTES
-    {
-        let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, value)| value.last_access)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest_key);
+    let entry = MemoryMetric {
+        bytes: entry_size(&entry),
+        entry,
+        last_disk_write,
+        lru_prev: None,
+        lru_next: None,
+    };
+    let new_bytes = entry.bytes;
+    if cache.entries.contains_key(&source_key) {
+        detach_memory_entry(cache, &source_key);
     }
+    if let Some(previous) = cache.entries.insert(source_key.clone(), entry) {
+        cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes);
+    }
+    cache.total_bytes = cache.total_bytes.saturating_add(new_bytes);
+    attach_memory_entry(cache, &source_key);
+
+    while cache.entries.len() > MAX_MEMORY_CACHE_ENTRIES
+        || cache.total_bytes > MAX_MEMORY_CACHE_BYTES
+    {
+        if let Some(removed) = pop_oldest_memory_entry(cache) {
+            cache.total_bytes = cache.total_bytes.saturating_sub(removed.bytes);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Maintain an intrusive LRU list alongside the hash map. Touches and
+/// evictions are O(1), so a large cache cannot turn every insert into a full
+/// scan of all entries.
+fn detach_memory_entry(cache: &mut MemoryCache, key: &str) {
+    let Some((previous, next)) = cache
+        .entries
+        .get(key)
+        .map(|entry| (entry.lru_prev.clone(), entry.lru_next.clone()))
+    else {
+        return;
+    };
+    if let Some(previous) = previous.as_deref() {
+        if let Some(entry) = cache.entries.get_mut(previous) {
+            entry.lru_next = next.clone();
+        }
+    } else {
+        cache.lru_head = next.clone();
+    }
+    if let Some(next) = next.as_deref() {
+        if let Some(entry) = cache.entries.get_mut(next) {
+            entry.lru_prev = previous.clone();
+        }
+    } else {
+        cache.lru_tail = previous.clone();
+    }
+    if let Some(entry) = cache.entries.get_mut(key) {
+        entry.lru_prev = None;
+        entry.lru_next = None;
+    }
+}
+
+fn attach_memory_entry(cache: &mut MemoryCache, key: &str) {
+    let previous_tail = cache.lru_tail.clone();
+    if let Some(previous_tail) = previous_tail.as_deref() {
+        if let Some(entry) = cache.entries.get_mut(previous_tail) {
+            entry.lru_next = Some(key.to_owned());
+        }
+    } else {
+        cache.lru_head = Some(key.to_owned());
+    }
+    if let Some(entry) = cache.entries.get_mut(key) {
+        entry.lru_prev = previous_tail;
+        entry.lru_next = None;
+    }
+    cache.lru_tail = Some(key.to_owned());
+}
+
+fn touch_memory_entry(cache: &mut MemoryCache, key: &str) {
+    if cache.lru_tail.as_deref() == Some(key) {
+        return;
+    }
+    detach_memory_entry(cache, key);
+    attach_memory_entry(cache, key);
+}
+
+fn remove_memory_entry(cache: &mut MemoryCache, key: &str) -> Option<MemoryMetric> {
+    if cache.entries.contains_key(key) {
+        detach_memory_entry(cache, key);
+    }
+    cache.entries.remove(key)
+}
+
+fn pop_oldest_memory_entry(cache: &mut MemoryCache) -> Option<MemoryMetric> {
+    let key = cache.lru_head.clone()?;
+    remove_memory_entry(cache, &key)
 }
 
 fn cleanup_disk_cache() {
     let tick = DISK_CLEANUP_TICK.fetch_add(1, Ordering::Relaxed);
-    if !tick.is_multiple_of(32) {
+    if tick % 32 != 0 {
         return;
     }
 
@@ -184,11 +286,14 @@ fn cleanup_disk_cache() {
 
     files.sort_by_key(|(_, modified, _)| *modified);
     let mut total_bytes: u64 = files.iter().map(|(_, _, size)| *size).sum();
-    while files.len() > MAX_DISK_CACHE_ENTRIES || total_bytes > MAX_DISK_CACHE_BYTES {
-        let Some((path, _, size)) = files.first().cloned() else {
+    let mut remove_index = 0;
+    while files.len().saturating_sub(remove_index) > MAX_DISK_CACHE_ENTRIES
+        || total_bytes > MAX_DISK_CACHE_BYTES
+    {
+        let Some((path, _, size)) = files.get(remove_index).cloned() else {
             break;
         };
-        files.remove(0);
+        remove_index += 1;
         if fs::remove_file(path).is_ok() {
             total_bytes = total_bytes.saturating_sub(size);
         }
@@ -202,22 +307,55 @@ pub fn cleanup() {
     cleanup_disk_cache();
 }
 
-fn read_entry(source_key: &str) -> Option<DiskMetric> {
+fn read_entry(source_key: &str, max_output_bytes: usize) -> Option<DiskMetric> {
     if let Ok(mut cache) = MEMORY_CACHE.lock() {
-        if let Some(cached) = cache.get_mut(source_key) {
-            cached.last_access = Instant::now();
+        if cache.entries.contains_key(source_key) {
+            touch_memory_entry(&mut cache, source_key);
+            let cached = cache.entries.get(source_key)?;
+            if !result_within_output_budget(&cached.entry.result, max_output_bytes) {
+                return None;
+            }
             return Some(cached.entry.clone());
         }
     }
     crate::core::power_debug::increment(crate::core::power_debug::Counter::DiskRead);
     let cache_path = path(source_key);
-    if fs::metadata(&cache_path)
-        .ok()
-        .is_some_and(|metadata| metadata.len() > MAX_DISK_CACHE_BYTES)
-    {
+    let read_limit = max_output_bytes
+        .max(1)
+        .saturating_add(64 * 1024)
+        .min(MAX_DISK_CACHE_BYTES as usize);
+    let metadata = fs::metadata(&cache_path).ok()?;
+    if metadata.len() > read_limit as u64 {
         return None;
     }
-    let entry: DiskMetric = serde_json::from_slice(&fs::read(cache_path).ok()?).ok()?;
+    let mut file = fs::File::open(&cache_path).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take((read_limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > read_limit {
+        return None;
+    }
+    let entry: DiskMetric = match serde_json::from_slice(&bytes) {
+        Ok(entry) => entry,
+        Err(error) => {
+            crate::core::error_limiter::warn(
+                diagnostic_key(source_key),
+                format!("discarded invalid cache entry: {error}"),
+            );
+            let _ = fs::remove_file(&cache_path);
+            return None;
+        }
+    };
+    if entry.version != 1 {
+        crate::core::error_limiter::warn(
+            diagnostic_key(source_key),
+            format!("discarded unsupported cache version {}", entry.version),
+        );
+        let _ = fs::remove_file(&cache_path);
+        return None;
+    }
     if let Ok(mut cache) = MEMORY_CACHE.lock() {
         insert_memory_entry(
             &mut cache,
@@ -257,6 +395,7 @@ pub fn result_within_output_budget(result: &MetricResult, max_output_bytes: usiz
 
 /// Load a fresh-enough cached result. An invalidated source deliberately
 /// bypasses this path so a source event cannot immediately replay old data.
+#[cfg(test)]
 pub fn load(
     source_key: &str,
     ttl_seconds: Option<u64>,
@@ -288,7 +427,7 @@ pub fn load_with_budget(
             .map(|state| state.generation)
             .unwrap_or_default()
     };
-    let entry = read_entry(source_key)?;
+    let entry = read_entry(source_key, max_output_bytes)?;
     let still_current = INVALIDATIONS.lock().ok().is_some_and(|invalidations| {
         invalidations
             .get(source_key)
@@ -313,10 +452,12 @@ pub fn load_with_budget(
 /// a failed refresh. Callers may expose it as a stale value while preserving a
 /// failure diagnostic separately. No error/loading/unavailable value can enter
 /// this path because store() only accepts Normal results.
+#[cfg(test)]
 pub fn load_last_good(source_key: &str, period: Option<&str>) -> Option<MetricResult> {
     load_last_good_with_max_age(source_key, None, period)
 }
 
+#[cfg(test)]
 pub fn load_last_good_with_max_age(
     source_key: &str,
     max_staleness_seconds: Option<u64>,
@@ -331,7 +472,7 @@ pub fn load_last_good_with_max_age_and_budget(
     period: Option<&str>,
     max_output_bytes: usize,
 ) -> Option<MetricResult> {
-    let entry = read_entry(source_key)?;
+    let entry = read_entry(source_key, max_output_bytes)?;
     if !valid_entry(&entry, period) || !result_within_output_budget(&entry.result, max_output_bytes)
     {
         return None;
@@ -394,7 +535,9 @@ pub fn forget(source_key: &str) {
         invalidations.remove(source_key);
     }
     if let Ok(mut cache) = MEMORY_CACHE.lock() {
-        cache.remove(source_key);
+        if let Some(removed) = remove_memory_entry(&mut cache, source_key) {
+            cache.total_bytes = cache.total_bytes.saturating_sub(removed.bytes);
+        }
     }
 }
 
@@ -407,10 +550,21 @@ pub fn prune(active_source_keys: &HashSet<String>) {
         invalidations.retain(|key, _| active_source_keys.contains(key));
     }
     if let Ok(mut cache) = MEMORY_CACHE.lock() {
-        cache.retain(|key, _| active_source_keys.contains(key));
+        let removed_keys = cache
+            .entries
+            .keys()
+            .filter(|key| !active_source_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in removed_keys {
+            if let Some(removed) = remove_memory_entry(&mut cache, &key) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
     }
 }
 
+#[cfg(feature = "power-debug")]
 pub fn stats() -> CacheStats {
     let invalidation_entries = INVALIDATIONS
         .lock()
@@ -418,12 +572,7 @@ pub fn stats() -> CacheStats {
         .unwrap_or_default();
     let (memory_entries, memory_bytes) = MEMORY_CACHE
         .lock()
-        .map(|cache| {
-            (
-                cache.len(),
-                cache.values().map(|entry| entry.bytes).sum::<usize>(),
-            )
-        })
+        .map(|cache| (cache.entries.len(), cache.total_bytes))
         .unwrap_or_default();
     CacheStats {
         memory_entries,
@@ -432,6 +581,7 @@ pub fn stats() -> CacheStats {
     }
 }
 
+#[cfg(test)]
 pub fn store(source_key: &str, period: Option<&str>, result: &MetricResult) -> io::Result<()> {
     let token = invalidation_token(source_key);
     let _ = store_if_current(source_key, period, result, token)?;
@@ -456,8 +606,7 @@ pub fn store_if_current(
     let _write_lock = CACHE_WRITE_LOCK
         .lock()
         .map_err(|_| io::Error::other("cache write lock poisoned"))?;
-    let dir = cache_dir();
-    fs::create_dir_all(&dir)?;
+    ensure_cache_dir()?;
 
     {
         let invalidations = INVALIDATIONS
@@ -479,23 +628,19 @@ pub fn store_if_current(
         let cache = MEMORY_CACHE
             .lock()
             .map_err(|_| io::Error::other("cache lock poisoned"))?;
-        let previous = cache.get(source_key);
+        let previous = cache.entries.get(source_key);
         let period = period.map(str::to_owned);
         let unchanged = previous.is_some_and(|previous| {
             previous.entry.period == period && same_result(&previous.entry.result, result)
         });
-        let entry = if unchanged {
-            previous
-                .expect("unchanged implies previous entry")
-                .entry
-                .clone()
-        } else {
-            DiskMetric {
+        let entry = match (unchanged, previous) {
+            (true, Some(previous)) => previous.entry.clone(),
+            _ => DiskMetric {
                 version: 1,
                 saved_at: now_secs(),
                 period,
                 result: result.clone(),
-            }
+            },
         };
         let should_write = !unchanged
             || previous.is_none_or(|previous| {
@@ -531,6 +676,11 @@ pub fn store_if_current(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    #[cfg(unix)]
+    if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
 
     // Keep invalidation and the final rename/commit ordered. Serialization and
     // the potentially slower write happen before this lock, while the final
@@ -551,6 +701,8 @@ pub fn store_if_current(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
 
     let last_disk_write = Instant::now();
     let mut cache = MEMORY_CACHE
@@ -675,5 +827,55 @@ mod tests {
         assert!(load_with_budget(&key, None, None, serialized_size).is_some());
         assert!(load_with_budget(&key, None, None, 32).is_none());
         assert!(load_last_good_with_max_age_and_budget(&key, None, None, 32).is_none());
+    }
+
+    #[test]
+    fn memory_cache_lru_touch_and_byte_accounting_are_consistent() {
+        let mut cache = MemoryCache {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            lru_head: None,
+            lru_tail: None,
+        };
+        for index in 0..MAX_MEMORY_CACHE_ENTRIES {
+            let key = format!("lru-{index}");
+            insert_memory_entry(
+                &mut cache,
+                key,
+                DiskMetric {
+                    version: 1,
+                    saved_at: 0,
+                    period: None,
+                    result: normal("value"),
+                },
+                Instant::now(),
+            );
+        }
+        touch_memory_entry(&mut cache, "lru-0");
+        insert_memory_entry(
+            &mut cache,
+            "lru-new".into(),
+            DiskMetric {
+                version: 1,
+                saved_at: 0,
+                period: None,
+                result: normal("value"),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(cache.entries.len(), MAX_MEMORY_CACHE_ENTRIES);
+        assert!(!cache.entries.contains_key("lru-1"));
+        assert!(cache.entries.contains_key("lru-0"));
+        assert_eq!(cache.lru_head.as_deref(), Some("lru-2"));
+        assert_eq!(
+            cache
+                .entries
+                .values()
+                .map(|entry| entry.bytes)
+                .sum::<usize>(),
+            cache.total_bytes
+        );
+        assert!(cache.total_bytes <= MAX_MEMORY_CACHE_BYTES);
     }
 }

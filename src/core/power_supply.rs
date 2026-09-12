@@ -27,37 +27,6 @@ pub struct PowerSupplyMonitor {
 }
 
 impl PowerSupplyMonitor {
-    pub fn start(runtime: RuntimeHandle, root: PathBuf, thermal_root: PathBuf) -> Rc<Self> {
-        Self::start_with_callback(runtime, root, thermal_root, || {})
-    }
-
-    pub fn start_with_callback(
-        runtime: RuntimeHandle,
-        root: PathBuf,
-        thermal_root: PathBuf,
-        power_event: impl Fn() + 'static,
-    ) -> Rc<Self> {
-        Self::start_with_callbacks(runtime, root, thermal_root, power_event, || {})
-    }
-
-    pub fn start_with_callbacks(
-        runtime: RuntimeHandle,
-        root: PathBuf,
-        thermal_root: PathBuf,
-        power_event: impl Fn() + 'static,
-        thermal_event: impl Fn() + 'static,
-    ) -> Rc<Self> {
-        let battery = Arc::new(Mutex::new(BatterySource::new(root.clone())));
-        Self::start_with_shared_battery(
-            runtime,
-            root,
-            thermal_root,
-            battery,
-            power_event,
-            thermal_event,
-        )
-    }
-
     pub fn start_with_shared_battery(
         runtime: RuntimeHandle,
         root: PathBuf,

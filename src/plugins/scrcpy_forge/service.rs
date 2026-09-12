@@ -1,10 +1,11 @@
 //! ScrcpyForge HTTP adapter independent from GTK.
 
 use super::config::{Endpoints, PageConfig};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    io::Read,
     process::{Child, Command, Stdio},
     rc::Rc,
     sync::Arc,
@@ -61,19 +62,26 @@ struct CachedMetadata {
 }
 
 #[derive(Clone)]
+struct CachedPreview {
+    etag: Option<String>,
+    bytes: bytes::Bytes,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct PreviewCache {
+    entries: HashMap<String, CachedPreview>,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
 pub struct Client {
     api_url: String,
     endpoints: Endpoints,
     http: reqwest::Client,
     metadata_ttl: Duration,
     metadata: Arc<tokio::sync::Mutex<Option<CachedMetadata>>>,
-    previews: Arc<tokio::sync::Mutex<HashMap<String, CachedPreview>>>,
-}
-#[derive(Clone)]
-struct CachedPreview {
-    etag: Option<String>,
-    bytes: bytes::Bytes,
-    last_used: Instant,
+    previews: Arc<tokio::sync::Mutex<PreviewCache>>,
 }
 
 fn preview_cache_key(serial: &str, has_session: bool) -> String {
@@ -86,16 +94,92 @@ fn preview_cache_key(serial: &str, has_session: bool) -> String {
 const MAX_PREVIEW_CACHE_ENTRIES: usize = 32;
 const MAX_PREVIEW_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+enum ServiceError {
+    #[error("{endpoint} transport error ({kind})")]
+    Transport {
+        endpoint: String,
+        kind: &'static str,
+    },
+    #[error("{endpoint} returned HTTP {status}")]
+    Status { endpoint: String, status: u16 },
+    #[error("{endpoint} response exceeded {limit} bytes")]
+    TooLarge { endpoint: String, limit: usize },
+    #[error("{endpoint} response decode failed: {detail}")]
+    Decode { endpoint: String, detail: String },
+    #[error("{endpoint} returned invalid payload: {detail}")]
+    InvalidPayload { endpoint: String, detail: String },
+}
+
+fn transport_error(endpoint: &str, error: &reqwest::Error) -> anyhow::Error {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else {
+        "request"
+    };
+    anyhow::Error::new(ServiceError::Transport {
+        endpoint: endpoint.to_owned(),
+        kind,
+    })
+}
+
+fn checked_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::Error::new(ServiceError::Status {
+            endpoint: endpoint.to_owned(),
+            status: status.as_u16(),
+        }));
+    }
+    Ok(response)
+}
+
+async fn send_checked(
+    request: reqwest::RequestBuilder,
+    endpoint: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| transport_error(endpoint, &error))?;
+    checked_response(response, endpoint)
+}
+
+async fn json_limited<T: DeserializeOwned>(
+    response: reqwest::Response,
+    endpoint: &str,
+    limit: usize,
+) -> anyhow::Result<T> {
+    let bytes = response_bytes_limited(response, endpoint, limit).await?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::Error::new(ServiceError::Decode {
+            endpoint: endpoint.to_owned(),
+            detail: error.to_string(),
+        })
+    })
+}
 
 async fn response_bytes_limited(
     mut response: reqwest::Response,
+    endpoint: &str,
     limit: usize,
-) -> Option<bytes::Bytes> {
+) -> anyhow::Result<bytes::Bytes> {
+    let limit = limit.max(1);
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return None;
+        return Err(anyhow::Error::new(ServiceError::TooLarge {
+            endpoint: endpoint.to_owned(),
+            limit,
+        }));
     }
     let mut bytes = Vec::with_capacity(
         response
@@ -104,13 +188,20 @@ async fn response_bytes_limited(
             .unwrap_or(64 * 1024)
             .min(limit),
     );
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| transport_error(endpoint, &error))?
+    {
         if bytes.len().saturating_add(chunk.len()) > limit {
-            return None;
+            return Err(anyhow::Error::new(ServiceError::TooLarge {
+                endpoint: endpoint.to_owned(),
+                limit,
+            }));
         }
         bytes.extend_from_slice(&chunk);
     }
-    Some(bytes::Bytes::from(bytes))
+    Ok(bytes::Bytes::from(bytes))
 }
 impl Client {
     pub fn new(config: &PageConfig) -> Self {
@@ -124,39 +215,39 @@ impl Client {
             http,
             metadata_ttl: Duration::from_secs(config.metadata_interval_seconds.max(1)),
             metadata: Arc::new(tokio::sync::Mutex::new(None)),
-            previews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            previews: Arc::new(tokio::sync::Mutex::new(PreviewCache::default())),
         }
     }
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.api_url, path.trim_start_matches('/'))
     }
     fn endpoint(&self, template: &str, serial: &str) -> String {
-        template.replace("{serial}", serial)
+        template.replace("{serial}", &encode_path_segment(serial))
     }
     pub async fn healthy(&self) -> bool {
         crate::core::power_debug::increment(crate::core::power_debug::Counter::HttpRequest);
-        self.http
-            .get(self.url(&self.endpoints.health))
-            .send()
+        send_checked(self.http.get(self.url(&self.endpoints.health)), "health")
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .is_ok()
     }
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&self.endpoints.shutdown))
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&self.endpoints.shutdown))
+                .timeout(Duration::from_secs(2)),
+            "shutdown",
+        )
+        .await?;
         Ok(())
     }
     pub async fn connect(&self, endpoint: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&self.endpoints.connect))
-            .json(&serde_json::json!({"endpoint":endpoint}))
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&self.endpoints.connect))
+                .json(&serde_json::json!({"endpoint":endpoint})),
+            "connect",
+        )
+        .await?;
         self.invalidate_metadata().await;
         Ok(())
     }
@@ -199,45 +290,103 @@ impl Client {
                 if let Some(etag) = cached.as_ref().and_then(|value| value.etag.as_deref()) {
                     request = request.header(reqwest::header::IF_NONE_MATCH, etag);
                 }
+                let preview_endpoint = if has_session {
+                    "session_preview"
+                } else {
+                    "device_preview"
+                };
                 let png = match request.send().await {
                     Ok(response) if response.status() == reqwest::StatusCode::NOT_MODIFIED => {
                         cached.map(|value| value.bytes)
                     }
-                    Ok(response) => {
-                        let response = response.error_for_status().ok();
-                        if let Some(response) = response {
+                    Ok(response) => match checked_response(response, preview_endpoint) {
+                        Ok(response) => {
                             let etag = response
                                 .headers()
                                 .get(reqwest::header::ETAG)
                                 .and_then(|value| value.to_str().ok())
                                 .map(str::to_owned);
-                            let bytes = response_bytes_limited(response, MAX_PREVIEW_BYTES).await;
-                            if let Some(bytes) = bytes.as_ref() {
-                                client.store_preview(cache_key, etag, bytes.clone()).await;
+                            match response_bytes_limited(
+                                response,
+                                preview_endpoint,
+                                MAX_PREVIEW_BYTES,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => {
+                                    client.store_preview(cache_key, etag, bytes.clone()).await;
+                                    Some(bytes)
+                                }
+                                Err(error) => {
+                                    crate::core::error_limiter::warn(
+                                        format!("scrcpy-forge:{preview_endpoint}"),
+                                        error.to_string(),
+                                    );
+                                    None
+                                }
                             }
-                            bytes
-                        } else {
+                        }
+                        Err(error) => {
+                            crate::core::error_limiter::warn(
+                                format!("scrcpy-forge:{preview_endpoint}"),
+                                error.to_string(),
+                            );
                             None
                         }
+                    },
+                    Err(error) => {
+                        crate::core::error_limiter::warn(
+                            format!("scrcpy-forge:{preview_endpoint}"),
+                            transport_error(preview_endpoint, &error).to_string(),
+                        );
+                        None
                     }
-                    Err(_) => None,
                 };
                 let metrics =
                     if has_session {
                         crate::core::power_debug::increment(
                             crate::core::power_debug::Counter::HttpRequest,
                         );
-                        match client
-                            .http
-                            .get(client.url(
+                        match send_checked(
+                            client.http.get(client.url(
                                 &client.endpoint(&client.endpoints.session_metrics, &d.serial),
-                            ))
-                            .send()
-                            .await
-                            .and_then(|r| r.error_for_status())
+                            )),
+                            "session_metrics",
+                        )
+                        .await
                         {
-                            Ok(r) => r.json::<SessionMetrics>().await.ok(),
-                            Err(_) => None,
+                            Ok(response) => match json_limited::<SessionMetrics>(
+                                response,
+                                "session_metrics",
+                                MAX_METADATA_BYTES,
+                            )
+                            .await
+                            {
+                                Ok(metrics) => match validate_session_metrics(&metrics) {
+                                    Ok(()) => Some(metrics),
+                                    Err(error) => {
+                                        crate::core::error_limiter::warn(
+                                            "scrcpy-forge:session_metrics",
+                                            error.to_string(),
+                                        );
+                                        None
+                                    }
+                                },
+                                Err(error) => {
+                                    crate::core::error_limiter::warn(
+                                        "scrcpy-forge:session_metrics",
+                                        error.to_string(),
+                                    );
+                                    None
+                                }
+                            },
+                            Err(error) => {
+                                crate::core::error_limiter::warn(
+                                    "scrcpy-forge:session_metrics",
+                                    error.to_string(),
+                                );
+                                None
+                            }
                         }
                     } else {
                         None
@@ -288,48 +437,36 @@ impl Client {
         }
         // These resources do not depend on each other. Fetching them together
         // keeps refresh latency close to the slowest request instead of their sum.
-        let devices_request = self.http.get(self.url(&self.endpoints.devices)).send();
-        let scripts_request = self.http.get(self.url(&self.endpoints.tasks)).send();
-        let runs_request = self.http.get(self.url(&self.endpoints.task_runs)).send();
-        let sessions_request = self.http.get(self.url(&self.endpoints.sessions)).send();
+        let devices_request =
+            send_checked(self.http.get(self.url(&self.endpoints.devices)), "devices");
+        let scripts_request = send_checked(self.http.get(self.url(&self.endpoints.tasks)), "tasks");
+        let runs_request = send_checked(
+            self.http.get(self.url(&self.endpoints.task_runs)),
+            "task_runs",
+        );
+        let sessions_request = send_checked(
+            self.http.get(self.url(&self.endpoints.sessions)),
+            "sessions",
+        );
         let (mut devices, mut scripts, mut runs, mut sessions) = tokio::try_join!(
             async {
-                Ok::<_, anyhow::Error>(
-                    devices_request
-                        .await?
-                        .error_for_status()?
-                        .json::<Vec<Device>>()
-                        .await?,
-                )
+                json_limited::<Vec<Device>>(devices_request.await?, "devices", MAX_METADATA_BYTES)
+                    .await
             },
             async {
-                Ok::<_, anyhow::Error>(
-                    scripts_request
-                        .await?
-                        .error_for_status()?
-                        .json::<Vec<String>>()
-                        .await?,
-                )
+                json_limited::<Vec<String>>(scripts_request.await?, "tasks", MAX_METADATA_BYTES)
+                    .await
             },
             async {
-                Ok::<_, anyhow::Error>(
-                    runs_request
-                        .await?
-                        .error_for_status()?
-                        .json::<Vec<ScriptRun>>()
-                        .await?,
-                )
+                json_limited::<Vec<ScriptRun>>(runs_request.await?, "task_runs", MAX_METADATA_BYTES)
+                    .await
             },
             async {
-                Ok::<_, anyhow::Error>(
-                    sessions_request
-                        .await?
-                        .error_for_status()?
-                        .json::<Vec<String>>()
-                        .await?,
-                )
+                json_limited::<Vec<String>>(sessions_request.await?, "sessions", MAX_METADATA_BYTES)
+                    .await
             },
         )?;
+        validate_metadata(&devices, &scripts, &runs, &sessions)?;
         devices.sort_by(|a, b| a.serial.cmp(&b.serial));
         scripts.sort();
         sessions.sort();
@@ -351,73 +488,86 @@ impl Client {
     }
 
     async fn cached_preview(&self, key: &str) -> Option<CachedPreview> {
-        let mut previews = self.previews.lock().await;
-        let preview = previews.get_mut(key)?;
+        let mut cache = self.previews.lock().await;
+        let preview = cache.entries.get_mut(key)?;
         preview.last_used = Instant::now();
         Some(preview.clone())
     }
 
     async fn store_preview(&self, key: String, etag: Option<String>, bytes: bytes::Bytes) {
-        let mut previews = self.previews.lock().await;
-        previews.insert(
+        let mut cache = self.previews.lock().await;
+        let byte_len = bytes.len();
+        if let Some(previous) = cache.entries.insert(
             key,
             CachedPreview {
                 etag,
                 bytes,
                 last_used: Instant::now(),
             },
-        );
-        while previews.len() > MAX_PREVIEW_CACHE_ENTRIES
-            || previews
-                .values()
-                .map(|preview| preview.bytes.len())
-                .sum::<usize>()
-                > MAX_PREVIEW_CACHE_BYTES
+        ) {
+            cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes.len());
+        }
+        cache.total_bytes = cache.total_bytes.saturating_add(byte_len);
+        while cache.entries.len() > MAX_PREVIEW_CACHE_ENTRIES
+            || cache.total_bytes > MAX_PREVIEW_CACHE_BYTES
         {
-            let Some(oldest_key) = previews
+            let Some(oldest_key) = cache
+                .entries
                 .iter()
                 .min_by_key(|(_, preview)| preview.last_used)
                 .map(|(key, _)| key.clone())
             else {
                 break;
             };
-            previews.remove(&oldest_key);
+            if let Some(removed) = cache.entries.remove(&oldest_key) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(removed.bytes.len());
+            }
         }
     }
 
     async fn prune_previews(&self, active_keys: HashSet<String>) {
-        self.previews
-            .lock()
-            .await
-            .retain(|key, _| active_keys.contains(key));
+        let mut cache = self.previews.lock().await;
+        let mut removed_bytes = 0_usize;
+        cache.entries.retain(|key, preview| {
+            if active_keys.contains(key) {
+                true
+            } else {
+                removed_bytes = removed_bytes.saturating_add(preview.bytes.len());
+                false
+            }
+        });
+        cache.total_bytes = cache.total_bytes.saturating_sub(removed_bytes);
     }
 
     pub async fn start_session(&self, serial: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&self.endpoint(&self.endpoints.session_start, serial)))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&self.endpoint(&self.endpoints.session_start, serial)))
+                .json(&serde_json::json!({})),
+            "session_start",
+        )
+        .await?;
         self.invalidate_metadata().await;
         Ok(())
     }
     pub async fn run_script(&self, serial: &str, name: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&self.endpoints.task_run))
-            .json(&RunNamed { serial, name })
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&self.endpoints.task_run))
+                .json(&RunNamed { serial, name }),
+            "task_run",
+        )
+        .await?;
         self.invalidate_metadata().await;
         Ok(())
     }
     pub async fn stop_script(&self, serial: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&self.endpoint(&self.endpoints.task_stop, serial)))
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&self.endpoint(&self.endpoints.task_stop, serial))),
+            "task_stop",
+        )
+        .await?;
         self.invalidate_metadata().await;
         Ok(())
     }
@@ -431,15 +581,113 @@ impl Client {
         let path = self
             .endpoint(&self.endpoints.profile, serial)
             .replace("{kind}", kind);
-        self.http
-            .post(self.url(&path))
-            .json(&serde_json::json!({"profile":profile}))
-            .send()
-            .await?
-            .error_for_status()?;
+        send_checked(
+            self.http
+                .post(self.url(&path))
+                .json(&serde_json::json!({"profile":profile})),
+            kind,
+        )
+        .await?;
         Ok(())
     }
 }
+
+const MAX_SERVICE_DEVICES: usize = 128;
+const MAX_SERVICE_SCRIPTS: usize = 256;
+const MAX_SERVICE_RUNS: usize = 512;
+const MAX_SERVICE_SESSIONS: usize = 128;
+const MAX_SERVICE_TEXT_BYTES: usize = 512;
+
+fn validate_metadata(
+    devices: &[Device],
+    scripts: &[String],
+    runs: &[ScriptRun],
+    sessions: &[String],
+) -> anyhow::Result<()> {
+    if devices.len() > MAX_SERVICE_DEVICES
+        || scripts.len() > MAX_SERVICE_SCRIPTS
+        || runs.len() > MAX_SERVICE_RUNS
+        || sessions.len() > MAX_SERVICE_SESSIONS
+    {
+        return Err(anyhow::Error::new(ServiceError::InvalidPayload {
+            endpoint: "metadata".into(),
+            detail: format!(
+                "collection sizes exceed limits ({MAX_SERVICE_DEVICES}/{MAX_SERVICE_SCRIPTS}/{MAX_SERVICE_RUNS}/{MAX_SERVICE_SESSIONS})"
+            ),
+        }));
+    }
+    for device in devices {
+        validate_text_field("metadata.devices.serial", &device.serial)?;
+        validate_text_field("metadata.devices.state", &device.state)?;
+        if let Some(model) = &device.model {
+            validate_text_field("metadata.devices.model", model)?;
+        }
+    }
+    for script in scripts {
+        validate_text_field("metadata.scripts", script)?;
+    }
+    for session in sessions {
+        validate_text_field("metadata.sessions", session)?;
+    }
+    for run in runs {
+        validate_text_field("metadata.runs.serial", &run.serial)?;
+        if let Some(name) = &run.name {
+            validate_text_field("metadata.runs.name", name)?;
+        }
+        if let Some(error) = &run.error {
+            validate_text_field("metadata.runs.error", error)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_text_field(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > MAX_SERVICE_TEXT_BYTES {
+        return Err(anyhow::Error::new(ServiceError::InvalidPayload {
+            endpoint: "metadata".into(),
+            detail: format!("{field} is empty or exceeds {MAX_SERVICE_TEXT_BYTES} bytes"),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_session_metrics(metrics: &SessionMetrics) -> anyhow::Result<()> {
+    let values = [
+        metrics.decoded_fps,
+        metrics.preview_fps,
+        metrics.script_fps,
+        metrics.latest_frame_age_ms,
+        metrics.average_script_ms,
+        metrics.script_p50_ms,
+        metrics.script_p95_ms,
+    ];
+    if values.iter().any(|value| !value.is_finite())
+        || metrics.profile.len() > MAX_SERVICE_TEXT_BYTES
+        || metrics.preview_profile.len() > MAX_SERVICE_TEXT_BYTES
+    {
+        return Err(anyhow::Error::new(ServiceError::InvalidPayload {
+            endpoint: "session_metrics".into(),
+            detail: "metrics contain a non-finite value or oversized profile".into(),
+        }));
+    }
+    Ok(())
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
 #[derive(Serialize)]
 struct RunNamed<'a> {
     serial: &'a str,
@@ -447,7 +695,13 @@ struct RunNamed<'a> {
 }
 
 #[derive(Clone, Default)]
-pub struct DaemonController(Rc<RefCell<Option<Child>>>);
+pub struct DaemonController {
+    child: Rc<RefCell<Option<Child>>>,
+    program: Rc<RefCell<Option<String>>>,
+}
+
+const MAX_DAEMON_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
 impl DaemonController {
     pub fn start(&self, program: &str, args: &[String]) -> std::io::Result<()> {
         if self.running() {
@@ -458,38 +712,60 @@ impl DaemonController {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command.spawn()?;
-        *self.0.borrow_mut() = Some(child);
+        let mut child = command.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            let program_name = program.to_owned();
+            let _ = std::thread::Builder::new()
+                .name("pulsedeck-daemon-stderr".into())
+                .spawn(move || drain_daemon_stderr(stderr, &program_name));
+        }
+        *self.program.borrow_mut() = Some(program.to_owned());
+        *self.child.borrow_mut() = Some(child);
         Ok(())
     }
     pub fn stop(&self) {
-        if let Some(mut child) = self.0.borrow_mut().take() {
-            #[cfg(unix)]
-            {
-                let process_group = -(child.id() as libc::pid_t);
-                unsafe {
-                    let _ = libc::kill(process_group, libc::SIGTERM);
-                    let _ = libc::kill(process_group, libc::SIGKILL);
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.take() {
+            // Process reaping and the grace period must not block the GTK
+            // main loop. The caller can use `take` when it needs to sequence
+            // the service API shutdown before this worker.
+            let _ = std::thread::Builder::new()
+                .name("pulsedeck-daemon-stop".into())
+                .spawn(|| stop_child_blocking(child));
         }
     }
+
+    pub fn take(&self) -> Option<Child> {
+        self.program.borrow_mut().take();
+        self.child.borrow_mut().take()
+    }
     pub fn running(&self) -> bool {
-        let mut slot = self.0.borrow_mut();
+        let mut slot = self.child.borrow_mut();
         if let Some(child) = slot.as_mut() {
             match child.try_wait() {
                 Ok(None) => true,
-                _ => {
+                Ok(Some(status)) => {
+                    let program = self
+                        .program
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or_else(|| "scrcpy-forge-daemon".into());
+                    tracing::warn!(
+                        program = %program,
+                        exit_code = ?status.code(),
+                        "ScrcpyForge daemon exited before/while becoming healthy"
+                    );
                     *slot = None;
                     false
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to inspect ScrcpyForge daemon status");
+                    true
                 }
             }
         } else {
@@ -497,10 +773,87 @@ impl DaemonController {
         }
     }
 }
+
+pub(super) fn stop_child_blocking(mut child: Child) {
+    #[cfg(unix)]
+    {
+        // A caller normally attempted the HTTP shutdown first. Give a
+        // cooperative daemon a short window to exit before sending a signal;
+        // this also keeps the common path free of unnecessary process-group
+        // termination.
+        if wait_for_child_exit(&mut child, Duration::from_millis(500)) {
+            return;
+        }
+        let process_group = -(child.id() as libc::pid_t);
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGTERM);
+        }
+        if wait_for_child_exit(&mut child, Duration::from_secs(2)) {
+            return;
+        }
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(child: &mut Child, grace: Duration) -> bool {
+    let deadline = std::time::Instant::now()
+        .checked_add(grace)
+        .unwrap_or_else(std::time::Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
+}
 impl Drop for DaemonController {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.0) == 1 {
+        if Rc::strong_count(&self.child) == 1 {
             self.stop()
         }
+    }
+}
+
+fn drain_daemon_stderr(mut stderr: impl Read, program: &str) {
+    let mut tail = std::collections::VecDeque::with_capacity(MAX_DAEMON_STDERR_TAIL_BYTES);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                for byte in &buffer[..read] {
+                    if tail.len() == MAX_DAEMON_STDERR_TAIL_BYTES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, program, "failed to drain ScrcpyForge daemon stderr");
+                break;
+            }
+        }
+    }
+    if tail.is_empty() {
+        return;
+    }
+    let bytes = tail.into_iter().collect::<Vec<_>>();
+    let message = String::from_utf8_lossy(&bytes);
+    let message = message.trim();
+    if !message.is_empty() {
+        tracing::warn!(program, stderr_tail = %message, "ScrcpyForge daemon stderr");
     }
 }

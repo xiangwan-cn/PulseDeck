@@ -1,6 +1,7 @@
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Grid, Label, Orientation};
 
+use crate::core::text::{bounded_text, MAX_UI_COLLECTION_ITEMS, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue};
 
 pub fn apply_value(widgets: &ValueWidgets, model: &CardModel) {
@@ -10,7 +11,11 @@ pub fn apply_value(widgets: &ValueWidgets, model: &CardModel) {
     widgets.grid.set_visible(false);
     widgets.value.set_visible(true);
 
-    if let (CardValue::Text(text), Some(limit)) = (&model.value, model.columns_after) {
+    let bounded_value = match &model.value {
+        CardValue::Text(text) => Some(bounded_text(text, MAX_UI_TEXT_BYTES)),
+        _ => None,
+    };
+    if let (Some(text), Some(limit)) = (bounded_value.as_deref(), model.columns_after) {
         if apply_text_grid(widgets, text, limit, model.columns.unwrap_or(2)) {
             return;
         }
@@ -23,7 +28,7 @@ pub fn apply_value(widgets: &ValueWidgets, model: &CardModel) {
             decimals,
         } => crate::rendering::format::number(*value, unit.as_deref(), *decimals),
         CardValue::Percentage(p) => crate::rendering::format::percentage(*p),
-        CardValue::Text(t) => t.clone(),
+        CardValue::Text(t) => bounded_text(t, MAX_UI_TEXT_BYTES),
         _ => String::new(),
     };
 
@@ -33,7 +38,11 @@ pub fn apply_value(widgets: &ValueWidgets, model: &CardModel) {
 fn apply_text_grid(widgets: &ValueWidgets, text: &str, limit: usize, columns: usize) -> bool {
     let mut summary = Vec::new();
     let mut items = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+    for line in text
+        .lines()
+        .take(MAX_UI_COLLECTION_ITEMS.saturating_add(1))
+        .filter(|line| !line.trim().is_empty())
+    {
         if line.contains('轮') && (line.contains('件') || line.contains("剩")) {
             summary.push(line);
         } else {
@@ -47,14 +56,15 @@ fn apply_text_grid(widgets: &ValueWidgets, text: &str, limit: usize, columns: us
     widgets.value.set_visible(false);
     widgets.grid.set_visible(true);
     if !summary.is_empty() {
-        let label = grid_label(&summary.join(" · "), true);
+        let summary = bounded_text(&summary.join(" · "), MAX_UI_TEXT_BYTES);
+        let label = grid_label(&summary, true);
         label.set_halign(Align::Center);
         widgets.grid.attach(&label, 0, 0, columns.max(1) as i32, 1);
     }
     let columns = columns.max(1);
     // Compact fixed cards can hold eight short rows. Truncate only beyond the
     // configured grid's total capacity; the full value remains in the tooltip.
-    items.truncate(columns.saturating_mul(8));
+    items.truncate(columns.saturating_mul(8).min(MAX_UI_COLLECTION_ITEMS));
     let summary_offset = usize::from(!summary.is_empty());
     for (index, item) in items.into_iter().enumerate() {
         // Row-major order follows normal reading order. The previous

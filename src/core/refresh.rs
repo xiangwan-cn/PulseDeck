@@ -50,7 +50,9 @@ impl SourceRevision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceEventKind {
     Changed,
+    #[allow(dead_code)]
     Available,
+    #[allow(dead_code)]
     Unavailable,
 }
 
@@ -63,6 +65,7 @@ pub struct SourceEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshReason {
+    #[allow(dead_code)]
     Periodic,
     Manual,
     Source(SourceKey),
@@ -123,16 +126,6 @@ impl RefreshCoordinator {
             .unwrap_or(SourceRevision::INITIAL)
     }
 
-    pub fn dependents(&self, key: &SourceKey) -> Vec<TaskKey> {
-        let mut tasks = self
-            .sources
-            .get(key)
-            .map(|source| source.dependents.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        tasks.sort();
-        tasks
-    }
-
     /// Publish one source edge and return the deduplicated task requests for
     /// the resulting revision. Repeated edges while a task is already pending
     /// are still represented by a higher revision, allowing the scheduler to
@@ -166,14 +159,6 @@ impl RefreshCoordinator {
             });
         }
         (event, requests)
-    }
-
-    /// Mark a task's source request as observed. This lets a subsequent event
-    /// after collection route a fresh revision without clearing source state.
-    pub fn acknowledge(&mut self, key: &SourceKey, task: &str, revision: SourceRevision) {
-        if let Some(source) = self.sources.get_mut(key) {
-            source.last_requested.insert(task.to_owned(), revision);
-        }
     }
 
     pub fn clear(&mut self) {

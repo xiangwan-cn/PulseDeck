@@ -14,6 +14,10 @@ pub use super::runtime_policy::{
     ThermalVerdict, Visibility, WorkLevel,
 };
 
+fn deadline_after(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserActivity {
     Click,
@@ -100,10 +104,12 @@ impl RuntimeSubscription {
         self.receiver.recv().await
     }
 
+    #[cfg(test)]
     pub fn try_recv(&self) -> Result<RuntimeSnapshot, async_channel::TryRecvError> {
         self.receiver.try_recv()
     }
 
+    #[cfg(feature = "scrcpy-forge")]
     pub fn is_closed(&self) -> bool {
         self.receiver.is_closed()
     }
@@ -192,7 +198,7 @@ impl RuntimeManager {
             .borrow()
             .observation_lease_seconds
             .min(HARD_MAX_OBSERVATION_LEASE_SECONDS);
-        let maximum = now + Duration::from_secs(configured);
+        let maximum = deadline_after(now, Duration::from_secs(configured));
         if self
             .observation_lease
             .get()
@@ -275,7 +281,7 @@ impl RuntimeManager {
                 .min(HARD_MAX_OBSERVATION_LEASE_SECONDS);
             if seconds > 0 {
                 self.observation_lease
-                    .set(Some(now + Duration::from_secs(seconds)));
+                    .set(Some(deadline_after(now, Duration::from_secs(seconds))));
             }
         }
         self.recompute();
@@ -358,7 +364,7 @@ impl RuntimeManager {
             task_id,
             attention: Some((
                 event_id,
-                Instant::now() + Duration::from_secs(seconds.max(1)),
+                deadline_after(Instant::now(), Duration::from_secs(seconds.max(1))),
             )),
             active,
         }));
@@ -475,21 +481,30 @@ impl RuntimeManager {
             return;
         }
         let mut deadlines = Vec::new();
-        let idle_at = self.last_activity.get() + Duration::from_secs(cfg.idle_timeout_seconds);
+        let idle_at = deadline_after(
+            self.last_activity.get(),
+            Duration::from_secs(cfg.idle_timeout_seconds),
+        );
         if idle_at > now {
             deadlines.push(idle_at);
         } else if let Some(candidate) = self.idle_candidate_since.get() {
-            deadlines.push(candidate + Duration::from_secs(cfg.idle_stability_seconds));
+            deadlines.push(deadline_after(
+                candidate,
+                Duration::from_secs(cfg.idle_stability_seconds),
+            ));
         }
         if let Some(since) = self.inactive_since.get() {
-            deadlines.push(since + Duration::from_secs(cfg.inactive_grace_seconds));
+            deadlines.push(deadline_after(
+                since,
+                Duration::from_secs(cfg.inactive_grace_seconds),
+            ));
         }
         deadlines.extend(self.interactions.borrow().values().copied());
         if let Some(deadline) = self.observation_lease.get() {
             deadlines.push(deadline);
         }
         if let Some(seconds) = seconds_until_quiet_boundary(cfg, Local::now()) {
-            deadlines.push(now + Duration::from_secs(seconds));
+            deadlines.push(deadline_after(now, Duration::from_secs(seconds)));
         }
         if let Some(agent) = self.agent.borrow().as_ref() {
             if let Some((_, until)) = agent.attention {
@@ -653,7 +668,7 @@ impl RuntimeHandle {
             self.manager
                 .interactions
                 .borrow_mut()
-                .insert(id, now + duration);
+                .insert(id, deadline_after(now, duration));
         }
         self.manager.recompute();
         InteractionLease {

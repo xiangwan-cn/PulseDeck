@@ -110,8 +110,8 @@ fn filesystem_usage() -> MetricResult {
         return MetricResult::error("读取根文件系统失败");
     }
     let stats = unsafe { stats.assume_init() };
-    let total = stats.f_blocks as u64 * stats.f_frsize as u64;
-    let available = stats.f_bavail as u64 * stats.f_frsize as u64;
+    let total = stats.f_blocks * stats.f_frsize;
+    let available = stats.f_bavail * stats.f_frsize;
     let used = total.saturating_sub(available);
     let percent = if total == 0 {
         0.0

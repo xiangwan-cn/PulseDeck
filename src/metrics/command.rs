@@ -1,7 +1,11 @@
+use crate::core::text::{
+    bounded_lines, bounded_tail, bounded_text, MAX_UI_ERROR_BYTES, MAX_UI_TEXT_BYTES,
+};
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
-use std::sync::{atomic::AtomicBool, Arc};
+use tokio_util::sync::CancellationToken;
 
+#[derive(Clone)]
 pub struct CommandMetric {
     program: String,
     args: Vec<String>,
@@ -30,21 +34,20 @@ impl CommandMetric {
         }
     }
 
-    pub fn collect_no_ctx(
-        &mut self,
+    pub async fn collect_async(
+        &self,
         global_max_output: usize,
-        shutdown: Arc<AtomicBool>,
+        cancellation: CancellationToken,
     ) -> MetricResult {
         let max_output = self.max_output_bytes.min(global_max_output).max(1);
-        let output = crate::tokio_handle().block_on(
-            crate::execution::subprocess::run_command_with_shutdown(
-                &self.program,
-                &self.args,
-                self.timeout_secs,
-                max_output,
-                shutdown,
-            ),
-        );
+        let output = crate::execution::subprocess::run_command_with_cancellation(
+            &self.program,
+            &self.args,
+            self.timeout_secs,
+            max_output,
+            cancellation,
+        )
+        .await;
         match output {
             Ok(output) if output.success => self.render_success(output.stdout),
             Ok(output) => MetricResult {
@@ -57,7 +60,7 @@ impl CommandMetric {
                 tooltip: Some(if output.stderr.trim().is_empty() {
                     "命令执行失败".into()
                 } else {
-                    output.stderr.trim().to_string()
+                    bounded_tail(output.stderr.trim(), MAX_UI_ERROR_BYTES)
                 }),
                 state: MetricState::Error,
                 cached: false,
@@ -65,8 +68,8 @@ impl CommandMetric {
             },
             Err(error) => MetricResult {
                 value: CardValue::Text("错误".into()),
-                subtitle: Some(error.clone()),
-                tooltip: Some(error),
+                subtitle: Some(bounded_text(&error, MAX_UI_ERROR_BYTES)),
+                tooltip: Some(bounded_text(&error, MAX_UI_ERROR_BYTES)),
                 state: MetricState::Error,
                 cached: false,
                 metadata: None,
@@ -86,23 +89,17 @@ impl CommandMetric {
                 metadata: None,
             };
         }
-        let mut lines = trimmed.lines();
-        let first = lines.next().unwrap_or_default();
-        let rest: Vec<&str> = lines.collect();
+        let (first, rest) = trimmed
+            .split_once('\n')
+            .map_or((trimmed, ""), |(first, rest)| (first, rest));
+        let first = bounded_text(first.trim_end_matches('\r'), MAX_UI_TEXT_BYTES);
         let (value, subtitle) = if self.reverse {
-            let content = rest.join("\n");
-            (
-                content,
-                Some(first.to_owned()).filter(|value| !value.is_empty()),
-            )
+            let content = bounded_lines(rest, 0, MAX_UI_TEXT_BYTES);
+            (content, Some(first).filter(|value| !value.is_empty()))
         } else {
-            let count = if self.max_subtitle_lines == 0 {
-                rest.len()
-            } else {
-                rest.len().min(self.max_subtitle_lines)
-            };
-            let subtitle = (count > 0).then(|| rest[..count].join("\n"));
-            (first.to_owned(), subtitle)
+            let subtitle = (!rest.is_empty())
+                .then(|| bounded_lines(rest, self.max_subtitle_lines, MAX_UI_TEXT_BYTES));
+            (first, subtitle)
         };
         MetricResult {
             value: CardValue::Text(value),

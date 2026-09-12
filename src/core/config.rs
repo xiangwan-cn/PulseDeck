@@ -1,5 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::model::card_model::{CardState, RendererKind, StatusLevel};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 4;
@@ -143,6 +146,15 @@ pub enum ScreenInhibitMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SuspendInhibitMode {
+    #[default]
+    Never,
+    WhileActive,
+    WhileMapped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleViewMode {
     #[default]
@@ -160,6 +172,11 @@ pub struct RuntimeConfig {
     pub inactive_grace_seconds: u64,
     #[serde(default)]
     pub screen_inhibit: ScreenInhibitMode,
+    /// Prevent the desktop session from automatically suspending while the
+    /// selected PulseDeck window state is present. This is opt-in because it
+    /// can increase energy use and should remain independent from idle blanking.
+    #[serde(default)]
+    pub suspend_inhibit: SuspendInhibitMode,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
     #[serde(default = "default_idle_stability")]
@@ -254,6 +271,7 @@ impl Default for RuntimeConfig {
             profile: RuntimeProfile::Balanced,
             inactive_grace_seconds: default_inactive_grace(),
             screen_inhibit: ScreenInhibitMode::WhileActive,
+            suspend_inhibit: SuspendInhibitMode::Never,
             idle_timeout_seconds: default_idle_timeout(),
             idle_stability_seconds: default_idle_stability(),
             idle_view: IdleViewMode::None,
@@ -285,6 +303,8 @@ pub struct RuntimeOverride {
     pub inactive_grace_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_inhibit: Option<ScreenInhibitMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_inhibit: Option<SuspendInhibitMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,6 +351,7 @@ impl RuntimeOverride {
             profile,
             inactive_grace_seconds,
             screen_inhibit,
+            suspend_inhibit,
             idle_timeout_seconds,
             idle_stability_seconds,
             idle_view,
@@ -360,6 +381,7 @@ impl RuntimeOverride {
             profile,
             inactive_grace_seconds,
             screen_inhibit,
+            suspend_inhibit,
             idle_timeout_seconds,
             idle_stability_seconds,
             idle_view,
@@ -793,7 +815,7 @@ pub enum SourceConfig {
     Builtin(String),
     File(FileSourceConfig),
     Command(CommandSourceConfig),
-    Http(HttpSourceConfig),
+    Http(Box<HttpSourceConfig>),
     Text(String),
 }
 
@@ -1339,6 +1361,48 @@ pub fn config_path() -> std::path::PathBuf {
 
 pub fn config_modules_dir() -> std::path::PathBuf {
     config_dir().join("config.d")
+}
+
+/// Create a configuration directory with owner-only permissions. Configuration
+/// modules may contain HTTP credentials or command arguments, so the directory
+/// boundary is part of the configuration security contract.
+pub fn ensure_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Create the parent of a user-selected state/output file without changing
+/// permissions on an already-existing directory. Plugin paths are allowed to
+/// point at locations such as `/tmp` or a user-managed data directory; making
+/// those existing parents mode 0700 would be a surprising and potentially
+/// destructive side effect. Newly-created directories still get the private
+/// mode before the file is written.
+#[cfg(feature = "pet-card")]
+pub fn ensure_private_parent(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut missing = Vec::new();
+    let mut current = parent.to_path_buf();
+    while !current.exists() {
+        missing.push(current.clone());
+        let Some(next) = current.parent() else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next.to_path_buf();
+    }
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    for directory in missing {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 pub fn cache_dir() -> std::path::PathBuf {

@@ -4,16 +4,17 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use super::config::{AnimationConfig, PetConfig};
 use crate::core::config::CardConfig;
@@ -22,12 +23,26 @@ use crate::core::runtime::{
     ImportantEventKind, RuntimeHandle, RuntimeSnapshot, ThermalVerdict, UserActivity, Visibility,
     VisualPolicy,
 };
+use crate::core::text::MAX_UI_TEXT_BYTES;
 use crate::plugins::{CardPresentation, CardPresentationHandle};
 
 const RUNTIME_DATA_KEY: &str = "pulsedeck-pet-runtime";
 const MAX_FRAME_CACHE_STATES: usize = 3;
+const MAX_FRAME_COUNT: usize = 256;
+const MAX_FRAME_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FRAME_STATE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FRAME_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FRAME_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_FRAME_DIMENSION: u64 = 4096;
+const MAX_FRAME_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_FRAME_LOAD_WORKERS: usize = 1;
 const MAX_MISSING_FRAME_WARNINGS: usize = 512;
 const MAX_STATE_FILE_BYTES: usize = 128 * 1024;
+const MAX_STATE_NAME_BYTES: usize = 128;
+const MAX_STATE_ID_BYTES: usize = 256;
+
+static FRAME_LOAD_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_FRAME_LOAD_WORKERS)));
 
 #[derive(Debug, Deserialize)]
 struct StateEvent {
@@ -55,6 +70,7 @@ struct Runtime {
     frames: RefCell<Vec<gdk::Texture>>,
     frame_cache: RefCell<HashMap<String, Vec<gdk::Texture>>>,
     cache_order: RefCell<VecDeque<String>>,
+    frame_cache_bytes: Cell<usize>,
     loading_states: RefCell<HashMap<String, u64>>,
     missing_frame_warnings: RefCell<HashSet<PathBuf>>,
     frame_load_generation: Cell<u64>,
@@ -73,7 +89,7 @@ struct Runtime {
     presentation: Option<CardPresentationHandle>,
     runtime: RuntimeHandle,
     handle: tokio::runtime::Handle,
-    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 }
 
 pub fn build(
@@ -82,7 +98,7 @@ pub fn build(
     presentation: Option<CardPresentationHandle>,
     runtime_handle: RuntimeHandle,
     tokio_handle: tokio::runtime::Handle,
-    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> Result<gtk::Box, AppError> {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
     root.add_css_class("card");
@@ -126,6 +142,7 @@ pub fn build(
         frames: RefCell::new(Vec::new()),
         frame_cache: RefCell::new(HashMap::new()),
         cache_order: RefCell::new(VecDeque::new()),
+        frame_cache_bytes: Cell::new(0),
         loading_states: RefCell::new(HashMap::new()),
         missing_frame_warnings: RefCell::new(HashSet::new()),
         frame_load_generation: Cell::new(0),
@@ -144,7 +161,7 @@ pub fn build(
         presentation,
         runtime: runtime_handle,
         handle: tokio_handle,
-        shutdown,
+        cancellation,
     });
     Runtime::setup_presentation_menu(&runtime);
     runtime.set_state("offline", None, true);
@@ -245,8 +262,9 @@ impl Runtime {
             .config
             .state_file
             .parent()
-            .ok_or_else(|| AppError::Plugin("pet-card state file has no parent".into()))?;
-        std::fs::create_dir_all(parent)?;
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        crate::core::config::ensure_private_parent(&this.config.state_file)?;
         let monitor = gio::File::for_path(parent)
             .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
             .map_err(|error| AppError::Plugin(format!("cannot monitor pet state: {error}")))?;
@@ -272,7 +290,7 @@ impl Runtime {
     }
 
     fn load_state(self: &Rc<Self>) {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.cancellation.is_cancelled() {
             return;
         }
         let generation = self.state_load_generation.get().wrapping_add(1);
@@ -291,7 +309,7 @@ impl Runtime {
             let Some(runtime) = weak.upgrade() else {
                 return;
             };
-            if runtime.shutdown.load(Ordering::Acquire) {
+            if runtime.cancellation.is_cancelled() {
                 return;
             }
             runtime.state_load_running.set(false);
@@ -486,15 +504,11 @@ impl Runtime {
         animation: AnimationConfig,
         generation: u64,
     ) {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.cancellation.is_cancelled() {
             return;
         }
-        if self
-            .loading_states
-            .borrow_mut()
-            .insert(state.to_string(), generation)
-            .is_some()
-        {
+        let claimed = claim_frame_load(&mut self.loading_states.borrow_mut(), state, generation);
+        if !claimed {
             return;
         }
         let state = state.to_string();
@@ -512,10 +526,14 @@ impl Runtime {
             return;
         }
         let handle = self.handle.clone();
-        let join = handle.spawn_blocking(move || load_frames(paths));
+        let cancellation = self.cancellation.clone();
+        let load = load_frames_with_budget(handle, paths, cancellation);
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            let loaded = match join.await {
+            let Some(loaded) = load.await else {
+                return;
+            };
+            let loaded = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => LoadedFrames {
                     frames: Vec::new(),
@@ -525,14 +543,15 @@ impl Runtime {
             let Some(runtime) = weak.upgrade() else {
                 return;
             };
-            if runtime.shutdown.load(Ordering::Acquire) {
+            if runtime.cancellation.is_cancelled() {
                 return;
             }
-            let current_load = runtime
-                .loading_states
-                .borrow_mut()
-                .remove(&state)
-                .is_some_and(|load_generation| load_generation == generation);
+            // A -> B -> A is valid, and an old worker must not consume a new
+            // A load that was started after stop_timers cleared the previous
+            // ownership token. The per-state generation is the completion
+            // guard; state equality alone is insufficient here.
+            let current_load =
+                finish_frame_load(&mut runtime.loading_states.borrow_mut(), &state, generation);
             if !current_load {
                 return;
             }
@@ -545,17 +564,34 @@ impl Runtime {
     }
 
     fn cache_frames(&self, state: &str, frames: Vec<gdk::Texture>) {
-        self.frame_cache
+        let new_bytes = estimate_frames_bytes(&frames);
+        let old_bytes = self
+            .frame_cache
             .borrow_mut()
-            .insert(state.to_string(), frames);
+            .insert(state.to_string(), frames)
+            .map_or(0, |old| estimate_frames_bytes(&old));
+        self.frame_cache_bytes.set(
+            self.frame_cache_bytes
+                .get()
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes),
+        );
         let mut order = self.cache_order.borrow_mut();
         order.retain(|key| key != state);
         order.push_back(state.to_string());
-        while order.len() > MAX_FRAME_CACHE_STATES {
+        while order.len() > MAX_FRAME_CACHE_STATES
+            || self.frame_cache_bytes.get() > MAX_FRAME_CACHE_BYTES
+        {
             if let Some(old) = order.pop_front() {
-                if old != state {
-                    self.frame_cache.borrow_mut().remove(&old);
+                if let Some(frames) = self.frame_cache.borrow_mut().remove(&old) {
+                    self.frame_cache_bytes.set(
+                        self.frame_cache_bytes
+                            .get()
+                            .saturating_sub(estimate_frames_bytes(&frames)),
+                    );
                 }
+            } else {
+                break;
             }
         }
     }
@@ -590,7 +626,7 @@ impl Runtime {
             let Some(runtime) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if runtime.shutdown.load(Ordering::Acquire) {
+            if runtime.cancellation.is_cancelled() {
                 runtime.animation_source.borrow_mut().take();
                 return glib::ControlFlow::Break;
             }
@@ -768,7 +804,24 @@ impl Runtime {
         self.frames.replace(Vec::new());
         self.frame_cache.borrow_mut().clear();
         self.cache_order.borrow_mut().clear();
+        self.frame_cache_bytes.set(0);
     }
+}
+
+async fn load_frames_with_budget(
+    handle: tokio::runtime::Handle,
+    paths: Vec<PathBuf>,
+    cancellation: CancellationToken,
+) -> Option<Result<LoadedFrames, tokio::task::JoinError>> {
+    let permit = tokio::select! {
+        permit = FRAME_LOAD_PERMITS.clone().acquire_owned() => permit.ok()?,
+        _ = cancellation.cancelled() => return None,
+    };
+    let join = handle.spawn_blocking(move || {
+        let _permit = permit;
+        load_frames(paths)
+    });
+    Some(join.await)
 }
 
 fn load_frames(paths: Vec<PathBuf>) -> LoadedFrames {
@@ -776,16 +829,192 @@ fn load_frames(paths: Vec<PathBuf>) -> LoadedFrames {
         frames: Vec::new(),
         failures: Vec::new(),
     };
+    let mut decoded_bytes = 0_u64;
+    if paths.len() > MAX_FRAME_COUNT {
+        loaded.failures.push((
+            PathBuf::from("<animation>"),
+            format!("动画帧数超过 {MAX_FRAME_COUNT} 限制"),
+        ));
+        return loaded;
+    }
     for path in paths {
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > MAX_FRAME_FILE_BYTES => {
+                loaded
+                    .failures
+                    .push((path, format!("文件超过 {MAX_FRAME_FILE_BYTES} 字节限制")));
+                continue;
+            }
+            Err(error) => {
+                loaded
+                    .failures
+                    .push((path, format!("读取文件信息失败: {error}")));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        match preflight_dimensions(&path) {
+            Ok(Some((width, height)))
+                if width == 0
+                    || height == 0
+                    || width > MAX_FRAME_DIMENSION
+                    || height > MAX_FRAME_DIMENSION
+                    || width.saturating_mul(height) > MAX_FRAME_PIXELS =>
+            {
+                loaded.failures.push((
+                    path,
+                    format!(
+                        "图片尺寸 {width}x{height} 超过限制 ({MAX_FRAME_DIMENSION}px / {MAX_FRAME_PIXELS} pixels)"
+                    ),
+                ));
+                continue;
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                loaded.failures.push((path, error));
+                continue;
+            }
+        }
         match gdk::Texture::from_file(&gio::File::for_path(&path)) {
             Ok(texture) => {
+                let pixels =
+                    (texture.width().max(0) as u64).saturating_mul(texture.height().max(0) as u64);
+                let estimated = pixels.saturating_mul(4);
+                let next_decoded_bytes = decoded_bytes.saturating_add(estimated);
+                if pixels == 0
+                    || pixels > MAX_FRAME_PIXELS
+                    || next_decoded_bytes > MAX_FRAME_STATE_BYTES as u64
+                {
+                    loaded.failures.push((
+                        path,
+                        format!("解码后的图像尺寸/内存超过限制 ({MAX_FRAME_STATE_BYTES} bytes)"),
+                    ));
+                    continue;
+                }
                 crate::core::power_debug::increment(crate::core::power_debug::Counter::ImageDecode);
+                decoded_bytes = next_decoded_bytes;
                 loaded.frames.push(texture);
             }
             Err(error) => loaded.failures.push((path, error.to_string())),
         }
     }
     loaded
+}
+
+/// Read only a small image header before handing a file to GDK. Unknown
+/// containers are allowed through and remain protected by the post-decode
+/// pixel budget; known dimensions are rejected before a potentially expensive
+/// allocation/decode occurs.
+fn preflight_dimensions(path: &Path) -> Result<Option<(u64, u64)>, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("读取图片头失败: {error}"))?;
+    let mut header = Vec::with_capacity(MAX_FRAME_HEADER_BYTES as usize);
+    file.take(MAX_FRAME_HEADER_BYTES)
+        .read_to_end(&mut header)
+        .map_err(|error| format!("读取图片头失败: {error}"))?;
+
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok((header.len() >= 24).then(|| {
+            (
+                u32::from_be_bytes(header[16..20].try_into().unwrap()) as u64,
+                u32::from_be_bytes(header[20..24].try_into().unwrap()) as u64,
+            )
+        }));
+    }
+    if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        return Ok((header.len() >= 10).then(|| {
+            (
+                u16::from_le_bytes(header[6..8].try_into().unwrap()) as u64,
+                u16::from_le_bytes(header[8..10].try_into().unwrap()) as u64,
+            )
+        }));
+    }
+    if header.starts_with(b"BM") && header.len() >= 26 {
+        let width = i32::from_le_bytes(header[18..22].try_into().unwrap());
+        let height = i32::from_le_bytes(header[22..26].try_into().unwrap());
+        return Ok(Some((
+            width.unsigned_abs() as u64,
+            height.unsigned_abs() as u64,
+        )));
+    }
+    if header.len() >= 10
+        && u16::from_le_bytes(header[0..2].try_into().unwrap()) == 0
+        && u16::from_le_bytes(header[2..4].try_into().unwrap()) == 1
+    {
+        let count = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
+        let required = 6_usize.saturating_add(count.saturating_mul(16));
+        if header.len() >= required && count > 0 {
+            let mut dimensions: Option<(u64, u64)> = None;
+            for entry in header[6..required].chunks_exact(16) {
+                let width = if entry[0] == 0 { 256 } else { entry[0] as u64 };
+                let height = if entry[1] == 0 { 256 } else { entry[1] as u64 };
+                dimensions = Some(match dimensions {
+                    Some((old_width, old_height)) => (old_width.max(width), old_height.max(height)),
+                    None => (width, height),
+                });
+            }
+            return Ok(dimensions);
+        }
+    }
+    if header.len() >= 30
+        && &header[0..4] == b"RIFF"
+        && &header[8..12] == b"WEBP"
+        && &header[12..16] == b"VP8X"
+    {
+        let width =
+            1 + (header[24] as u64 | ((header[25] as u64) << 8) | ((header[26] as u64) << 16));
+        let height =
+            1 + (header[27] as u64 | ((header[28] as u64) << 8) | ((header[29] as u64) << 16));
+        return Ok(Some((width, height)));
+    }
+    if header.starts_with(&[0xff, 0xd8]) {
+        return Ok(jpeg_dimensions(&header));
+    }
+    Ok(None)
+}
+
+fn jpeg_dimensions(header: &[u8]) -> Option<(u64, u64)> {
+    let mut index = 2;
+    while index + 1 < header.len() {
+        if header[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        while index < header.len() && header[index] == 0xff {
+            index += 1;
+        }
+        if index >= header.len() {
+            break;
+        }
+        let marker = header[index];
+        index += 1;
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if index + 2 > header.len() {
+            break;
+        }
+        let length = u16::from_be_bytes([header[index], header[index + 1]]) as usize;
+        if length < 2 || index.saturating_add(length) > header.len() {
+            break;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) && length >= 7 {
+            let height = u16::from_be_bytes([header[index + 3], header[index + 4]]) as u64;
+            let width = u16::from_be_bytes([header[index + 5], header[index + 6]]) as u64;
+            return Some((width, height));
+        }
+        index += length;
+    }
+    None
+}
+
+fn estimate_frames_bytes(frames: &[gdk::Texture]) -> usize {
+    frames.iter().fold(0_usize, |total, texture| {
+        total.saturating_add(
+            (texture.width().max(0) as usize)
+                .saturating_mul(texture.height().max(0) as usize)
+                .saturating_mul(4),
+        )
+    })
 }
 
 fn read_state_file(path: PathBuf) -> Result<Option<StateEvent>, String> {
@@ -801,9 +1030,35 @@ fn read_state_file(path: PathBuf) -> Result<Option<StateEvent>, String> {
     if bytes.len() > MAX_STATE_FILE_BYTES {
         return Err(format!("状态文件超过 {} 字节限制", MAX_STATE_FILE_BYTES));
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| format!("状态 JSON 无效: {error}"))
+    let event: StateEvent =
+        serde_json::from_slice(&bytes).map_err(|error| format!("状态 JSON 无效: {error}"))?;
+    validate_state_event(event).map(Some)
+}
+
+fn validate_state_event(event: StateEvent) -> Result<StateEvent, String> {
+    if event.state.trim().is_empty() || event.state.len() > MAX_STATE_NAME_BYTES {
+        return Err(format!(
+            "状态名称必须非空且不超过 {MAX_STATE_NAME_BYTES} 字节"
+        ));
+    }
+    if event
+        .detail
+        .as_ref()
+        .is_some_and(|detail| detail.len() > MAX_UI_TEXT_BYTES)
+    {
+        return Err(format!("状态详情超过 {MAX_UI_TEXT_BYTES} 字节限制"));
+    }
+    for (field, value) in [
+        ("task_id", event.task_id.as_deref()),
+        ("event_id", event.event_id.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty() || value.len() > MAX_STATE_ID_BYTES) {
+            return Err(format!(
+                "{field} 必须非空且不超过 {MAX_STATE_ID_BYTES} 字节"
+            ));
+        }
+    }
+    Ok(event)
 }
 
 fn state_file_event_matches(
@@ -861,15 +1116,11 @@ fn load_presentation(path: &Path) -> CardPresentation {
 }
 
 fn save_presentation(path: &Path, presentation: CardPresentation) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "presentation file has no parent",
-        ));
-    };
-    std::fs::create_dir_all(parent)?;
+    crate::core::config::ensure_private_parent(path)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temporary, format!("{}\n", presentation_name(presentation)))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(temporary, path)
 }
 
@@ -983,14 +1234,43 @@ fn state_emoji(state: &str) -> &'static str {
     }
 }
 
+fn claim_frame_load(loading: &mut HashMap<String, u64>, state: &str, generation: u64) -> bool {
+    if loading.contains_key(state) {
+        return false;
+    }
+    loading.insert(state.to_string(), generation);
+    true
+}
+
+fn finish_frame_load(loading: &mut HashMap<String, u64>, state: &str, generation: u64) -> bool {
+    if loading.get(state).copied() != Some(generation) {
+        return false;
+    }
+    loading.remove(state);
+    true
+}
+
+fn completion_sound_argv(file: Option<&Path>) -> Vec<OsString> {
+    let mut argv = vec![OsString::from("canberra-gtk-play")];
+    if let Some(file) = file {
+        argv.push(OsString::from("--file"));
+        argv.push(file.as_os_str().to_owned());
+    } else {
+        argv.push(OsString::from("--id=complete"));
+    }
+    argv
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
 
     use super::{
-        completion_sound_argv, is_active_agent_state, next_presentation, parse_presentation,
-        pet_visual_policy, presentation_name, state_file_event_matches,
+        claim_frame_load, completion_sound_argv, finish_frame_load, is_active_agent_state,
+        next_presentation, parse_presentation, pet_visual_policy, presentation_name,
+        state_file_event_matches, validate_state_event, StateEvent,
     };
     use crate::core::runtime::{ThermalVerdict, Visibility, VisualPolicy};
     use crate::plugins::CardPresentation;
@@ -1068,6 +1348,47 @@ mod tests {
         for state in ["ready", "done", "error", "offline"] {
             assert!(!is_active_agent_state(state));
         }
+    }
+
+    #[test]
+    fn state_event_text_is_bounded_before_reaching_gtk_or_runtime() {
+        let valid = StateEvent {
+            state: "working".into(),
+            detail: Some("正在执行".into()),
+            timestamp_ms: 1,
+            task_id: Some("task-1".into()),
+            event_id: Some("event-1".into()),
+        };
+        assert!(validate_state_event(valid).is_ok());
+
+        let oversized = StateEvent {
+            state: "working".into(),
+            detail: Some("x".repeat(super::MAX_UI_TEXT_BYTES + 1)),
+            timestamp_ms: 1,
+            task_id: None,
+            event_id: None,
+        };
+        assert!(validate_state_event(oversized).is_err());
+    }
+
+    #[test]
+    fn frame_load_singleflight_preserves_a_worker_across_a_to_b_to_a() {
+        let mut loading = HashMap::new();
+
+        assert!(claim_frame_load(&mut loading, "A", 1));
+        assert!(claim_frame_load(&mut loading, "B", 2));
+        assert!(!claim_frame_load(&mut loading, "A", 3));
+        assert_eq!(loading.get("A"), Some(&1));
+        assert!(finish_frame_load(&mut loading, "B", 2));
+        assert!(finish_frame_load(&mut loading, "A", 1));
+
+        // A cancelled old worker can finish after a new A worker has claimed
+        // the same state. It must not remove or apply the new generation.
+        assert!(claim_frame_load(&mut loading, "A", 4));
+        assert!(!finish_frame_load(&mut loading, "A", 1));
+        assert_eq!(loading.get("A"), Some(&4));
+        assert!(finish_frame_load(&mut loading, "A", 4));
+        assert!(loading.is_empty());
     }
 
     #[test]
@@ -1201,15 +1522,4 @@ mod tests {
             ]
         );
     }
-}
-
-fn completion_sound_argv(file: Option<&Path>) -> Vec<OsString> {
-    let mut argv = vec![OsString::from("canberra-gtk-play")];
-    if let Some(file) = file {
-        argv.push(OsString::from("--file"));
-        argv.push(file.as_os_str().to_owned());
-    } else {
-        argv.push(OsString::from("--id=complete"));
-    }
-    argv
 }

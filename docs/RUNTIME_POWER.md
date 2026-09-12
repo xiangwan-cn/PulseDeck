@@ -21,7 +21,9 @@ The snapshot contains independent decisions:
 - **Work:** `Full`, `Reduced`, `Minimal`, or `Suspended`.
 - **Visuals:** `Full`, `Capped(fps)`, `Frozen`, or `Stopped`.
 - **Screen inhibition:** a boolean derived only from `screen_inhibit` and GTK
-  visibility/activity.
+  visibility/activity; it requests idle blanking inhibition.
+- **Suspend inhibition:** a separate boolean derived only from `suspend_inhibit`
+  and GTK visibility/activity; it requests an opt-in system suspend inhibitor.
 - **Idle view:** none, an application-only dim overlay, or a black minimal view.
 - **Periodic refresh pause:** an independent quiet-hours decision; manual refresh remains available.
 - **Diagnostics:** power, thermal, Agent phase, attention time, and reason tags.
@@ -66,11 +68,17 @@ idle visuals:
 ```toml
 [runtime]
 screen_inhibit = "while-active" # never | while-active | while-mapped
+suspend_inhibit = "never"        # never | while-active | while-mapped
 ```
 
 The default, `while-active`, asks the desktop session to inhibit idle blanking
-only while the PulseDeck window is mapped and active. PulseDeck does not request
-a suspend inhibitor. Unmapping always releases the inhibitor.
+only while the PulseDeck window is mapped and active. The separate
+`suspend_inhibit` setting defaults to `never`; when enabled it asks the desktop
+session to inhibit automatic system suspension for the selected mapped/active
+state. It is opt-in because it can increase energy use. Unmapping and
+application shutdown always release all inhibitors. GTK and the desktop session
+may reject or override an inhibitor, so this remains a request rather than an
+absolute guarantee.
 
 Idle presentation is also independent:
 
@@ -334,6 +342,7 @@ not accidentally gain unrelated profile, screen, or idle-view overrides.
 # profile and external_boost are compatibility diagnostics and are omitted here.
 inactive_grace_seconds = 15
 screen_inhibit = "while-active"
+suspend_inhibit = "never"
 idle_timeout_seconds = 60
 idle_stability_seconds = 10
 idle_view = "none"

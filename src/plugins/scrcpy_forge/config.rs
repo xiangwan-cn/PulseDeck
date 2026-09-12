@@ -221,6 +221,83 @@ impl Default for PageConfig {
     }
 }
 
+impl PageConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.api_url.len() > 4096 {
+            return Err("api_url is too long".into());
+        }
+        let parsed = reqwest::Url::parse(&self.api_url)
+            .map_err(|error| format!("api_url is invalid: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("api_url must use http or https".into());
+        }
+        if self.daemon_program.trim().is_empty() || self.daemon_program.len() > 4096 {
+            return Err("daemon_program must be 1..=4096 bytes".into());
+        }
+        if self.daemon_args.len() > 128 || self.daemon_args.iter().any(|arg| arg.len() > 16 * 1024)
+        {
+            return Err(
+                "daemon_args cannot contain more than 128 entries or 16 KiB arguments".into(),
+            );
+        }
+        if self.preview_interval_seconds == 0 || self.preview_interval_seconds > 3600 {
+            return Err("preview_interval_seconds must be between 1 and 3600".into());
+        }
+        if self.metadata_interval_seconds == 0 || self.metadata_interval_seconds > 3600 {
+            return Err("metadata_interval_seconds must be between 1 and 3600".into());
+        }
+        if self.health_interval_seconds == 0 || self.health_interval_seconds > 3600 {
+            return Err("health_interval_seconds must be between 1 and 3600".into());
+        }
+        if !(1..=12).contains(&self.columns)
+            || !(64..=4096).contains(&self.card_width)
+            || !(64..=4096).contains(&self.card_height)
+            || !(32..=4096).contains(&self.preview_height)
+        {
+            return Err("columns/card dimensions are outside the supported bounds".into());
+        }
+        for (name, endpoint) in [
+            ("health", &self.endpoints.health),
+            ("shutdown", &self.endpoints.shutdown),
+            ("devices", &self.endpoints.devices),
+            ("connect", &self.endpoints.connect),
+            ("device_preview", &self.endpoints.device_preview),
+            ("session_preview", &self.endpoints.session_preview),
+            ("session_metrics", &self.endpoints.session_metrics),
+            ("tasks", &self.endpoints.tasks),
+            ("task_runs", &self.endpoints.task_runs),
+            ("sessions", &self.endpoints.sessions),
+            ("session_start", &self.endpoints.session_start),
+            ("task_run", &self.endpoints.task_run),
+            ("task_stop", &self.endpoints.task_stop),
+            ("profile", &self.endpoints.profile),
+        ] {
+            if endpoint.trim().is_empty() || endpoint.len() > 512 {
+                return Err(format!("endpoint `{name}` must be 1..=512 bytes"));
+            }
+        }
+        if self.cards.len() > 32 {
+            return Err("cards cannot contain more than 32 entries".into());
+        }
+        for card in &self.cards {
+            if card.role.trim().is_empty() || card.role.len() > 64 {
+                return Err("plugin card roles must be 1..=64 bytes".into());
+            }
+            if card.title.trim().is_empty() || card.title.len() > 256 {
+                return Err("plugin card titles must be 1..=256 bytes".into());
+            }
+            if card
+                .description
+                .as_ref()
+                .is_some_and(|text| text.len() > 4096)
+            {
+                return Err("plugin card descriptions cannot exceed 4096 bytes".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn default_page() -> AppPageConfig {
     AppPageConfig {
         id: "scrcpy-forge".into(),

@@ -556,7 +556,8 @@ cache_ttl = "4h"
 `inactive_grace_seconds` 和本地空闲只保留诊断/界面含义。未映射才进入 `Suspended`。
 
 `screen_inhibit` 可选 `never`、`while-active`（默认）或 `while-mapped`，只请求抑制
-空闲熄屏，不阻止系统休眠，并且与刷新、Agent、供电及空闲视觉独立。`idle_view` 可选
+空闲熄屏；`suspend_inhibit` 可选 `never`（默认）、`while-active` 或 `while-mapped`，用于独立请求
+阻止系统自动休眠/挂起，并且与刷新、Agent、供电及空闲视觉独立。挂起抑制会增加耗电，窗口取消映射或应用退出时释放。`idle_view` 可选
 `none`（默认）、`dim` 或 `minimal`；后两者只改变应用内显示，不修改系统亮度。
 真实点击、触摸、滚动、键盘、拖动、页面切换、手动刷新和插件控制会重置空闲时间并续期
 `observation_lease_seconds`；自动刷新、网络请求、动画、Agent hook 及状态文件变化不会。

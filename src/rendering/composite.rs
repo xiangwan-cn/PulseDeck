@@ -1,6 +1,7 @@
 use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Label, Orientation};
 
+use crate::core::text::{bounded_text, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue};
 
 pub struct CompositeRow {
@@ -36,14 +37,16 @@ impl CompositeRow {
     }
 
     fn set_labels(&self, label: &str, value: &str) {
-        self.label.set_label(label);
-        self.value.set_label(value);
+        self.label
+            .set_label(&bounded_text(label, MAX_UI_TEXT_BYTES / 4));
+        self.value
+            .set_label(&bounded_text(value, MAX_UI_TEXT_BYTES / 2));
     }
 }
 
 pub fn apply_composite(widgets: &CompositeWidgets, model: &CardModel) {
     let fields = match &model.value {
-        CardValue::Composite(fields) => fields.clone(),
+        CardValue::Composite(fields) => fields,
         _ => return,
     };
 

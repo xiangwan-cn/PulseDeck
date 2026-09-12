@@ -10,6 +10,8 @@ max_output_bytes = 20000
 # profile and external_boost are retained only for strict v4 compatibility diagnostics.
 inactive_grace_seconds = 15
 screen_inhibit = "while-active"
+# System suspend inhibitor: never | while-active | while-mapped. Opt-in because it increases energy use.
+suspend_inhibit = "never"
 idle_timeout_seconds = 60
 idle_stability_seconds = 10
 idle_view = "none"

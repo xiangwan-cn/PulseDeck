@@ -52,8 +52,9 @@ PulseDeck 将运行事实与纯策略计算分开。策略快照分别表达窗�
 已映射白天默认工作均为完整策略。自动识别的高成本命令/HTTP 至少间隔 30 分钟；确实便宜的来源可显式标为
 `normal`／`live`。显式单卡 `inactive_behavior`／`idle_behavior` 仍属于用户主动覆盖。
 `screen_inhibit = "never" | "while-active" | "while-mapped"` 与刷新独立，只请求抑制
-空闲熄屏，不阻止系统休眠。`idle_view = "none" | "dim" | "minimal"` 只影响
-PulseDeck，不修改系统亮度。静默按本地时钟使用半开区间 `[start,end)`，起止小时相同则禁用；
+空闲熄屏；`suspend_inhibit = "never" | "while-active" | "while-mapped"` 是独立的、默认关闭的
+系统挂起抑制策略，开启后会增加耗电。两者在窗口取消映射或应用退出时都会释放。`idle_view = "none" | "dim" | "minimal"` 只影响
+PulseDeck，不修改系统亮度。桌面会话可能拒绝或覆盖挂起抑制，因此它是请求而非绝对保证。静默按本地时钟使用半开区间 `[start,end)`，起止小时相同则禁用；
 手动/事件请求仍可执行。
 
 外接电源不会清除 Low/Critical 电池阶段，也不会让工作超过白天的 Full；`external_boost`

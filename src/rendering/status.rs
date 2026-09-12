@@ -1,12 +1,15 @@
 use gtk::prelude::*;
 use gtk::{Align, Label};
 
+use crate::core::text::{bounded_text, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue, StatusLevel};
 
 pub fn apply_status(widgets: &StatusWidgets, model: &CardModel) {
     let (label, level) = match &model.value {
-        CardValue::Status { label, level } => (label.clone(), level.clone()),
-        CardValue::Text(t) => (t.clone(), StatusLevel::Normal),
+        CardValue::Status { label, level } => {
+            (bounded_text(label, MAX_UI_TEXT_BYTES), level.clone())
+        }
+        CardValue::Text(t) => (bounded_text(t, MAX_UI_TEXT_BYTES), StatusLevel::Normal),
         _ => (String::new(), StatusLevel::Unknown),
     };
 

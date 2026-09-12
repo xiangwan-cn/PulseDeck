@@ -6,10 +6,7 @@ use std::{
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, LazyLock,
-    },
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -17,6 +14,7 @@ use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, DropDown, Entry, FlowBox, Label, Orientation, Picture, Switch,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::config::{CardConfig, PageConfig as ScrcpyForgeConfig};
 use super::service::{Client, DaemonController, Device, SessionMetrics, Snapshot};
@@ -47,15 +45,43 @@ const MAX_PREVIEW_DECODE_TASKS: usize = 2;
 static PREVIEW_DECODE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_PREVIEW_DECODE_TASKS)));
 
+#[derive(Clone)]
+struct BackendContext {
+    config: ScrcpyForgeConfig,
+    client: Client,
+    daemon: DaemonController,
+    handle: tokio::runtime::Handle,
+    runtime: RuntimeHandle,
+    cancellation: CancellationToken,
+    service_available: Rc<Cell<bool>>,
+    service_event_tx: async_channel::Sender<()>,
+}
+
+struct SnapshotRenderContext<'a> {
+    flow: &'a FlowBox,
+    device_views: &'a Rc<RefCell<HashMap<String, DevicePairWidgets>>>,
+    scripts_signature: &'a Rc<Cell<u64>>,
+    snapshot: DecodedSnapshot,
+    client: &'a Client,
+    handle: &'a tokio::runtime::Handle,
+    devices_config: Option<&'a CardConfig>,
+    scripts_config: Option<&'a CardConfig>,
+    page_config: &'a ScrcpyForgeConfig,
+    preview_width: i32,
+    preview_height: i32,
+    cancellation: CancellationToken,
+}
+
 async fn decode_snapshot(
     snapshot: Snapshot,
     handle: &tokio::runtime::Handle,
     permits: Arc<tokio::sync::Semaphore>,
-    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> Option<DecodedSnapshot> {
-    let permit = until_shutdown(permits.acquire_owned(), shutdown.clone())
-        .await?
-        .ok()?;
+    let permit = tokio::select! {
+        permit = permits.acquire_owned() => permit.ok()?,
+        _ = cancellation.cancelled() => return None,
+    };
     until_shutdown(
         handle.spawn_blocking(move || {
             let _permit = permit;
@@ -67,14 +93,21 @@ async fn decode_snapshot(
                         let mut hasher = DefaultHasher::new();
                         png.hash(&mut hasher);
                         let hash = hasher.finish();
-                        gtk::gdk::Texture::from_bytes(&glib::Bytes::from(png.as_ref()))
-                            .ok()
-                            .map(|texture| {
+                        match gtk::gdk::Texture::from_bytes(&glib::Bytes::from(png.as_ref())) {
+                            Ok(texture) => {
                                 crate::core::power_debug::increment(
                                     crate::core::power_debug::Counter::ImageDecode,
                                 );
-                                DecodedPreview { hash, texture }
-                            })
+                                Some(DecodedPreview { hash, texture })
+                            }
+                            Err(error) => {
+                                crate::core::error_limiter::warn(
+                                    format!("scrcpy-forge:decode:{}", device.serial),
+                                    format!("预览解码失败: {error}"),
+                                );
+                                None
+                            }
+                        }
                     });
                     (device, preview)
                 })
@@ -87,26 +120,20 @@ async fn decode_snapshot(
                 metrics: snapshot.metrics,
             }
         }),
-        shutdown,
+        cancellation,
     )
     .await?
     .ok()
 }
 
-async fn until_shutdown<F, T>(future: F, shutdown: Arc<AtomicBool>) -> Option<T>
+async fn until_shutdown<F, T>(future: F, cancellation: CancellationToken) -> Option<T>
 where
     F: Future<Output = T>,
 {
     tokio::pin!(future);
     tokio::select! {
         result = &mut future => Some(result),
-        _ = wait_for_shutdown(shutdown) => None,
-    }
-}
-
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        _ = cancellation.cancelled() => None,
     }
 }
 
@@ -122,11 +149,16 @@ fn preview_mode(level: WorkLevel, periodic_refresh_paused: bool) -> PreviewMode 
     }
 }
 
+fn preview_retry_delay(base_seconds: u64, failures: u32) -> u64 {
+    let factor = 1_u64 << failures.min(6);
+    base_seconds.saturating_mul(factor).clamp(1, 5 * 60)
+}
+
 pub fn build(
     handle: tokio::runtime::Handle,
     cfg: ScrcpyForgeConfig,
     runtime: RuntimeHandle,
-    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> gtk::ScrolledWindow {
     let mut cards = if cfg.cards.is_empty() {
         default_cards()
@@ -155,20 +187,24 @@ pub fn build(
 
     let client = Client::new(&cfg);
     let daemon = DaemonController::default();
+    let service_available = Rc::new(Cell::new(false));
+    let (service_event_tx, service_event_rx) = async_channel::bounded::<()>(1);
+    let backend_context = BackendContext {
+        config: cfg.clone(),
+        client: client.clone(),
+        daemon: daemon.clone(),
+        handle: handle.clone(),
+        runtime: runtime.clone(),
+        cancellation: cancellation.clone(),
+        service_available: service_available.clone(),
+        service_event_tx: service_event_tx.clone(),
+    };
     let mut devices_cfg = None;
     let mut scripts_cfg = None;
 
     for card in cards {
         match card.role.as_str() {
-            "backend" => flow.append(&backend_card(
-                &card,
-                &cfg,
-                client.clone(),
-                daemon.clone(),
-                handle.clone(),
-                runtime.clone(),
-                shutdown.clone(),
-            )),
+            "backend" => flow.append(&backend_card(&card, &backend_context)),
             "devices" => {
                 devices_cfg = Some(card);
             }
@@ -190,14 +226,14 @@ pub fn build(
         let client = client.clone();
         let handle = handle.clone();
         let tx = tx.clone();
-        let shutdown = shutdown.clone();
+        let cancellation = cancellation.clone();
         move |include_previews: bool| {
             let client = client.clone();
             let tx = tx.clone();
-            let shutdown = shutdown.clone();
+            let cancellation = cancellation.clone();
             handle.spawn(async move {
                 let Some(result) =
-                    until_shutdown(client.snapshot(include_previews), shutdown).await
+                    until_shutdown(client.snapshot(include_previews), cancellation).await
                 else {
                     return;
                 };
@@ -225,7 +261,10 @@ pub fn build(
     let weak_flow = flow.downgrade();
     let preview_seconds = cfg.preview_interval_seconds.max(1);
     let request_busy = busy.clone();
+    let preview_failures = Rc::new(Cell::new(0_u32));
+    let preview_failures_for_poll = preview_failures.clone();
     let render_runtime = runtime.clone();
+    let service_available_for_poll = service_available.clone();
     glib::MainContext::default().spawn_local(async move {
         loop {
             let Some(flow) = weak_flow.upgrade() else {
@@ -233,29 +272,42 @@ pub fn build(
             };
             let snapshot = runtime.snapshot();
             let mode = preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused);
-            if flow.is_mapped() && mode != PreviewMode::Stopped && !request_busy.replace(true) {
+            if flow.is_mapped()
+                && service_available_for_poll.get()
+                && mode != PreviewMode::Stopped
+                && !request_busy.replace(true)
+            {
                 request(mode != PreviewMode::MetadataOnly);
             }
             drop(flow);
-            let delay = match mode {
+            let base_delay = match mode {
                 PreviewMode::Full => preview_seconds,
                 PreviewMode::Reduced => preview_seconds.saturating_mul(3),
                 PreviewMode::MetadataOnly => preview_seconds.saturating_mul(8),
                 PreviewMode::Stopped => 3600,
             };
+            let delay = if !service_available_for_poll.get() {
+                3600
+            } else {
+                preview_retry_delay(base_delay, preview_failures_for_poll.get())
+            };
             let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
             let mode = Box::pin(mode_rx.recv());
             let visibility = Box::pin(visibility_rx.recv());
+            let service = Box::pin(service_event_rx.recv());
             let first = futures_util::future::select(timer, mode);
-            let _ = futures_util::future::select(Box::pin(first), visibility).await;
-            if mode_rx.is_closed() || visibility_rx.is_closed() {
+            let second = futures_util::future::select(Box::pin(first), visibility);
+            let _ = futures_util::future::select(Box::pin(second), service).await;
+            if mode_rx.is_closed() || visibility_rx.is_closed() || service_event_rx.is_closed() {
                 break;
             }
         }
     });
     let weak_update_flow = flow.downgrade();
     let decode_permits = PREVIEW_DECODE_PERMITS.clone();
-    let decode_shutdown = shutdown.clone();
+    let decode_cancellation = cancellation.clone();
+    let preview_failures = preview_failures.clone();
+    let service_available_for_render = service_available.clone();
     glib::MainContext::default().spawn_local(async move {
         while let Ok(result) = rx.recv().await {
             let Some(update_flow) = weak_update_flow.upgrade() else {
@@ -264,18 +316,20 @@ pub fn build(
             let snapshot = render_runtime.snapshot();
             if preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused)
                 == PreviewMode::Stopped
+                || !service_available_for_render.get()
             {
                 busy.set(false);
                 continue;
             }
             match result {
                 Ok(snapshot) => {
+                    preview_failures.set(0);
                     crate::core::error_limiter::recovered("scrcpy-forge:snapshot");
                     let Some(snapshot) = decode_snapshot(
                         snapshot,
                         &handle,
                         decode_permits.clone(),
-                        decode_shutdown.clone(),
+                        decode_cancellation.clone(),
                     )
                     .await
                     else {
@@ -287,20 +341,20 @@ pub fn build(
                         continue;
                     };
                     let render_started = std::time::Instant::now();
-                    render_snapshot(
-                        &update_flow,
-                        &device_views,
-                        &scripts_signature,
+                    render_snapshot(SnapshotRenderContext {
+                        flow: &update_flow,
+                        device_views: &device_views,
+                        scripts_signature: &scripts_signature,
                         snapshot,
-                        &client,
-                        &handle,
-                        devices_cfg.as_ref(),
-                        scripts_cfg.as_ref(),
-                        &cfg,
+                        client: &client,
+                        handle: &handle,
+                        devices_config: devices_cfg.as_ref(),
+                        scripts_config: scripts_cfg.as_ref(),
+                        page_config: &cfg,
                         preview_width,
                         preview_height,
-                        decode_shutdown.clone(),
-                    );
+                        cancellation: decode_cancellation.clone(),
+                    });
                     let render_elapsed = render_started.elapsed();
                     if render_elapsed >= Duration::from_millis(100) {
                         tracing::warn!(
@@ -310,6 +364,7 @@ pub fn build(
                     }
                 }
                 Err(error) => {
+                    preview_failures.set(preview_failures.get().saturating_add(1));
                     scripts_signature.set(0);
                     crate::core::error_limiter::warn(
                         "scrcpy-forge:snapshot",
@@ -330,30 +385,37 @@ pub fn build(
     scroll
 }
 
-fn backend_card(
-    card: &CardConfig,
-    cfg: &ScrcpyForgeConfig,
-    client: Client,
-    daemon: DaemonController,
-    handle: tokio::runtime::Handle,
-    runtime: RuntimeHandle,
-    shutdown: Arc<AtomicBool>,
-) -> GtkBox {
+fn backend_card(card: &CardConfig, context: &BackendContext) -> GtkBox {
+    let cfg = &context.config;
+    let client = context.client.clone();
+    let daemon = context.daemon.clone();
+    let handle = context.handle.clone();
+    let runtime = context.runtime.clone();
+    let cancellation = context.cancellation.clone();
+    let service_available = context.service_available.clone();
+    let service_event_tx = context.service_event_tx.clone();
     let card_shell = shell(card, cfg);
     let card_box = card_shell.root;
     let body = card_shell.body;
     let status = Label::new(Some("检查中…"));
+    status.update_property(&[gtk::accessible::Property::Label("ScrcpyForge 服务状态")]);
     status.set_halign(Align::Start);
     status.set_hexpand(true);
     let toggle = Switch::new();
+    toggle.update_property(&[gtk::accessible::Property::Label(
+        "启用或停止 ScrcpyForge 服务",
+    )]);
+    toggle.set_tooltip_text(Some("启动或停止 ScrcpyForge 外部服务"));
     let row = GtkBox::new(Orientation::Horizontal, 8);
     row.append(&status);
     row.append(&toggle);
     body.append(&row);
     let endpoint = Entry::new();
+    endpoint.update_property(&[gtk::accessible::Property::Label("无线设备地址")]);
     endpoint.set_placeholder_text(Some("设备地址:端口"));
     endpoint.set_hexpand(true);
     let connect = Button::with_label("连接无线设备");
+    connect.update_property(&[gtk::accessible::Property::Label("连接无线设备")]);
     let connect_row = GtkBox::new(Orientation::Vertical, 5);
     connect_row.set_hexpand(true);
     endpoint.set_width_chars(1);
@@ -370,18 +432,20 @@ fn backend_card(
         let connect_tx = connect_tx.clone();
         let runtime = runtime.clone();
         let connect_lease = connect_lease.clone();
-        let shutdown = shutdown.clone();
-        move |_| {
+        let cancellation = cancellation.clone();
+        move |button| {
             let value = endpoint.text().trim().to_owned();
-            if value.is_empty() {
+            if value.is_empty() || connect_lease.borrow().is_some() {
                 return;
             }
+            button.set_sensitive(false);
             connect_lease.replace(Some(runtime.begin_interaction(Duration::from_secs(30))));
             let client = client.clone();
             let tx = connect_tx.clone();
-            let shutdown = shutdown.clone();
+            let cancellation = cancellation.clone();
             handle.spawn(async move {
-                let Some(result) = until_shutdown(client.connect(&value), shutdown).await else {
+                let Some(result) = until_shutdown(client.connect(&value), cancellation).await
+                else {
                     return;
                 };
                 let _ = tx.try_send(
@@ -394,19 +458,25 @@ fn backend_card(
     });
     glib::MainContext::default().spawn_local({
         let weak_status = status.downgrade();
+        let weak_connect = connect.downgrade();
         let connect_lease = connect_lease.clone();
         async move {
             while let Ok(result) = connect_rx.recv().await {
                 connect_lease.borrow_mut().take();
-                let Some(status) = weak_status.upgrade() else {
+                let (Some(status), Some(connect)) = (weak_status.upgrade(), weak_connect.upgrade())
+                else {
                     break;
                 };
+                connect.set_sensitive(true);
                 status.set_text(&result.unwrap_or_else(|e| format!("连接失败：{e}")));
             }
         }
     });
     let changing = Rc::new(Cell::new(false));
-    let toggle_shutdown = shutdown.clone();
+    let (stop_done_tx, stop_done_rx) = async_channel::bounded::<()>(1);
+    let toggle_cancellation = cancellation.clone();
+    let toggle_service_available = service_available.clone();
+    let toggle_service_event_tx = service_event_tx.clone();
     toggle.connect_active_notify({
         let daemon = daemon.clone();
         let status = status.clone();
@@ -414,6 +484,7 @@ fn backend_card(
         let changing = changing.clone();
         let client = client.clone();
         let handle = handle.clone();
+        let stop_done_tx = stop_done_tx.clone();
         move |toggle| {
             if changing.get() {
                 return;
@@ -428,14 +499,40 @@ fn backend_card(
                     status.set_text("正在启动…");
                 }
             } else {
+                changing.set(true);
                 status.set_text("正在停止…");
-                daemon.stop();
+                if toggle_service_available.replace(false) {
+                    let _ = toggle_service_event_tx.try_send(());
+                }
                 let client = client.clone();
-                let shutdown = toggle_shutdown.clone();
+                let cancellation = toggle_cancellation.clone();
+                let child = daemon.take();
+                let stop_done_tx = stop_done_tx.clone();
                 handle.spawn(async move {
-                    let _ = until_shutdown(client.shutdown(), shutdown).await;
+                    // Give the service a chance to close its own sessions
+                    // before terminating the daemon process group. The
+                    // process wait itself is kept off the GTK thread.
+                    let _ = until_shutdown(client.shutdown(), cancellation).await;
+                    if let Some(child) = child {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            super::service::stop_child_blocking(child);
+                        })
+                        .await;
+                    }
+                    let _ = stop_done_tx.try_send(());
                 });
             }
+        }
+    });
+    let weak_stop_status = status.downgrade();
+    let stop_changing = changing.clone();
+    glib::MainContext::default().spawn_local(async move {
+        while stop_done_rx.recv().await.is_ok() {
+            let Some(status) = weak_stop_status.upgrade() else {
+                break;
+            };
+            stop_changing.set(false);
+            status.set_text("已停止");
         }
     });
     let (tx, rx) = async_channel::bounded(1);
@@ -459,7 +556,9 @@ fn backend_card(
     let weak_status = status.downgrade();
     let weak_toggle = toggle.downgrade();
     let base_interval = cfg.health_interval_seconds.max(1);
-    let health_cancel = shutdown.clone();
+    let health_failures = Rc::new(Cell::new(0_u32));
+    let health_failures_for_poll = health_failures.clone();
+    let health_cancellation = cancellation.clone();
     glib::MainContext::default().spawn_local(async move {
         loop {
             let (Some(status), Some(toggle)) = (weak_status.upgrade(), weak_toggle.upgrade())
@@ -468,12 +567,20 @@ fn backend_card(
             };
             let snapshot = runtime.snapshot();
             let mode = preview_mode(snapshot.work_level, snapshot.periodic_refresh_paused);
-            if status.is_mapped() && mode != PreviewMode::Stopped {
+            if changing.get() {
+                health_failures_for_poll.set(0);
+            } else if !toggle.is_active() {
+                health_failures_for_poll.set(0);
+                if service_available.replace(false) {
+                    let _ = service_event_tx.try_send(());
+                }
+                status.set_text("已停止");
+            } else if status.is_mapped() && mode != PreviewMode::Stopped {
                 let client = client.clone();
                 let tx = tx.clone();
-                let health_cancel = health_cancel.clone();
+                let health_cancellation = health_cancellation.clone();
                 handle.spawn(async move {
-                    let Some(healthy) = until_shutdown(client.healthy(), health_cancel).await
+                    let Some(healthy) = until_shutdown(client.healthy(), health_cancellation).await
                     else {
                         tx.close();
                         return;
@@ -481,20 +588,35 @@ fn backend_card(
                     let _ = tx.try_send(healthy);
                 });
                 if let Ok(healthy) = rx.recv().await {
+                    if healthy {
+                        health_failures_for_poll.set(0);
+                    } else {
+                        health_failures_for_poll
+                            .set(health_failures_for_poll.get().saturating_add(1));
+                    }
+                    if service_available.replace(healthy) != healthy {
+                        let _ = service_event_tx.try_send(());
+                    }
                     status.set_text(if healthy { "运行中" } else { "已停止" });
                     changing.set(true);
                     toggle.set_active(healthy);
                     changing.set(false);
                 }
             }
+            let toggle_active = toggle.is_active();
             drop(status);
             drop(toggle);
-            let delay = match mode {
-                PreviewMode::Full => base_interval,
-                PreviewMode::Reduced => base_interval.saturating_mul(3),
-                PreviewMode::MetadataOnly => base_interval.saturating_mul(4),
-                PreviewMode::Stopped => 3600,
+            let delay = if !toggle_active {
+                3600
+            } else {
+                match mode {
+                    PreviewMode::Full => base_interval,
+                    PreviewMode::Reduced => base_interval.saturating_mul(3),
+                    PreviewMode::MetadataOnly => base_interval.saturating_mul(4),
+                    PreviewMode::Stopped => 3600,
+                }
             };
+            let delay = preview_retry_delay(delay, health_failures_for_poll.get());
             let timer = Box::pin(glib::timeout_future(Duration::from_secs(delay)));
             let mode = Box::pin(mode_rx.recv());
             let visible = Box::pin(visible_rx.recv());
@@ -508,20 +630,21 @@ fn backend_card(
     card_box
 }
 
-fn render_snapshot(
-    flow: &FlowBox,
-    device_views: &Rc<RefCell<HashMap<String, DevicePairWidgets>>>,
-    scripts_signature: &Rc<Cell<u64>>,
-    snapshot: DecodedSnapshot,
-    client: &Client,
-    handle: &tokio::runtime::Handle,
-    devices_config: Option<&CardConfig>,
-    scripts_config: Option<&CardConfig>,
-    page_config: &ScrcpyForgeConfig,
-    preview_width: i32,
-    preview_height: i32,
-    shutdown: Arc<AtomicBool>,
-) {
+fn render_snapshot(context: SnapshotRenderContext<'_>) {
+    let SnapshotRenderContext {
+        flow,
+        device_views,
+        scripts_signature,
+        snapshot,
+        client,
+        handle,
+        devices_config,
+        scripts_config,
+        page_config,
+        preview_width,
+        preview_height,
+        cancellation,
+    } = context;
     let serials: std::collections::HashSet<&str> = snapshot
         .devices
         .iter()
@@ -575,7 +698,7 @@ fn render_snapshot(
                     &snapshot,
                     client.clone(),
                     handle.clone(),
-                    shutdown.clone(),
+                    cancellation.clone(),
                 ));
             }
         }
@@ -652,14 +775,24 @@ impl DevicePreviewWidgets {
         } else {
             "ADB 离线，预览已暂停"
         };
-        self.label.set_text(&format!(
-            "{} · {state}",
-            device.model.as_deref().unwrap_or(&device.serial)
-        ));
-        self.label.set_tooltip_text(Some(&device.serial));
+        let model = device.model.as_deref().unwrap_or(&device.serial);
+        self.label
+            .set_text(&format!("{} · {state}", compact_label(model, 24)));
+        self.label
+            .set_tooltip_text(Some(&compact_label(&device.serial, 128)));
         self.details.set_visible(metrics.is_some());
         if let Some(m) = metrics {
-            self.details.set_text(&format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS · 帧龄 {:.0}ms\n延迟均值 {:.1} · P50 {:.1} / P95 {:.1} ms · 丢帧 {}",m.decoded_fps,m.preview_fps,m.script_fps,m.latest_frame_age_ms,m.average_script_ms,m.script_p50_ms,m.script_p95_ms,m.dropped_script_frames));
+            self.details.set_text(&format!(
+                "解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS · 帧龄 {:.0}ms\n延迟均值 {:.1} · P50 {:.1} / P95 {:.1} ms · 丢帧 {}",
+                m.decoded_fps,
+                m.preview_fps,
+                m.script_fps,
+                m.latest_frame_age_ms,
+                m.average_script_ms,
+                m.script_p50_ms,
+                m.script_p95_ms,
+                m.dropped_script_frames
+            ));
         }
     }
 }
@@ -691,7 +824,7 @@ fn script_controls(
     snapshot: &DecodedSnapshot,
     client: Client,
     handle: tokio::runtime::Handle,
-    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> GtkBox {
     let box_ = GtkBox::new(Orientation::Vertical, 7);
     let device_serial = device.serial.clone();
@@ -706,6 +839,7 @@ fn script_controls(
     let script_labels: Vec<String> = scripts.iter().map(|name| compact_label(name, 18)).collect();
     let script_refs: Vec<&str> = script_labels.iter().map(String::as_str).collect();
     let combo = DropDown::from_strings(&script_refs);
+    combo.update_property(&[gtk::accessible::Property::Label("选择设备脚本")]);
     box_.append(&combo);
     let active = snapshot
         .runs
@@ -726,7 +860,7 @@ fn script_controls(
                 format!("运行中 · {name}")
             }
         })
-        .or_else(|| last_error.map(|error| format!("已停止：{error}")))
+        .or_else(|| last_error.map(|error| format!("已停止：{}", compact_label(error, 96))))
         .unwrap_or_else(|| {
             if device.state == "device" {
                 "已停止".into()
@@ -745,11 +879,16 @@ fn script_controls(
     } else {
         "运行脚本"
     });
+    button.update_property(&[gtk::accessible::Property::Label(if stopping {
+        "停止当前设备脚本"
+    } else {
+        "运行所选设备脚本"
+    })]);
     button.set_sensitive(stopping || (device.state == "device" && !snapshot.scripts.is_empty()));
     let has_session = snapshot.sessions.contains(&device.serial);
     let action_serial = device_serial.clone();
     let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
-    let action_shutdown = shutdown.clone();
+    let action_cancellation = cancellation.clone();
     button.connect_clicked({
         let status = status.clone();
         let rx = rx.clone();
@@ -761,7 +900,7 @@ fn script_controls(
             let serial = action_serial.clone();
             let selected = scripts.get(combo.selected() as usize).cloned();
             let tx = tx.clone();
-            let shutdown = action_shutdown.clone();
+            let cancellation = action_cancellation.clone();
             handle.spawn(async move {
                 let Some(result) = until_shutdown(
                     async {
@@ -778,7 +917,7 @@ fn script_controls(
                             anyhow::bail!("未选择脚本")
                         }
                     },
-                    shutdown,
+                    cancellation,
                 )
                 .await
                 else {
@@ -834,19 +973,17 @@ fn script_controls(
         let client = profile_client.clone();
         let handle = profile_handle.clone();
         let serial = device_serial.clone();
-        let shutdown = shutdown.clone();
+        let cancellation = cancellation.clone();
         move |combo| {
             let value = profile_id(combo.selected()).to_string();
             let client = client.clone();
             let serial = serial.clone();
-            let shutdown = shutdown.clone();
+            let cancellation = cancellation.clone();
             handle.spawn(async move {
-                if let Some(result) =
-                    until_shutdown(client.set_script_profile(&serial, &value), shutdown).await
+                if let Some(Err(error)) =
+                    until_shutdown(client.set_script_profile(&serial, &value), cancellation).await
                 {
-                    if let Err(error) = result {
-                        tracing::warn!(%error,%serial,"failed to set script profile");
-                    }
+                    tracing::warn!(%error,%serial,"failed to set script profile");
                 }
             });
         }
@@ -855,19 +992,17 @@ fn script_controls(
         let client = profile_client;
         let handle = profile_handle;
         let serial = device_serial;
-        let shutdown = shutdown;
+        let cancellation = cancellation;
         move |combo| {
             let value = profile_id(combo.selected()).to_string();
             let client = client.clone();
             let serial = serial.clone();
-            let shutdown = shutdown.clone();
+            let cancellation = cancellation.clone();
             handle.spawn(async move {
-                if let Some(result) =
-                    until_shutdown(client.set_preview_profile(&serial, &value), shutdown).await
+                if let Some(Err(error)) =
+                    until_shutdown(client.set_preview_profile(&serial, &value), cancellation).await
                 {
-                    if let Err(error) = result {
-                        tracing::warn!(%error,%serial,"failed to set preview profile");
-                    }
+                    tracing::warn!(%error,%serial,"failed to set preview profile");
                 }
             });
         }
@@ -894,6 +1029,7 @@ fn profile_combo(prefix: &str, active: &str) -> DropDown {
     ];
     let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let combo = DropDown::from_strings(&refs);
+    combo.update_property(&[gtk::accessible::Property::Label(prefix)]);
     combo.set_selected(match active {
         "eco" => 1,
         "balanced" => 2,

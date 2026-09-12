@@ -2,6 +2,33 @@ use gtk::prelude::*;
 use gtk::{Align, Box as GtkBox, Button, Image, Label, Orientation, Spinner};
 use std::rc::Rc;
 
+type ActionResolver = dyn Fn(&str) -> Option<(bool, String, String)>;
+type ActionClick = dyn Fn(&str) -> bool;
+type DialogCallback = dyn Fn();
+
+pub struct ActionCardCallbacks {
+    resolve: Rc<ActionResolver>,
+    on_click: Rc<ActionClick>,
+    on_dialog_open: Rc<DialogCallback>,
+    on_dialog_response: Rc<DialogCallback>,
+}
+
+impl ActionCardCallbacks {
+    pub fn new(
+        resolve: impl Fn(&str) -> Option<(bool, String, String)> + 'static,
+        on_click: impl Fn(&str) -> bool + 'static,
+        on_dialog_open: impl Fn() + 'static,
+        on_dialog_response: impl Fn() + 'static,
+    ) -> Self {
+        Self {
+            resolve: Rc::new(resolve),
+            on_click: Rc::new(on_click),
+            on_dialog_open: Rc::new(on_dialog_open),
+            on_dialog_response: Rc::new(on_dialog_response),
+        }
+    }
+}
+
 pub struct ActionCard {
     pub card: GtkBox,
     pub button: Button,
@@ -14,38 +41,9 @@ impl ActionCard {
         name: &str,
         description: &str,
         icon_name: &str,
-        confirm: bool,
-        confirm_title: &str,
-        confirm_detail: &str,
-        on_click: impl Fn(&str) + 'static,
-        on_dialog_open: impl Fn() + 'static,
-        on_dialog_response: impl Fn() + 'static,
+        callbacks: ActionCardCallbacks,
     ) -> Self {
-        let confirm_title = confirm_title.to_owned();
-        let confirm_detail = confirm_detail.to_owned();
-        Self::new_with_resolver(
-            action_id,
-            name,
-            description,
-            icon_name,
-            move |_| Some((confirm, confirm_title.clone(), confirm_detail.clone())),
-            on_click,
-            on_dialog_open,
-            on_dialog_response,
-        )
-    }
-
-    pub fn new_with_resolver(
-        action_id: &str,
-        name: &str,
-        description: &str,
-        icon_name: &str,
-        resolve: impl Fn(&str) -> Option<(bool, String, String)> + 'static,
-        on_click: impl Fn(&str) + 'static,
-        on_dialog_open: impl Fn() + 'static,
-        on_dialog_response: impl Fn() + 'static,
-    ) -> Self {
-        let initial_confirm = resolve(action_id).is_some_and(|(confirm, _, _)| confirm);
+        let initial_confirm = (callbacks.resolve)(action_id).is_some_and(|(confirm, _, _)| confirm);
         let card = GtkBox::new(Orientation::Vertical, 0);
         card.add_css_class("card");
         card.add_css_class("pulsedeck-card");
@@ -97,15 +95,16 @@ impl ActionCard {
         btn_row.append(&spinner);
 
         let aid = action_id.to_string();
-        let resolve: Rc<dyn Fn(&str) -> Option<(bool, String, String)>> = Rc::new(resolve);
-        let on_click: Rc<dyn Fn(&str)> = Rc::new(on_click);
-        let on_dialog_open: Rc<dyn Fn()> = Rc::new(on_dialog_open);
-        let on_dialog_response: Rc<dyn Fn()> = Rc::new(on_dialog_response);
+        let resolve = callbacks.resolve;
+        let on_click = callbacks.on_click;
+        let on_dialog_open = callbacks.on_dialog_open;
+        let on_dialog_response = callbacks.on_dialog_response;
         let btn = Button::with_label("执行");
         btn.set_valign(Align::Center);
         btn.add_css_class("pill");
         btn.add_css_class("suggested-action");
         btn.add_css_class("action-run-btn");
+        btn.update_property(&[gtk::accessible::Property::Label("执行操作")]);
         let running_spinner = spinner.clone();
         btn.connect_clicked(move |button| {
             let Some((confirm, confirm_title, confirm_detail)) = resolve(&aid) else {
@@ -114,8 +113,9 @@ impl ActionCard {
                 return;
             };
             if !confirm {
-                set_running(button, &running_spinner, true);
-                on_click(&aid);
+                if on_click(&aid) {
+                    set_running(button, &running_spinner, true);
+                }
                 return;
             }
             let Some(window) = button
@@ -141,9 +141,8 @@ impl ActionCard {
             glib::MainContext::default().spawn_local(async move {
                 let response = dialog.choose_future(Some(&window)).await;
                 on_dialog_response();
-                if response == Ok(1) && resolve(&aid).is_some() {
+                if response == Ok(1) && resolve(&aid).is_some() && on_click(&aid) {
                     set_running(&button, &running_spinner, true);
-                    on_click(&aid);
                 }
             });
         });

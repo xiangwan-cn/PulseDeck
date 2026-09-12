@@ -1,18 +1,19 @@
 use gtk::prelude::*;
 use gtk::{Align, Label};
 
+use crate::core::text::{bounded_text, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue};
 
 pub fn apply_text(widgets: &TextWidgets, model: &CardModel) {
     let val_str = match &model.value {
-        CardValue::Text(t) => t.clone(),
+        CardValue::Text(t) => bounded_text(t, MAX_UI_TEXT_BYTES),
         CardValue::Number {
             value,
             unit,
             decimals,
         } => crate::rendering::format::number(*value, unit.as_deref(), *decimals),
         CardValue::Percentage(p) => crate::rendering::format::percentage(*p),
-        CardValue::Status { label, .. } => label.clone(),
+        CardValue::Status { label, .. } => bounded_text(label, MAX_UI_TEXT_BYTES),
         _ => String::new(),
     };
 

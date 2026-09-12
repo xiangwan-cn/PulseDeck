@@ -29,7 +29,7 @@ impl crate::plugins::PagePlugin for Plugin {
             context.handle.clone(),
             config,
             context.runtime.clone(),
-            context.shutdown.clone(),
+            context.cancellation.clone(),
         )
         .upcast())
     }

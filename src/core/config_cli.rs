@@ -179,8 +179,7 @@ fn migrate(arguments: &[String]) -> Result<(), String> {
         }
     }
 
-    let mut backed_up = 0;
-    for (document, _) in &converted {
+    for (backed_up, (document, _)) in converted.iter().enumerate() {
         let backup = migration_backup(document);
         if let Err(error) = std::fs::rename(document, &backup) {
             cleanup_temporaries(&temporaries);
@@ -190,7 +189,6 @@ fn migrate(arguments: &[String]) -> Result<(), String> {
                 backup.display()
             ));
         }
-        backed_up += 1;
     }
 
     for (index, ((document, _), temporary)) in converted.iter().zip(&temporaries).enumerate() {
@@ -204,10 +202,10 @@ fn migrate(arguments: &[String]) -> Result<(), String> {
         }
     }
 
-    let validation = (|| {
+    let validation = {
         let mut manager = ConfigManager::new(path.clone());
         manager.load().map_err(|error| error.to_string())
-    })();
+    };
     if let Err(error) = validation {
         let rollback = rollback_documents(&converted);
         return Err(format!(
@@ -220,7 +218,7 @@ fn migrate(arguments: &[String]) -> Result<(), String> {
         converted.len()
     );
     println!(
-        "recommended v4 defaults: profile=balanced, screen_inhibit=while-active, external_boost=false, idle_view=none, observation_lease_seconds=300, battery=20/25% low and 10/15% critical"
+        "recommended v4 defaults: profile=balanced, screen_inhibit=while-active, suspend_inhibit=never, external_boost=false, idle_view=none, observation_lease_seconds=300, battery=20/25% low and 10/15% critical"
     );
     println!(
         "note: v3 external_prevents_idle/hysteresis, Agent brightness protection, CPU hints, and multiplier fields have no v4 equivalent"
@@ -1045,7 +1043,7 @@ fn build_source(kind: &str, options: &AddOptions) -> Result<SourceConfig, String
             })
         }),
         "http" => one_positional(kind, options).map(|url| {
-            SourceConfig::Http(HttpSourceConfig {
+            SourceConfig::Http(Box::new(HttpSourceConfig {
                 url,
                 method: None,
                 headers: None,
@@ -1053,7 +1051,7 @@ fn build_source(kind: &str, options: &AddOptions) -> Result<SourceConfig, String
                 timeout_seconds: 10,
                 max_output_bytes: 20_000,
                 parser: None,
-            })
+            }))
         }),
         "text" => one_positional(kind, options).map(SourceConfig::Text),
         "command" => {

@@ -102,6 +102,82 @@ impl Default for PetConfig {
     }
 }
 
+impl PetConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        const MAX_ANIMATIONS: usize = 32;
+        const MAX_FRAMES_PER_ANIMATION: usize = 256;
+        const MAX_PATH_LENGTH: usize = 4096;
+
+        if self.fps == 0 || self.fps > 12 {
+            return Err("fps must be between 1 and 12".into());
+        }
+        if self.offline_after_seconds == 0 || self.offline_after_seconds > 7 * 24 * 60 * 60 {
+            return Err("offline_after_seconds must be between 1 and 604800".into());
+        }
+        if self.done_hold_seconds > 60 * 60 {
+            return Err("done_hold_seconds must be at most 3600".into());
+        }
+        if self.offline_normal_after_seconds < self.offline_after_seconds
+            || self.offline_normal_after_seconds > 30 * 24 * 60 * 60
+        {
+            return Err(
+                "offline_normal_after_seconds must be >= offline_after_seconds and at most 2592000"
+                    .into(),
+            );
+        }
+        if self.animations.len() > MAX_ANIMATIONS {
+            return Err(format!(
+                "animations cannot contain more than {MAX_ANIMATIONS} states"
+            ));
+        }
+        for (state, animation) in &self.animations {
+            if state.trim().is_empty() || state.len() > 128 {
+                return Err("animation state names must be 1..=128 bytes".into());
+            }
+            if animation.frames.len() > MAX_FRAMES_PER_ANIMATION {
+                return Err(format!(
+                    "animation `{state}` cannot contain more than {MAX_FRAMES_PER_ANIMATION} frames"
+                ));
+            }
+            if animation.fps.is_some_and(|fps| fps == 0 || fps > self.fps) {
+                return Err(format!(
+                    "animation `{state}` fps must be between 1 and the global fps"
+                ));
+            }
+            for frame in &animation.frames {
+                if frame.as_os_str().to_string_lossy().len() > MAX_PATH_LENGTH {
+                    return Err(format!(
+                        "animation `{state}` contains an excessively long path"
+                    ));
+                }
+            }
+        }
+        for (name, path) in [
+            ("state_file", &self.state_file),
+            ("presentation_file", &self.presentation_file),
+        ] {
+            if path.as_os_str().to_string_lossy().len() > MAX_PATH_LENGTH {
+                return Err(format!("{name} path is too long"));
+            }
+        }
+        if self
+            .asset_root
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().to_string_lossy().len() > MAX_PATH_LENGTH)
+        {
+            return Err("asset_root path is too long".into());
+        }
+        if self
+            .completion_sound_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().to_string_lossy().len() > MAX_PATH_LENGTH)
+        {
+            return Err("completion_sound_file path is too long".into());
+        }
+        Ok(())
+    }
+}
+
 /// Card written to a standalone config module when this feature is compiled
 /// in. Empty plugin options select PetConfig's safe defaults.
 pub(crate) fn default_card() -> CardConfig {

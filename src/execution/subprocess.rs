@@ -1,13 +1,7 @@
-use std::{
-    future::Future,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::sync::CancellationToken;
 
 pub struct CommandOutput {
     pub stdout: String,
@@ -16,36 +10,15 @@ pub struct CommandOutput {
     pub success: bool,
 }
 
-pub async fn run_command(
+/// Run a command with an event-driven cancellation token.
+pub async fn run_command_with_cancellation(
     program: &str,
     args: &[String],
     timeout_secs: u64,
     max_output: usize,
+    cancellation: CancellationToken,
 ) -> Result<CommandOutput, String> {
-    run_command_inner(program, args, timeout_secs, max_output, None).await
-}
-
-pub async fn run_command_with_shutdown(
-    program: &str,
-    args: &[String],
-    timeout_secs: u64,
-    max_output: usize,
-    shutdown: Arc<AtomicBool>,
-) -> Result<CommandOutput, String> {
-    run_command_inner(program, args, timeout_secs, max_output, Some(shutdown)).await
-}
-
-async fn run_command_inner(
-    program: &str,
-    args: &[String],
-    timeout_secs: u64,
-    max_output: usize,
-    shutdown: Option<Arc<AtomicBool>>,
-) -> Result<CommandOutput, String> {
-    if shutdown
-        .as_ref()
-        .is_some_and(|signal| signal.load(Ordering::Acquire))
-    {
+    if cancellation.is_cancelled() {
         return Err("命令因应用关闭而取消".into());
     }
     crate::core::power_debug::increment(crate::core::power_debug::Counter::ExternalProcess);
@@ -74,13 +47,11 @@ async fn run_command_inner(
         )?;
         Ok::<_, std::io::Error>((stdout, stderr, status))
     };
-
-    let wait = await_command(
-        execution,
-        Duration::from_secs(timeout_secs.max(1)),
-        shutdown,
-    )
-    .await;
+    let wait = tokio::select! {
+        result = execution => CommandWait::Completed(result),
+        _ = cancellation.cancelled() => CommandWait::Cancelled,
+        _ = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1))) => CommandWait::TimedOut,
+    };
     let (stdout, stderr, status) = match wait {
         CommandWait::Completed(Ok(result)) => result,
         CommandWait::Completed(Err(error)) => {
@@ -96,7 +67,6 @@ async fn run_command_inner(
             return Err("命令因应用关闭而取消".into());
         }
     };
-
     Ok(CommandOutput {
         stdout: clean_output(stdout),
         stderr: clean_output(stderr),
@@ -109,35 +79,6 @@ enum CommandWait<T> {
     Completed(T),
     TimedOut,
     Cancelled,
-}
-
-async fn await_command<F, T>(
-    future: F,
-    timeout: Duration,
-    shutdown: Option<Arc<AtomicBool>>,
-) -> CommandWait<T>
-where
-    F: Future<Output = T>,
-{
-    if let Some(shutdown) = shutdown {
-        tokio::pin!(future);
-        tokio::select! {
-            result = &mut future => CommandWait::Completed(result),
-            _ = wait_for_shutdown(shutdown) => CommandWait::Cancelled,
-            _ = tokio::time::sleep(timeout) => CommandWait::TimedOut,
-        }
-    } else {
-        match tokio::time::timeout(timeout, future).await {
-            Ok(result) => CommandWait::Completed(result),
-            Err(_) => CommandWait::TimedOut,
-        }
-    }
-}
-
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 async fn terminate_child(child: &mut tokio::process::Child) {
@@ -192,7 +133,7 @@ fn clean_output(bytes: Vec<u8>) -> String {
     while let Some(character) = chars.next() {
         if character == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next();
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if ('\u{40}'..='\u{7e}').contains(&next) {
                     break;
                 }
@@ -206,6 +147,8 @@ fn clean_output(bytes: Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
@@ -219,10 +162,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_cancels_command_process_group() {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let signal = shutdown.clone();
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
         let task = tokio::spawn(async move {
-            run_command_with_shutdown(
+            run_command_with_cancellation(
                 "sh",
                 &["-c".to_string(), "sleep 30".to_string()],
                 30,
@@ -232,7 +175,7 @@ mod tests {
             .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown.store(true, Ordering::Release);
+        cancellation.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("command cancellation timed out")

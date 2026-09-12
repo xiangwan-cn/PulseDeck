@@ -1,6 +1,7 @@
 use gtk::prelude::*;
 use gtk::{Align, Label, LevelBar, Orientation};
 
+use crate::core::text::{bounded_text, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue};
 
 pub fn apply_progress(widgets: &ProgressWidgets, model: &CardModel) {
@@ -21,7 +22,7 @@ pub fn apply_progress(widgets: &ProgressWidgets, model: &CardModel) {
                     crate::rendering::format::percentage(p),
                 )
             } else {
-                (0.0, t.clone())
+                (0.0, bounded_text(t, MAX_UI_TEXT_BYTES))
             }
         }
         _ => (0.0, String::new()),

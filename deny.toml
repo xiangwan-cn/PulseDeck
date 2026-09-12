@@ -1,0 +1,45 @@
+# Dependency policy for the checked-in lockfile. This is intentionally
+# conservative for security findings while leaving duplicate versions as a
+# review warning: GTK/zbus transitive graphs can legitimately span majors.
+
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "warn"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[licenses]
+unlicensed = "deny"
+copyleft = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

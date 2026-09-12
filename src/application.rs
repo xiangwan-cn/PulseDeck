@@ -1,5 +1,8 @@
 use std::rc::Rc;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use glib::prelude::ObjectExt;
 
 use crate::core::config::{
@@ -35,14 +38,24 @@ pub fn build_app(app: &adw::Application) {
     }
 
     let config_dir_path = config_dir();
-    let _ = std::fs::create_dir_all(&config_dir_path);
-    let _ = std::fs::create_dir_all(config_modules_dir());
+    if let Err(error) = crate::core::config::ensure_private_directory(&config_dir_path) {
+        tracing::warn!(%error, "failed to secure PulseDeck configuration directory");
+    }
+    if let Err(error) = crate::core::config::ensure_private_directory(&config_modules_dir()) {
+        tracing::warn!(%error, "failed to secure PulseDeck configuration modules directory");
+    }
 
     let config_file = config_path();
     if !config_file.exists() {
         if let Err(e) = std::fs::write(&config_file, DEFAULT_CONFIG) {
             tracing::error!("failed to write default config: {}", e);
         } else {
+            #[cfg(unix)]
+            if let Err(error) =
+                std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(%error, "failed to secure the default configuration file");
+            }
             tracing::info!("wrote default config to {:?}", config_file);
         }
     }

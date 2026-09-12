@@ -1,12 +1,17 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
 };
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use tokio_util::sync::CancellationToken;
 
 use adw::prelude::AdwApplicationWindowExt;
 use gtk::prelude::*;
@@ -16,6 +21,7 @@ use crate::core::cache;
 use crate::core::config::{
     config_modules_dir, config_path, AppConfig, CardConfig, CardWorkBehavior, CardWorkload,
     ConfigManager, DisplayConfig, IdleViewMode, ScreenInhibitMode, SourceConfig, SourceKind,
+    SuspendInhibitMode,
 };
 use crate::core::refresh::{
     RefreshCoordinator, RefreshReason, SourceEventKind, SourceKey, SourceRevision,
@@ -24,6 +30,7 @@ use crate::core::runtime::{
     Activity, IdleViewDecision, RuntimeHandle, RuntimeManager, UserActivity, Visibility,
 };
 use crate::core::scheduler::{Scheduler, TaskPolicy, WorkBehavior, Workload};
+use crate::core::text::{bounded_tail, bounded_text, MAX_UI_ERROR_BYTES, MAX_UI_TEXT_BYTES};
 use crate::metrics::builtin::{
     builtin_is_event_driven, builtin_uses_stateful_sampling, create_builtin_metric,
 };
@@ -39,6 +46,12 @@ use crate::ui::page::Page;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/config.example.toml");
 const NETWORK_SIGNAL_FALLBACK_SECONDS: u64 = 600;
+const MAX_BLOCKING_COLLECTIONS: usize = 2;
+const MAX_CACHE_IO_WORKERS: usize = 1;
+static BLOCKING_COLLECTION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKING_COLLECTIONS)));
+static CACHE_IO_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CACHE_IO_WORKERS)));
 
 const APP_CSS: &str = r#"
 .tab-bar-area { padding: 5px 6px; }
@@ -103,7 +116,9 @@ const APP_CSS: &str = r#"
 .runtime-idle-time { color: #666666; font-size: 28px; font-feature-settings: "tnum"; }
 "#;
 
+#[derive(Clone)]
 struct MetricUpdate {
+    completion_id: u64,
     card_id: String,
     page_id: String,
     source_key: String,
@@ -134,6 +149,47 @@ struct MetricUpdate {
     next_deadline: Option<Instant>,
 }
 
+/// A completion is intentionally smaller than the presentation payload. It
+/// carries every scheduler transition exactly once, while the corresponding
+/// result is kept in the latest-wins presentation lane below. This prevents a
+/// slow GTK turn from either dropping a scheduler completion or retaining a
+/// burst of large output strings.
+struct MetricCompletion {
+    completion_id: u64,
+    card_id: String,
+    source_key: String,
+    source_revision: SourceRevision,
+    revision_key: Option<String>,
+    invalidation_generation: u64,
+    config_epoch: u64,
+    task_generation: u64,
+    collection_health: CollectionHealth,
+    max_output_bytes: usize,
+    interval_secs: u64,
+    next_delay: Option<Duration>,
+    next_deadline: Option<Instant>,
+}
+
+impl From<&MetricUpdate> for MetricCompletion {
+    fn from(update: &MetricUpdate) -> Self {
+        Self {
+            completion_id: update.completion_id,
+            card_id: update.card_id.clone(),
+            source_key: update.source_key.clone(),
+            source_revision: update.source_revision,
+            revision_key: update.revision_key.clone(),
+            invalidation_generation: update.invalidation_generation,
+            config_epoch: update.config_epoch,
+            task_generation: update.task_generation,
+            collection_health: update.collection_health,
+            max_output_bytes: update.max_output_bytes,
+            interval_secs: update.interval_secs,
+            next_delay: update.next_delay,
+            next_deadline: update.next_deadline,
+        }
+    }
+}
+
 struct ActionUpdate {
     action_id: String,
     invocation_id: u64,
@@ -141,25 +197,34 @@ struct ActionUpdate {
     result: ActionResult,
 }
 
-// Worker completions are state updates, not an append-only event log. Keeping
-// only the newest update for each card/action prevents a slow GTK turn from
-// retaining every intermediate result when collectors finish in a burst.
+// Presentation updates are state updates, not an append-only event log. The
+// exact completion lane is separate and must not use this coalescing policy.
 const MAX_UI_UPDATES_PER_TURN: usize = 24;
-const MAX_PENDING_UI_UPDATES: usize = 1024;
+const MAX_PENDING_METRIC_COMPLETIONS: usize = 1024;
+const MAX_PENDING_METRIC_PRESENTATIONS: usize = 1024;
+static NEXT_METRIC_COMPLETION: AtomicU64 = AtomicU64::new(1);
+
+fn next_metric_completion_id() -> u64 {
+    NEXT_METRIC_COMPLETION.fetch_add(1, Ordering::Relaxed)
+}
 
 struct LatestInbox<T> {
     pending: Mutex<HashMap<String, T>>,
     wake_tx: async_channel::Sender<()>,
+    max_pending: usize,
 }
 
 impl<T> LatestInbox<T> {
+    #[cfg(test)]
     fn new(wake_tx: async_channel::Sender<()>) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             wake_tx,
+            max_pending: MAX_PENDING_METRIC_PRESENTATIONS,
         }
     }
 
+    #[cfg(test)]
     fn publish(&self, key: String, update: T) {
         self.publish_if(key, update, |_| true);
     }
@@ -168,23 +233,35 @@ impl<T> LatestInbox<T> {
     where
         F: FnOnce(Option<&T>) -> bool,
     {
-        if self.wake_tx.is_closed() {
-            return;
-        }
         if let Ok(mut pending) = self.pending.lock() {
             if !should_replace(pending.get(&key)) {
                 return;
             }
-            pending.insert(key, update);
-            if pending.len() > MAX_PENDING_UI_UPDATES {
+            if !pending.contains_key(&key) && pending.len() >= self.max_pending {
+                // This is presentation state, not lifecycle state. The exact
+                // completion remains in `metric_completion_tx` and will
+                // finalize the scheduler even when an old card generation is
+                // evicted here.
                 if let Some(evicted) = pending.keys().next().cloned() {
                     pending.remove(&evicted);
                 }
             }
+            pending.insert(key, update);
         }
         let _ = self.wake_tx.try_send(());
     }
 
+    fn new_silent() -> Self {
+        let (wake_tx, wake_rx) = async_channel::bounded(1);
+        drop(wake_rx);
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            wake_tx,
+            max_pending: MAX_PENDING_METRIC_PRESENTATIONS,
+        }
+    }
+
+    #[cfg(test)]
     fn take_batch(&self, limit: usize) -> Vec<T> {
         let Ok(mut pending) = self.pending.lock() else {
             return Vec::new();
@@ -195,6 +272,7 @@ impl<T> LatestInbox<T> {
             .collect()
     }
 
+    #[cfg(test)]
     fn has_pending(&self) -> bool {
         self.pending
             .lock()
@@ -202,15 +280,27 @@ impl<T> LatestInbox<T> {
             .unwrap_or(false)
     }
 
+    fn latest(&self, key: &str) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(key).cloned())
+    }
+
+    fn remove(&self, key: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(key);
+        }
+    }
+
     fn len(&self) -> usize {
         self.pending
             .lock()
             .map(|pending| pending.len())
             .unwrap_or_default()
-    }
-
-    fn wake(&self) {
-        let _ = self.wake_tx.try_send(());
     }
 
     fn close(&self) {
@@ -223,20 +313,74 @@ impl<T> LatestInbox<T> {
 
 fn publish_metric(inbox: &Arc<LatestInbox<MetricUpdate>>, update: MetricUpdate) {
     let generation = update.task_generation;
+    let completion_id = update.completion_id;
     inbox.publish_if(update.card_id.clone(), update, |pending| {
-        pending.is_none_or(|pending| pending.task_generation <= generation)
+        pending.is_none_or(|pending| {
+            pending.task_generation < generation
+                || (pending.task_generation == generation && pending.completion_id <= completion_id)
+        })
     });
 }
 
-fn publish_action(inbox: &Arc<LatestInbox<ActionUpdate>>, update: ActionUpdate) {
-    let invocation = update.invocation_id;
-    inbox.publish_if(update.action_id.clone(), update, |pending| {
-        pending.is_none_or(|pending| pending.invocation_id <= invocation)
-    });
+async fn publish_metric_completion(
+    presentation: &Arc<LatestInbox<MetricUpdate>>,
+    completion_tx: &async_channel::Sender<MetricCompletion>,
+    update: MetricUpdate,
+    cancellation: &CancellationToken,
+) -> bool {
+    let completion = MetricCompletion::from(&update);
+    publish_metric(presentation, update);
+    tokio::select! {
+        result = completion_tx.send(completion) => result.is_ok(),
+        _ = cancellation.cancelled() => false,
+    }
 }
 
-const MAX_COMPLETED_ACTION_INVOCATIONS: usize = 4096;
+async fn publish_action(
+    completion_tx: async_channel::Sender<ActionUpdate>,
+    update: ActionUpdate,
+    cancellation: CancellationToken,
+) -> bool {
+    // Action completions are exact events. A bounded channel applies
+    // backpressure instead of silently replacing another invocation's result.
+    tokio::select! {
+        result = completion_tx.send(update) => result.is_ok(),
+        _ = cancellation.cancelled() => false,
+    }
+}
+
+async fn acquire_permit(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    cancellation: &CancellationToken,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        permit = semaphore.acquire_owned() => permit.ok(),
+        _ = cancellation.cancelled() => None,
+    }
+}
+
+const MAX_ACTIVE_ACTIONS: usize = 256;
 static NEXT_SAMPLING_CONSUMER_KEY: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_ACTIONS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct ActionLease(String);
+
+impl Drop for ActionLease {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_ACTIONS.lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+fn acquire_action(action_id: &str) -> Option<ActionLease> {
+    let mut active = ACTIVE_ACTIONS.lock().ok()?;
+    if active.len() >= MAX_ACTIVE_ACTIONS || !active.insert(action_id.to_owned()) {
+        return None;
+    }
+    Some(ActionLease(action_id.to_owned()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectionHealth {
@@ -262,26 +406,6 @@ impl CollectionHealth {
     }
 }
 
-struct InvocationDedup {
-    seen: std::collections::HashSet<u64>,
-    order: std::collections::VecDeque<u64>,
-}
-
-impl InvocationDedup {
-    fn insert(&mut self, invocation_id: u64) -> bool {
-        if !self.seen.insert(invocation_id) {
-            return false;
-        }
-        self.order.push_back(invocation_id);
-        while self.order.len() > MAX_COMPLETED_ACTION_INVOCATIONS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.seen.remove(&oldest);
-            }
-        }
-        true
-    }
-}
-
 struct CardMeta {
     page_id: String,
     interval_secs: u64,
@@ -302,11 +426,15 @@ enum PersistentSource {
 
 enum SourceCollector {
     Builtin(BuiltinMetric),
-    Persistent(PersistentSource),
+    Persistent(Box<PersistentSource>),
 }
 
 struct SourceNode {
     state: Mutex<SourceNodeState>,
+    /// Tasks wait here asynchronously before entering the blocking pool. A
+    /// shared source therefore has one collector in flight without consuming
+    /// a blocking worker while followers queue behind its state mutex.
+    collect_gate: Arc<tokio::sync::Mutex<()>>,
     /// Canonical descriptor key used to invalidate all sampling-policy nodes
     /// that project the same source.
     descriptor_key: String,
@@ -338,20 +466,30 @@ impl SourceNode {
                 last_generation: 0,
                 last_max_output: 0,
             }),
+            collect_gate: Arc::new(tokio::sync::Mutex::new(())),
             descriptor_key,
             invalidation_generation: AtomicU64::new(0),
         }
     }
 
-    fn collect(&self, ctx: &MetricContext, max_output: usize) -> MetricResult {
+    fn collect(
+        &self,
+        ctx: &MetricContext,
+        max_output: usize,
+        requested_at: Instant,
+    ) -> MetricResult {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         let generation = self.invalidation_generation.load(Ordering::Acquire);
         if state.last_generation == generation
             && state.last_max_output == max_output
-            && state
-                .last_collected_at
-                .is_some_and(|at| now.duration_since(at) < Self::COALESCE_WINDOW)
+            && state.last_collected_at.is_some_and(|at| {
+                // A follower that was already queued while the previous
+                // collection was running must observe that exact result even
+                // when the request itself took longer than the short normal
+                // coalescing window. New requests still expire normally.
+                at >= requested_at || now.saturating_duration_since(at) < Self::COALESCE_WINDOW
+            })
         {
             if let Some(result) = &state.last_result {
                 return result.clone();
@@ -372,6 +510,71 @@ impl SourceNode {
         result
     }
 
+    /// Clone only the async-safe collector while the short state lock is held,
+    /// then await it without retaining that synchronous lock. The per-source
+    /// async gate is held by the caller, so mutable sampling state cannot race
+    /// while the request is in flight.
+    async fn collect_async(
+        &self,
+        ctx: &MetricContext,
+        max_output: usize,
+        requested_at: Instant,
+    ) -> MetricResult {
+        enum AsyncCollector {
+            Command(Box<CommandMetric>),
+            Http(Box<HttpMetric>),
+        }
+
+        let (collector, generation) = {
+            let state = self.state.lock().unwrap();
+            let now = Instant::now();
+            let generation = self.invalidation_generation.load(Ordering::Acquire);
+            if state.last_generation == generation
+                && state.last_max_output == max_output
+                && state.last_collected_at.is_some_and(|at| {
+                    at >= requested_at || now.saturating_duration_since(at) < Self::COALESCE_WINDOW
+                })
+            {
+                if let Some(result) = &state.last_result {
+                    return result.clone();
+                }
+            }
+            let collector = match &state.collector {
+                SourceCollector::Persistent(source) => match source.as_ref() {
+                    PersistentSource::Command(command) => {
+                        AsyncCollector::Command(Box::new(command.clone()))
+                    }
+                    PersistentSource::Http(http) => AsyncCollector::Http(Box::new(http.clone())),
+                    _ => return MetricResult::error("非异步数据源进入了异步采集路径"),
+                },
+                _ => return MetricResult::error("非异步数据源进入了异步采集路径"),
+            };
+            (collector, generation)
+        };
+
+        let result = match collector {
+            AsyncCollector::Command(command) => {
+                command
+                    .collect_async(max_output, ctx.cancellation.clone())
+                    .await
+            }
+            AsyncCollector::Http(http) => http.collect_async(ctx, max_output).await,
+        };
+        let mut state = self.state.lock().unwrap();
+        state.last_collected_at = Some(Instant::now());
+        state.last_max_output = max_output;
+        state.last_result = Some(result.clone());
+        state.last_generation = generation;
+        result
+    }
+
+    fn is_async(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            matches!(&state.collector, SourceCollector::Persistent(source)
+                if matches!(source.as_ref(), PersistentSource::Command(_) | PersistentSource::Http(_)))
+        })
+    }
+
     fn invalidate(&self) {
         self.invalidation_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -380,9 +583,9 @@ impl SourceNode {
 impl PersistentSource {
     fn collect(&mut self, ctx: &MetricContext, max_output: usize) -> MetricResult {
         match self {
-            Self::Command(source) => source.collect_no_ctx(max_output, ctx.shutdown.clone()),
+            Self::Command(_) => MetricResult::error("命令数据源必须走异步采集路径"),
             Self::File(source) => source.collect(ctx, max_output),
-            Self::Http(source) => source.collect(ctx, max_output),
+            Self::Http(_) => MetricResult::error("HTTP 数据源必须走异步采集路径"),
             Self::Static(result) => result.clone(),
         }
     }
@@ -414,10 +617,62 @@ impl ConfigReloadGuard {
     }
 }
 
+/// The page builder is shared by initial construction and configuration
+/// reconciliation. Keeping the references in one cloneable context prevents
+/// hot reload from retaining an obsolete `MonitorWindow` or accidentally
+/// rebuilding only part of the scheduler/UI graph.
+#[derive(Clone)]
+struct PageBuildContext {
+    window: adw::ApplicationWindow,
+    config: Rc<RefCell<ConfigManager>>,
+    pages: Rc<RefCell<HashMap<String, Page>>>,
+    scheduler: Rc<RefCell<Scheduler>>,
+    scheduler_wake: async_channel::Sender<()>,
+    handle: tokio::runtime::Handle,
+    runtime: RuntimeHandle,
+    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    action_completion_tx: async_channel::Sender<ActionUpdate>,
+    card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
+    previous_results: Rc<RefCell<HashMap<String, MetricResult>>>,
+    max_output_budget: Arc<AtomicUsize>,
+    refresh: Rc<RefCell<RefreshCoordinator>>,
+    source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+    config_epoch: Rc<Cell<u64>>,
+    file_monitors: Rc<RefCell<Vec<gio::FileMonitor>>>,
+    file_fallback: Rc<RefCell<Option<glib::SourceId>>>,
+    card_style_registry: Rc<RefCell<crate::ui::metric_card::CardStyleRegistry>>,
+    compact_grid: Rc<Cell<bool>>,
+    view_stack: adw::ViewStack,
+    current_page_id: Rc<RefCell<String>>,
+}
+
+#[derive(Clone)]
+struct RefreshBindingContext {
+    file_monitors: Rc<RefCell<Vec<gio::FileMonitor>>>,
+    file_fallback: Rc<RefCell<Option<glib::SourceId>>>,
+    refresh: Rc<RefCell<RefreshCoordinator>>,
+    scheduler: Rc<RefCell<Scheduler>>,
+    scheduler_wake: async_channel::Sender<()>,
+    card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
+    source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
+}
+
+#[derive(Clone)]
+struct ActionContext {
+    config: Rc<RefCell<ConfigManager>>,
+    completion_tx: async_channel::Sender<ActionUpdate>,
+    handle: tokio::runtime::Handle,
+    runtime: RuntimeHandle,
+    shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+}
+
 pub struct MonitorWindow {
     window: adw::ApplicationWindow,
     app_style_provider: gtk::CssProvider,
     app_style_display: gtk::gdk::Display,
+    card_style_registry: Rc<RefCell<crate::ui::metric_card::CardStyleRegistry>>,
     view_stack: adw::ViewStack,
     pages: Rc<RefCell<HashMap<String, Page>>>,
     config: Rc<RefCell<ConfigManager>>,
@@ -432,11 +687,13 @@ pub struct MonitorWindow {
     config_epoch: Rc<Cell<u64>>,
     current_page_id: Rc<RefCell<String>>,
     metric_inbox: Arc<LatestInbox<MetricUpdate>>,
-    action_inbox: Arc<LatestInbox<ActionUpdate>>,
+    metric_completion_tx: async_channel::Sender<MetricCompletion>,
+    action_completion_tx: async_channel::Sender<ActionUpdate>,
     reload_guard: Rc<ConfigReloadGuard>,
     config_monitors: Vec<gio::FileMonitor>,
     scheduler_wake: async_channel::Sender<()>,
     shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     heartbeat_source: Option<glib::SourceId>,
     compact_grid: Rc<Cell<bool>>,
     runtime: RuntimeHandle,
@@ -469,6 +726,8 @@ impl MonitorWindow {
             &app_style_provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        let card_style_registry =
+            crate::ui::metric_card::CardStyleRegistry::new(app_style_display.clone());
 
         let view_stack = adw::ViewStack::new();
         view_stack.set_vexpand(true);
@@ -484,6 +743,7 @@ impl MonitorWindow {
         let compact_grid = gtk::ToggleButton::new();
         compact_grid.set_icon_name("view-grid-symbolic");
         compact_grid.add_css_class("flat");
+        compact_grid.update_property(&[gtk::accessible::Property::Label("切换紧凑布局")]);
         compact_grid.add_css_class("compact-grid-button");
         compact_grid.set_halign(Align::End);
         let initial_compact = load_compact_grid_preference();
@@ -555,6 +815,7 @@ impl MonitorWindow {
         let handle = tokio_handle();
         std::mem::drop(handle.spawn_blocking(cache::cleanup));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
         let heartbeat_last = Rc::new(Cell::new(Instant::now()));
         let heartbeat_source = {
             let heartbeat_last = heartbeat_last.clone();
@@ -575,18 +836,17 @@ impl MonitorWindow {
         let battery_root = PathBuf::from("/sys/class/power_supply");
         let procfs_root = PathBuf::from("/proc");
         let metric_ctx = Arc::new(MetricContext::new(
-            handle.clone(),
-            shutdown.clone(),
+            cancellation.clone(),
             http_client.clone(),
             battery_root,
             procfs_root,
             PathBuf::from("/sys/class/thermal"),
         ));
 
-        let (metric_wake, metric_wake_rx) = async_channel::bounded::<()>(1);
-        let (action_wake, action_wake_rx) = async_channel::bounded::<()>(1);
-        let metric_inbox = Arc::new(LatestInbox::new(metric_wake));
-        let action_inbox = Arc::new(LatestInbox::new(action_wake));
+        let (metric_completion_tx, metric_completion_rx) =
+            async_channel::bounded(MAX_PENDING_METRIC_COMPLETIONS);
+        let metric_inbox = Arc::new(LatestInbox::new_silent());
+        let (action_completion_tx, action_completion_rx) = async_channel::bounded(64);
         let (scheduler_wake, scheduler_wake_rx) = async_channel::bounded::<()>(1);
         let source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -651,6 +911,7 @@ impl MonitorWindow {
             window,
             app_style_provider,
             app_style_display,
+            card_style_registry,
             view_stack,
             pages: pages.clone(),
             config: config_ref.clone(),
@@ -665,11 +926,13 @@ impl MonitorWindow {
             config_epoch,
             current_page_id: current_page_id.clone(),
             metric_inbox,
-            action_inbox,
+            metric_completion_tx,
+            action_completion_tx,
             reload_guard: reload_guard.clone(),
             config_monitors: Vec::new(),
             scheduler_wake,
             shutdown,
+            cancellation,
             heartbeat_source: Some(heartbeat_source),
             compact_grid: compact_preference,
             runtime,
@@ -693,15 +956,16 @@ impl MonitorWindow {
         win.setup_config_monitor();
         win.setup_network_monitor(&network_monitor);
         win.start_scheduler_polling(scheduler_wake_rx);
-        win.start_metric_receiver(metric_wake_rx);
-        win.start_action_receiver(action_wake_rx);
+        win.start_metric_receiver(metric_completion_rx);
+        win.start_action_receiver(action_completion_rx);
 
         win
     }
 
     fn setup_runtime_consumers(&mut self, app: &adw::Application) {
         let application = app.clone();
-        let inhibit_cookie: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+        let inhibit_state: Rc<RefCell<Option<(u32, gtk::ApplicationInhibitFlags)>>> =
+            Rc::new(RefCell::new(None));
         let runtime = self.runtime.clone();
         runtime.set_mapped(self.window.is_mapped());
         runtime.set_active(self.window.is_active());
@@ -743,18 +1007,43 @@ impl MonitorWindow {
                 } else {
                     presented_attention.borrow_mut().take();
                 }
+                let mut requested_flags = gtk::ApplicationInhibitFlags::empty();
                 if snapshot.inhibit_screen {
-                    if inhibit_cookie.borrow().is_none() {
-                        let flags = gtk::ApplicationInhibitFlags::IDLE;
-                        let id = application.inhibit(
-                            Some(&window),
-                            flags,
-                            Some("PulseDeck 正在前台显示实时监控信息"),
-                        );
-                        inhibit_cookie.replace(Some(id));
+                    requested_flags |= gtk::ApplicationInhibitFlags::IDLE;
+                }
+                if snapshot.inhibit_suspend {
+                    requested_flags |= gtk::ApplicationInhibitFlags::SUSPEND;
+                }
+                let requested_state = (!requested_flags.is_empty()).then_some(requested_flags);
+                let current_flags = inhibit_state.borrow().as_ref().map(|(_, flags)| *flags);
+                if current_flags != requested_state {
+                    if let Some((id, _)) = inhibit_state.borrow_mut().take() {
+                        application.uninhibit(id);
+                        tracing::debug!(id, "released desktop power inhibition");
                     }
-                } else if let Some(id) = inhibit_cookie.borrow_mut().take() {
-                    application.uninhibit(id);
+                    if let Some(flags) = requested_state {
+                        let reason = match (
+                            flags.contains(gtk::ApplicationInhibitFlags::IDLE),
+                            flags.contains(gtk::ApplicationInhibitFlags::SUSPEND),
+                        ) {
+                            (true, true) => {
+                                "PulseDeck 正在显示实时监控信息，并请求保持系统不自动挂起"
+                            }
+                            (true, false) => "PulseDeck 正在前台显示实时监控信息",
+                            (false, true) => "PulseDeck 正在执行需要持续运行的监控任务",
+                            (false, false) => unreachable!("empty inhibition flags were filtered"),
+                        };
+                        let id = application.inhibit(Some(&window), flags, Some(reason));
+                        if id == 0 {
+                            tracing::warn!(
+                                ?flags,
+                                "desktop power inhibition is unavailable or was rejected"
+                            );
+                        } else {
+                            tracing::debug!(id, ?flags, "acquired desktop power inhibition");
+                            inhibit_state.replace(Some((id, flags)));
+                        }
+                    }
                 }
 
                 let idle_view = snapshot.idle_view;
@@ -821,126 +1110,42 @@ impl MonitorWindow {
             if let Some(source) = clock_source.borrow_mut().take() {
                 source.remove();
             }
-            if let Some(id) = inhibit_cookie.borrow_mut().take() {
+            if let Some((id, _)) = inhibit_state.borrow_mut().take() {
                 application.uninhibit(id);
+                tracing::debug!(id, "released desktop power inhibition during shutdown");
             }
         });
     }
 
-    fn drain_cards(&self) -> (Vec<CardConfig>, Vec<crate::core::config::ActionConfig>) {
-        let cfg = self.config.borrow();
-        let app_config = cfg.config();
-
-        let mut cards = effective_cards(app_config, cfg.uses_default_card_registry());
-
-        cards.sort_by_key(|c| c.order);
-
-        let actions = app_config.actions.clone();
-
-        (cards, actions)
-    }
-
-    fn sorted_pages(&self) -> Vec<crate::core::config::PageConfig> {
-        let cfg = self.config.borrow();
-        let app_config = cfg.config();
-
-        let mut pages_list = effective_pages(app_config, cfg.uses_default_page_registry());
-
-        pages_list.sort_by_key(|p| p.order);
-        pages_list
+    fn page_build_context(&self) -> PageBuildContext {
+        PageBuildContext {
+            window: self.window.clone(),
+            config: self.config.clone(),
+            pages: self.pages.clone(),
+            scheduler: self.scheduler.clone(),
+            scheduler_wake: self.scheduler_wake.clone(),
+            handle: self.handle.clone(),
+            runtime: self.runtime.clone(),
+            shutdown: self.shutdown.clone(),
+            cancellation: self.cancellation.clone(),
+            action_completion_tx: self.action_completion_tx.clone(),
+            card_metas: self.card_metas.clone(),
+            previous_results: self.previous_results.clone(),
+            max_output_budget: self.max_output_budget.clone(),
+            refresh: self.refresh.clone(),
+            source_nodes: self.source_nodes.clone(),
+            config_epoch: self.config_epoch.clone(),
+            file_monitors: self.file_monitors.clone(),
+            file_fallback: self.file_fallback.clone(),
+            card_style_registry: self.card_style_registry.clone(),
+            compact_grid: self.compact_grid.clone(),
+            view_stack: self.view_stack.clone(),
+            current_page_id: self.current_page_id.clone(),
+        }
     }
 
     fn setup_pages(&mut self) {
-        let pages_list = self.sorted_pages();
-        let (cards, actions) = self.drain_cards();
-
-        let mut page_ids = Vec::new();
-
-        self.pages.borrow_mut().clear();
-        self.card_metas.borrow_mut().clear();
-        self.previous_results.borrow_mut().clear();
-        self.source_nodes.lock().unwrap().clear();
-        self.refresh.borrow_mut().clear();
-        for card in &cards {
-            let source_key = source_key_for(card.source.as_ref());
-            self.refresh
-                .borrow_mut()
-                .register_source(source_key.clone());
-            self.refresh.borrow_mut().bind(source_key, card.id.clone());
-            if card
-                .source
-                .as_ref()
-                .and_then(SourceConfig::builtin_metric)
-                .is_some_and(|metric| {
-                    matches!(metric, "battery_capacity" | "battery_temperature" | "power")
-                })
-            {
-                self.refresh
-                    .borrow_mut()
-                    .bind("signal:power-supply", card.id.clone());
-            }
-            if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("network") {
-                self.refresh
-                    .borrow_mut()
-                    .bind("signal:network", card.id.clone());
-            }
-            if card.source.as_ref().and_then(SourceConfig::builtin_metric)
-                == Some("cpu_temperature")
-            {
-                self.refresh
-                    .borrow_mut()
-                    .bind("signal:thermal", card.id.clone());
-            }
-        }
-        self.setup_file_monitors(&cards);
-
-        let plugin_context = crate::plugins::PluginContext {
-            handle: self.handle.clone(),
-            presentation: None,
-            runtime: self.runtime.clone(),
-            shutdown: self.shutdown.clone(),
-        };
-        for page_cfg in &pages_list {
-            match crate::plugins::build_page(&plugin_context, page_cfg) {
-                Ok(Some(container)) => {
-                    self.view_stack
-                        .add_titled(&container, Some(&page_cfg.id), &page_cfg.title);
-                    page_ids.push(page_cfg.id.clone());
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(page = %page_cfg.id, %error, "plugin page skipped");
-                    continue;
-                }
-            }
-            let ui = self.config.borrow().config().ui.clone();
-            let mut page = Page::new(&page_cfg.id, &ui);
-            page.set_available_height(self.view_stack.height());
-            page.set_compact_grid(self.compact_grid.get());
-            self.populate_page(&mut page, &page_cfg.id, &cards, &actions);
-
-            self.view_stack
-                .add_titled(&page.container, Some(&page_cfg.id), &page_cfg.title);
-
-            self.pages.borrow_mut().insert(page_cfg.id.clone(), page);
-            page_ids.push(page_cfg.id.clone());
-        }
-
-        let preferred = self.config.borrow().config().ui.default_page.clone();
-        if let Some(initial) = page_ids
-            .iter()
-            .find(|id| **id == preferred)
-            .or_else(|| page_ids.first())
-        {
-            self.view_stack.set_visible_child_name(initial);
-            *self.current_page_id.borrow_mut() = initial.clone();
-        }
-
-        self.scheduler
-            .borrow_mut()
-            .set_active_page(&self.current_page_id.borrow());
-        prune_source_nodes(&self.source_nodes, &self.card_metas);
+        rebuild_pages(&self.page_build_context());
     }
 
     fn setup_adaptive_layout(&self) {
@@ -973,19 +1178,6 @@ impl MonitorWindow {
             let schedule_update = schedule_update.clone();
             surface.connect_height_notify(move |_| schedule_update());
         });
-    }
-
-    fn setup_file_monitors(&self, cards: &[CardConfig]) {
-        install_file_monitors(
-            &self.file_monitors,
-            &self.file_fallback,
-            cards,
-            self.refresh.clone(),
-            self.scheduler.clone(),
-            self.scheduler_wake.clone(),
-            self.card_metas.clone(),
-            self.source_nodes.clone(),
-        );
     }
 
     fn setup_network_monitor(&mut self, monitor: &gio::NetworkMonitor) {
@@ -1071,184 +1263,7 @@ impl MonitorWindow {
         self.network_dbus = Some((connection, subscription));
     }
 
-    fn populate_page(
-        &self,
-        page: &mut Page,
-        page_id: &str,
-        all_cards: &[CardConfig],
-        all_actions: &[crate::core::config::ActionConfig],
-    ) {
-        let mut page_cards: Vec<&CardConfig> =
-            all_cards.iter().filter(|c| c.page == page_id).collect();
-        page_cards.sort_by_key(|c| c.order);
-
-        let mut page_actions: Vec<&crate::core::config::ActionConfig> = all_actions
-            .iter()
-            .filter(|action| action.page == page_id && action.visible)
-            .collect();
-        page_actions.sort_by_key(|_| 0);
-
-        for card_cfg in &page_cards {
-            if card_cfg.kind.is_some() {
-                let (presentation, presentation_rx) =
-                    crate::plugins::CardPresentationHandle::channel();
-                let context = crate::plugins::PluginContext {
-                    handle: self.handle.clone(),
-                    presentation: Some(presentation.clone()),
-                    runtime: self.runtime.clone(),
-                    shutdown: self.shutdown.clone(),
-                };
-                match crate::plugins::build_card(&context, card_cfg) {
-                    Ok(Some(widget)) => {
-                        page.add_plugin_card(
-                            &card_cfg.id,
-                            &widget,
-                            card_cfg.display.as_ref(),
-                            presentation,
-                        );
-                        let pages = Rc::downgrade(&self.pages);
-                        let page_id = page_id.to_string();
-                        let card_id = card_cfg.id.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            while let Ok(request) = presentation_rx.recv().await {
-                                let Some(pages) = pages.upgrade() else {
-                                    break;
-                                };
-                                {
-                                    let mut pages = pages.borrow_mut();
-                                    if let Some(page) = pages.get_mut(&page_id) {
-                                        page.set_plugin_card_presentation(&card_id, request);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(card = %card_cfg.id, %error, "plugin card skipped");
-                    }
-                }
-                continue;
-            }
-            let model = CardModel {
-                id: card_cfg.id.clone(),
-                title: card_cfg.title.clone(),
-                subtitle: card_cfg.description.clone(),
-                icon: card_cfg.icon.clone(),
-                renderer: card_cfg.renderer,
-                state: CardState::Loading,
-                value: CardValue::Text("加载中...".into()),
-                tooltip: None,
-                cached: false,
-                columns_after: card_cfg.display.as_ref().and_then(|d| d.columns_after),
-                columns: card_cfg.display.as_ref().and_then(|d| d.columns),
-            };
-            page.add_metric_card(&model, card_cfg.display.as_ref());
-            if let Some(metric_card) = page.get_metric_card(&card_cfg.id) {
-                let scheduler = self.scheduler.clone();
-                let wake = self.scheduler_wake.clone();
-                let card_id = card_cfg.id.clone();
-                let refresh_runtime = self.runtime.clone();
-                metric_card.refresh_btn.connect_clicked(move |button| {
-                    refresh_runtime.report_user_activity(UserActivity::ManualRefresh);
-                    if scheduler.borrow_mut().request_now(&card_id) {
-                        button.set_sensitive(false);
-                        button.set_tooltip_text(Some("正在刷新"));
-                        let _ = wake.try_send(());
-                    }
-                });
-
-                bind_metric_action(
-                    metric_card,
-                    &card_cfg.id,
-                    self.config.clone(),
-                    self.action_inbox.clone(),
-                    self.handle.clone(),
-                    self.runtime.clone(),
-                    self.shutdown.clone(),
-                );
-            }
-
-            let source_key = source_key_for(card_cfg.source.as_ref());
-            let sampling_consumer_key = next_sampling_consumer_key();
-            let source_node_key = source_node_key(&source_key, card_cfg, sampling_consumer_key);
-            self.card_metas.borrow_mut().insert(
-                card_cfg.id.clone(),
-                CardMeta {
-                    page_id: page_id.to_string(),
-                    interval_secs: card_cfg.refresh_interval,
-                    source_key,
-                    source_node_key,
-                    config_epoch: self.config_epoch.get(),
-                    sampling_consumer_key,
-                },
-            );
-
-            self.scheduler.borrow_mut().register_with_policy(
-                &card_cfg.id,
-                card_cfg.refresh_interval,
-                page_id,
-                task_policy(card_cfg),
-            );
-        }
-
-        for action_cfg in &page_actions {
-            let icon = action_cfg.icon.as_deref().unwrap_or("system-run-symbolic");
-            let action_id = action_cfg.id.clone();
-            let action_inbox = self.action_inbox.clone();
-            let handle = self.handle.clone();
-            let shutdown = self.shutdown.clone();
-            let config = self.config.clone();
-            let resolve_config = config.clone();
-            let dialog_runtime = self.runtime.clone();
-            let response_runtime = self.runtime.clone();
-            let dialog_lease = Rc::new(RefCell::new(None));
-            let open_lease = dialog_lease.clone();
-            let close_lease = dialog_lease.clone();
-
-            page.add_action_card_with_resolver(
-                &action_id,
-                &action_cfg.name,
-                action_cfg.description.as_deref().unwrap_or(""),
-                icon,
-                move |id| {
-                    current_action_config(&resolve_config, id).map(|action| {
-                        let (title, detail) = action_confirmation_text(&action);
-                        (action.confirm, title, detail)
-                    })
-                },
-                move |id| {
-                    let Some(cfg) = current_action_config(&config, id) else {
-                        tracing::warn!(action = %id, "action was removed by config reload");
-                        return;
-                    };
-                    execute_action_async(
-                        cfg,
-                        action_inbox.clone(),
-                        handle.clone(),
-                        config.clone(),
-                        shutdown.clone(),
-                        None,
-                    );
-                },
-                move || {
-                    open_lease.replace(Some(
-                        dialog_runtime.begin_interaction(Duration::from_secs(300)),
-                    ));
-                },
-                move || {
-                    close_lease.borrow_mut().take();
-                    response_runtime.report_user_activity(UserActivity::Dialog);
-                },
-            );
-        }
-
-        if page_id == "settings" {
-            self.add_settings_content(page);
-        }
-    }
-
-    fn add_settings_content(&self, page: &mut Page) {
+    fn add_settings_content_with_context(context: &PageBuildContext, page: &mut Page) {
         let status_card = GtkBox::new(Orientation::Horizontal, 10);
         status_card.set_hexpand(true);
         status_card.set_overflow(gtk::Overflow::Hidden);
@@ -1272,7 +1287,7 @@ impl MonitorWindow {
 
         page.flow_insert(&status_card);
 
-        let runtime_cfg = self.config.borrow().config().runtime.clone();
+        let runtime_cfg = context.config.borrow().config().runtime.clone();
         let (inhibit_row, inhibit_dropdown) = setting_dropdown_row(
             "屏幕常亮策略",
             "常亮与刷新、空闲视觉独立；推荐仅窗口活动时抑制熄屏",
@@ -1284,8 +1299,8 @@ impl MonitorWindow {
             },
         );
         {
-            let config = self.config.clone();
-            let runtime = self.runtime.clone();
+            let config = context.config.clone();
+            let runtime = context.runtime.clone();
             inhibit_dropdown.connect_selected_notify(move |dropdown| {
                 let mut config = config.borrow_mut();
                 config.config_mut().runtime.screen_inhibit = match dropdown.selected() {
@@ -1299,6 +1314,33 @@ impl MonitorWindow {
             });
         }
         page.flow_insert(&inhibit_row);
+
+        let (suspend_row, suspend_dropdown) = setting_dropdown_row(
+            "系统挂起策略",
+            "阻止系统自动睡眠或挂起；会增加耗电，仅在需要持续监控时开启",
+            &["从不", "窗口活动时", "窗口已映射时"],
+            match runtime_cfg.suspend_inhibit {
+                SuspendInhibitMode::Never => 0,
+                SuspendInhibitMode::WhileActive => 1,
+                SuspendInhibitMode::WhileMapped => 2,
+            },
+        );
+        {
+            let config = context.config.clone();
+            let runtime = context.runtime.clone();
+            suspend_dropdown.connect_selected_notify(move |dropdown| {
+                let mut config = config.borrow_mut();
+                config.config_mut().runtime.suspend_inhibit = match dropdown.selected() {
+                    0 => SuspendInhibitMode::Never,
+                    2 => SuspendInhibitMode::WhileMapped,
+                    _ => SuspendInhibitMode::WhileActive,
+                };
+                let next = config.config().runtime.clone();
+                let _ = config.save();
+                runtime.update_config(next);
+            });
+        }
+        page.flow_insert(&suspend_row);
 
         let runtime_section = Label::new(Some("运行与省电"));
         runtime_section.set_halign(Align::Start);
@@ -1331,8 +1373,8 @@ impl MonitorWindow {
                 .last_child()
                 .and_then(|widget| widget.downcast::<gtk::Switch>().ok())
                 .expect("setting switch row");
-            let config = self.config.clone();
-            let runtime = self.runtime.clone();
+            let config = context.config.clone();
+            let runtime = context.runtime.clone();
             switch.connect_active_notify(move |switch| {
                 let mut config = config.borrow_mut();
                 let value = switch.is_active();
@@ -1424,8 +1466,8 @@ impl MonitorWindow {
             ),
         ] {
             let (row, spin) = setting_spin_row(title, description, value, min, max);
-            let config = self.config.clone();
-            let runtime = self.runtime.clone();
+            let config = context.config.clone();
+            let runtime = context.runtime.clone();
             spin.connect_value_changed(move |spin| {
                 let value = spin.value().round().max(0.0) as u64;
                 let mut config = config.borrow_mut();
@@ -1477,8 +1519,8 @@ impl MonitorWindow {
             },
         );
         {
-            let config = self.config.clone();
-            let runtime = self.runtime.clone();
+            let config = context.config.clone();
+            let runtime = context.runtime.clone();
             display_dropdown.connect_selected_notify(move |dropdown| {
                 let mut config = config.borrow_mut();
                 config.config_mut().runtime.idle_view = match dropdown.selected() {
@@ -1498,7 +1540,7 @@ impl MonitorWindow {
             .last_child()
             .and_then(|widget| widget.downcast::<gtk::Label>().ok())
             .expect("runtime status label");
-        let runtime_rx = self.runtime.subscribe();
+        let runtime_rx = context.runtime.subscribe();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(snapshot) = runtime_rx.recv().await {
                 status_value.set_text(&format!(
@@ -1560,7 +1602,7 @@ impl MonitorWindow {
         section.set_margin_top(8);
         page.flow_insert(&section);
 
-        let builtin_cards: Vec<CardConfig> = self
+        let builtin_cards: Vec<CardConfig> = context
             .config
             .borrow()
             .config()
@@ -1574,6 +1616,7 @@ impl MonitorWindow {
             })
             .cloned()
             .collect();
+        let refresh_bindings = context.refresh_bindings();
 
         for card in builtin_cards {
             let row = GtkBox::new(Orientation::Horizontal, 12);
@@ -1614,22 +1657,26 @@ impl MonitorWindow {
             toggle.set_valign(Align::Center);
             toggle.set_active(card.enabled);
             let card_id = card.id.clone();
-            let config = self.config.clone();
-            let action_inbox = self.action_inbox.clone();
-            let action_handle = self.handle.clone();
-            let shutdown = self.shutdown.clone();
-            let pages = self.pages.clone();
-            let scheduler = self.scheduler.clone();
-            let card_metas = self.card_metas.clone();
-            let previous_results = self.previous_results.clone();
-            let scheduler_wake = self.scheduler_wake.clone();
-            let current_page_id = self.current_page_id.clone();
-            let runtime = self.runtime.clone();
-            let refresh = self.refresh.clone();
-            let file_monitors = self.file_monitors.clone();
-            let file_fallback = self.file_fallback.clone();
-            let source_nodes = self.source_nodes.clone();
-            let config_epoch = self.config_epoch.clone();
+            let config = context.config.clone();
+            let action_context = ActionContext {
+                config: context.config.clone(),
+                completion_tx: context.action_completion_tx.clone(),
+                handle: context.handle.clone(),
+                runtime: context.runtime.clone(),
+                shutdown: context.shutdown.clone(),
+                cancellation: context.cancellation.clone(),
+            };
+            let pages = context.pages.clone();
+            let scheduler = context.scheduler.clone();
+            let card_metas = context.card_metas.clone();
+            let previous_results = context.previous_results.clone();
+            let scheduler_wake = context.scheduler_wake.clone();
+            let current_page_id = context.current_page_id.clone();
+            let runtime = context.runtime.clone();
+            let refresh = context.refresh.clone();
+            let source_nodes = context.source_nodes.clone();
+            let config_epoch = context.config_epoch.clone();
+            let refresh_bindings = refresh_bindings.clone();
             toggle.connect_active_notify(move |switch| {
                 let mut config_manager = config.borrow_mut();
                 let changed_card = config_manager
@@ -1670,11 +1717,7 @@ impl MonitorWindow {
                                     bind_metric_action(
                                         metric_card,
                                         &card.id,
-                                        config.clone(),
-                                        action_inbox.clone(),
-                                        action_handle.clone(),
-                                        runtime.clone(),
-                                        shutdown.clone(),
+                                        action_context.clone(),
                                     );
                                     let scheduler = scheduler.clone();
                                     let wake = scheduler_wake.clone();
@@ -1727,16 +1770,7 @@ impl MonitorWindow {
                         refresh.borrow_mut().unbind_task(&card.id);
                     }
                     prune_source_nodes(&source_nodes, &card_metas);
-                    install_file_monitors(
-                        &file_monitors,
-                        &file_fallback,
-                        &cards_for_watchers,
-                        refresh.clone(),
-                        scheduler.clone(),
-                        scheduler_wake.clone(),
-                        card_metas.clone(),
-                        source_nodes.clone(),
-                    );
+                    install_file_monitors(&refresh_bindings, &cards_for_watchers);
                 }
             });
             row.append(&toggle);
@@ -1746,9 +1780,10 @@ impl MonitorWindow {
         let refresh_btn = Button::with_label("刷新全部指标");
         refresh_btn.add_css_class("pill");
         refresh_btn.set_halign(Align::Center);
-        let scheduler = self.scheduler.clone();
-        let wake = self.scheduler_wake.clone();
-        let runtime = self.runtime.clone();
+        refresh_btn.update_property(&[gtk::accessible::Property::Label("刷新全部指标")]);
+        let scheduler = context.scheduler.clone();
+        let wake = context.scheduler_wake.clone();
+        let runtime = context.runtime.clone();
         refresh_btn.connect_clicked(move |_| {
             runtime.report_user_activity(UserActivity::ManualRefresh);
             scheduler.borrow_mut().request_all_now();
@@ -1840,7 +1875,9 @@ impl MonitorWindow {
         }
 
         let modules_path_buf = config_modules_dir();
-        let _ = std::fs::create_dir_all(&modules_path_buf);
+        if let Err(error) = crate::core::config::ensure_private_directory(&modules_path_buf) {
+            tracing::warn!(%error, "failed to secure configuration modules directory for monitoring");
+        }
         let mut monitors = Vec::new();
         if let Ok(monitor) = gio::File::for_path(&config_path_buf)
             .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
@@ -1856,19 +1893,9 @@ impl MonitorWindow {
             return;
         }
 
-        let config_ref = self.config.clone();
+        let page_context = self.page_build_context();
+        let config_ref = page_context.config.clone();
         let reload_guard = self.reload_guard.clone();
-        let runtime = self.runtime.clone();
-        let previous_results = self.previous_results.clone();
-        let scheduler = self.scheduler.clone();
-        let scheduler_wake = self.scheduler_wake.clone();
-        let card_metas = self.card_metas.clone();
-        let source_nodes = self.source_nodes.clone();
-        let file_monitors = self.file_monitors.clone();
-        let file_fallback = self.file_fallback.clone();
-        let refresh = self.refresh.clone();
-        let max_output_budget = self.max_output_budget.clone();
-        let config_epoch = self.config_epoch.clone();
 
         let reload: Rc<dyn Fn(gio::FileMonitorEvent)> = Rc::new(move |event_type| {
             // Keep monitors installed after a true -> false transition so the
@@ -1887,18 +1914,8 @@ impl MonitorWindow {
                     | gio::FileMonitorEvent::Renamed
             ) {
                 let guard = reload_guard.clone();
-                let cfg = config_ref.clone();
-                let runtime = runtime.clone();
-                let previous_results = previous_results.clone();
-                let scheduler = scheduler.clone();
-                let scheduler_wake = scheduler_wake.clone();
-                let card_metas = card_metas.clone();
-                let source_nodes = source_nodes.clone();
-                let file_monitors = file_monitors.clone();
-                let file_fallback = file_fallback.clone();
-                let refresh = refresh.clone();
-                let max_output_budget = max_output_budget.clone();
-                let config_epoch = config_epoch.clone();
+                let context = page_context.clone();
+                let cfg = context.config.clone();
 
                 let should_schedule;
                 {
@@ -1918,181 +1935,31 @@ impl MonitorWindow {
                         drop(last);
                         let (previous, previous_effective) = {
                             let manager = cfg.borrow();
-                            let raw = manager.config().clone();
-                            let mut effective = raw.clone();
-                            effective.cards =
-                                effective_cards(&raw, manager.uses_default_card_registry());
-                            (raw, effective)
+                            effective_config_snapshot(&manager)
                         };
                         if do_reload_config(&cfg) {
-                            let (next, next_effective) = {
-                                let manager = cfg.borrow();
-                                let raw = manager.config().clone();
-                                let mut effective = raw.clone();
-                                effective.cards =
-                                    effective_cards(&raw, manager.uses_default_card_registry());
-                                (raw, effective)
-                            };
-                            apply_output_budget_change(
-                                &previous,
-                                &next,
-                                &max_output_budget,
-                                &scheduler,
-                                &scheduler_wake,
-                                &card_metas,
-                                &source_nodes,
-                            );
-                            let changed = changed_card_ids(&previous_effective, &next_effective);
-                            for card_id in &changed {
-                                previous_results.borrow_mut().remove(card_id);
-                                invalidate_changed_source_keys(
-                                    &previous_effective,
-                                    &next_effective,
-                                    card_id,
-                                    &source_nodes,
-                                );
-                            }
-                            if !changed.is_empty() {
-                                let next_epoch = config_epoch.get().wrapping_add(1);
-                                reconcile_scheduler_cards(
-                                    &scheduler,
-                                    &card_metas,
-                                    &source_nodes,
-                                    &previous_effective,
-                                    &next_effective,
-                                    &changed,
-                                    next_epoch,
-                                );
-                                rebind_refresh_sources(
-                                    &refresh,
-                                    &previous_effective,
-                                    &next_effective,
-                                    &changed,
-                                );
-                                install_file_monitors(
-                                    &file_monitors,
-                                    &file_fallback,
-                                    &next_effective.cards,
-                                    refresh.clone(),
-                                    scheduler.clone(),
-                                    scheduler_wake.clone(),
-                                    card_metas.clone(),
-                                    source_nodes.clone(),
-                                );
-                                config_epoch.set(next_epoch);
-                            }
-                            for card_id in changed {
-                                if next_effective.cards.iter().any(|card| {
-                                    card.id == card_id && card.enabled && card.schedule.is_none()
-                                }) {
-                                    let _ = scheduler.borrow_mut().request_config_reload(&card_id);
-                                }
-                            }
-                            let _ = scheduler_wake.try_send(());
-                            runtime.update_config(next.runtime);
+                            apply_config_reload(&context, previous, previous_effective);
                         }
                     }
                 }
 
                 if let Some(remaining_ms) = should_schedule {
                     let cfg2 = cfg.clone();
-                    let runtime2 = runtime.clone();
-                    let previous_results2 = previous_results.clone();
-                    let scheduler2 = scheduler.clone();
-                    let scheduler_wake2 = scheduler_wake.clone();
-                    let card_metas2 = card_metas.clone();
-                    let source_nodes2 = source_nodes.clone();
-                    let file_monitors2 = file_monitors.clone();
-                    let file_fallback2 = file_fallback.clone();
-                    let refresh2 = refresh.clone();
-                    let max_output_budget2 = max_output_budget.clone();
-                    let config_epoch2 = config_epoch.clone();
+                    let context2 = context.clone();
                     let sid_cell = guard.source_id.clone();
 
                     let sid_cell_for_timer = sid_cell.clone();
                     let sid = glib::timeout_add_local(
-                        Duration::from_millis(remaining_ms + 50),
+                        Duration::from_millis(remaining_ms.saturating_add(50)),
                         move || {
                             sid_cell_for_timer.borrow_mut().take();
                             guard.pending.replace(false);
                             let (previous, previous_effective) = {
                                 let manager = cfg2.borrow();
-                                let raw = manager.config().clone();
-                                let mut effective = raw.clone();
-                                effective.cards =
-                                    effective_cards(&raw, manager.uses_default_card_registry());
-                                (raw, effective)
+                                effective_config_snapshot(&manager)
                             };
                             if do_reload_config(&cfg2) {
-                                let (next, next_effective) = {
-                                    let manager = cfg2.borrow();
-                                    let raw = manager.config().clone();
-                                    let mut effective = raw.clone();
-                                    effective.cards =
-                                        effective_cards(&raw, manager.uses_default_card_registry());
-                                    (raw, effective)
-                                };
-                                apply_output_budget_change(
-                                    &previous,
-                                    &next,
-                                    &max_output_budget2,
-                                    &scheduler2,
-                                    &scheduler_wake2,
-                                    &card_metas2,
-                                    &source_nodes2,
-                                );
-                                let changed =
-                                    changed_card_ids(&previous_effective, &next_effective);
-                                for card_id in &changed {
-                                    previous_results2.borrow_mut().remove(card_id);
-                                    invalidate_changed_source_keys(
-                                        &previous_effective,
-                                        &next_effective,
-                                        card_id,
-                                        &source_nodes2,
-                                    );
-                                }
-                                if !changed.is_empty() {
-                                    let next_epoch = config_epoch2.get().wrapping_add(1);
-                                    reconcile_scheduler_cards(
-                                        &scheduler2,
-                                        &card_metas2,
-                                        &source_nodes2,
-                                        &previous_effective,
-                                        &next_effective,
-                                        &changed,
-                                        next_epoch,
-                                    );
-                                    rebind_refresh_sources(
-                                        &refresh2,
-                                        &previous_effective,
-                                        &next_effective,
-                                        &changed,
-                                    );
-                                    install_file_monitors(
-                                        &file_monitors2,
-                                        &file_fallback2,
-                                        &next_effective.cards,
-                                        refresh2.clone(),
-                                        scheduler2.clone(),
-                                        scheduler_wake2.clone(),
-                                        card_metas2.clone(),
-                                        source_nodes2.clone(),
-                                    );
-                                    config_epoch2.set(next_epoch);
-                                }
-                                for card_id in changed {
-                                    if next_effective.cards.iter().any(|card| {
-                                        card.id == card_id
-                                            && card.enabled
-                                            && card.schedule.is_none()
-                                    }) {
-                                        let _ =
-                                            scheduler2.borrow_mut().request_config_reload(&card_id);
-                                    }
-                                }
-                                let _ = scheduler_wake2.try_send(());
-                                runtime2.update_config(next.runtime);
+                                apply_config_reload(&context2, previous, previous_effective);
                             }
                             glib::ControlFlow::Break
                         },
@@ -2135,7 +2002,9 @@ impl MonitorWindow {
         let source_nodes = self.source_nodes.clone();
         let max_output_budget = self.max_output_budget.clone();
         let metric_inbox = self.metric_inbox.clone();
+        let metric_completion_tx = self.metric_completion_tx.clone();
         let shutdown = self.shutdown.clone();
+        let cancellation = self.cancellation.clone();
         glib::MainContext::default().spawn_local(async move {
             loop {
                 if shutdown.load(Ordering::Acquire) {
@@ -2178,10 +2047,14 @@ impl MonitorWindow {
 
                     scheduler.borrow_mut().mark_started(&card_id);
 
-                    let cfg = config.borrow();
-                    let use_default_cards = cfg.uses_default_card_registry();
-                    let card_cfg = effective_card_config(cfg.config(), &card_id, use_default_cards);
-                    drop(cfg);
+                    let card_cfg = {
+                        let cfg = config.borrow();
+                        effective_card_config(
+                            cfg.config(),
+                            &card_id,
+                            cfg.uses_default_card_registry(),
+                        )
+                    };
 
                     let card_cfg = match card_cfg {
                         Some(c) => c,
@@ -2213,6 +2086,8 @@ impl MonitorWindow {
                     let epoch = meta.config_epoch;
                     let invalidation_generation = cache::invalidation_token(&source_key);
                     let inbox = metric_inbox.clone();
+                    let completion_tx = metric_completion_tx.clone();
+                    let task_cancellation = cancellation.clone();
                     let h = handle.clone();
                     let ctx = metric_ctx.clone();
                     let nodes = source_nodes.clone();
@@ -2252,56 +2127,68 @@ impl MonitorWindow {
                     let schedule_state = match schedule {
                         Some(Ok(state)) => Some(state),
                         Some(Err(error)) => {
-                            publish_metric(
+                            let update = MetricUpdate {
+                                completion_id: next_metric_completion_id(),
+                                card_id,
+                                page_id: meta.page_id,
+                                source_key: source_key.clone(),
+                                source_revision,
+                                revision_key: revision_key.clone(),
+                                config_epoch: epoch,
+                                task_generation,
+                                result: MetricResult::error(error),
+                                collection_health: CollectionHealth::Failed,
+                                max_output_bytes: max_output,
+                                invalidation_generation,
+                                interval_secs: meta.interval_secs,
+                                next_delay: None,
+                                next_deadline: None,
+                            };
+                            let _ = publish_metric_completion(
                                 &inbox,
-                                MetricUpdate {
-                                    card_id,
-                                    page_id: meta.page_id,
-                                    source_key: source_key.clone(),
-                                    source_revision,
-                                    revision_key: revision_key.clone(),
-                                    config_epoch: epoch,
-                                    task_generation,
-                                    result: MetricResult::error(error),
-                                    collection_health: CollectionHealth::Failed,
-                                    max_output_bytes: max_output,
-                                    invalidation_generation,
-                                    interval_secs: meta.interval_secs,
-                                    next_delay: None,
-                                    next_deadline: None,
-                                },
-                            );
+                                &completion_tx,
+                                update,
+                                &task_cancellation,
+                            )
+                            .await;
                             continue;
                         }
                         None => None,
                     };
                     let schedule_deadline = schedule_state.as_ref().map(|schedule| {
-                        Instant::now() + Duration::from_secs(schedule.next_delay_seconds.max(1))
+                        Instant::now()
+                            .checked_add(Duration::from_secs(schedule.next_delay_seconds.max(1)))
+                            .unwrap_or_else(Instant::now)
                     });
 
                     // Scheduled data is immutable within one configured time slot. Load it
                     // from disk instead of repeating external requests after every launch.
                     if let Some(schedule) = &schedule_state {
                         if schedule.period.is_none() {
-                            publish_metric(
+                            let update = MetricUpdate {
+                                completion_id: next_metric_completion_id(),
+                                card_id,
+                                page_id: meta.page_id,
+                                source_key: source_key.clone(),
+                                source_revision,
+                                revision_key: revision_key.clone(),
+                                invalidation_generation,
+                                config_epoch: epoch,
+                                task_generation,
+                                result: MetricResult::unavailable("等待第一个计划更新时间"),
+                                collection_health: CollectionHealth::Failed,
+                                max_output_bytes: max_output,
+                                interval_secs: schedule.next_delay_seconds,
+                                next_delay: None,
+                                next_deadline: schedule_deadline,
+                            };
+                            let _ = publish_metric_completion(
                                 &inbox,
-                                MetricUpdate {
-                                    card_id,
-                                    page_id: meta.page_id,
-                                    source_key: source_key.clone(),
-                                    source_revision,
-                                    revision_key: revision_key.clone(),
-                                    invalidation_generation,
-                                    config_epoch: epoch,
-                                    task_generation,
-                                    result: MetricResult::unavailable("等待第一个计划更新时间"),
-                                    collection_health: CollectionHealth::Failed,
-                                    max_output_bytes: max_output,
-                                    interval_secs: schedule.next_delay_seconds,
-                                    next_delay: None,
-                                    next_deadline: schedule_deadline,
-                                },
-                            );
+                                &completion_tx,
+                                update,
+                                &task_cancellation,
+                            )
+                            .await;
                             continue;
                         }
                     }
@@ -2315,15 +2202,45 @@ impl MonitorWindow {
                     let cache_lookup_enabled =
                         cacheable_source || schedule_state.is_some() || cache_ttl.is_some();
                     let task_shutdown = shutdown.clone();
+                    let collection_node = match source.as_ref() {
+                        Some(source) => {
+                            source_node_for(&collect_source_key, &node_key, source, &nodes)
+                                .map_err(MetricResult::error)
+                        }
+                        None => Err(unconfigured_metric_result()),
+                    };
+                    let collection_gate = collection_node
+                        .as_ref()
+                        .ok()
+                        .map(|node| node.collect_gate.clone());
+                    let collection_requested_at = Instant::now();
                     h.spawn(async move {
                         if task_shutdown.load(Ordering::Acquire) {
                             return;
                         }
                         let collection_budget = budget_source.load(Ordering::Acquire).max(1);
                         let cache_lookup_key = cache_source_key.clone();
-                        let (mut result, cache_hit) = tokio::task::spawn_blocking(move || {
-                            if cache_lookup_enabled {
-                                let cached = if let Some(schedule) = &cache_lookup_schedule {
+                        // Both waits happen in the async scheduler task. No
+                        // blocking-pool thread is consumed while a shared
+                        // source is already being sampled.
+                        let _source_gate = match collection_gate {
+                            Some(gate) => Some(tokio::select! {
+                                guard = gate.lock_owned() => guard,
+                                _ = task_cancellation.cancelled() => return,
+                            }),
+                            None => None,
+                        };
+                        // Cache I/O is bounded and short-lived. Do it before
+                        // acquiring the source-collection permit so a cache
+                        // hit never consumes a local blocking slot.
+                        let cached = if cache_lookup_enabled {
+                            let Some(_cache_permit) =
+                                acquire_permit(CACHE_IO_PERMITS.clone(), &task_cancellation).await
+                            else {
+                                return;
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(schedule) = &cache_lookup_schedule {
                                     schedule.period.as_deref().and_then(|period| {
                                         cache::load_with_budget(
                                             &cache_lookup_key,
@@ -2341,33 +2258,73 @@ impl MonitorWindow {
                                             collection_budget,
                                         )
                                     })
-                                };
-                                if let Some(result) = cached {
-                                    return (result, true);
                                 }
-                            }
-                            crate::core::power_debug::increment(
-                                crate::core::power_debug::Counter::CardCollect,
-                            );
-                            (
-                                collect_card_metric(
-                                    &collect_source_key,
-                                    &node_key,
-                                    &source,
-                                    &ctx,
-                                    &nodes,
-                                    collection_budget,
-                                ),
-                                false,
-                            )
-                        })
-                        .await
-                        .unwrap_or_else(|e| {
-                            (
-                                MetricResult::error(format!("metric task panicked: {}", e)),
-                                false,
-                            )
-                        });
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        } else {
+                            None
+                        };
+                        let (mut result, cache_hit) = if let Some(result) = cached {
+                            (result, true)
+                        } else {
+                            let result = match collection_node {
+                                Ok(node) => {
+                                    // Async HTTP collectors do not occupy the
+                                    // local blocking lane. File/builtin
+                                    // collectors acquire the bounded permit
+                                    // only immediately before entering
+                                    // spawn_blocking.
+                                    let async_collection = node.is_async();
+                                    let collection_permit = if async_collection {
+                                        None
+                                    } else {
+                                        let Some(permit) = acquire_permit(
+                                            BLOCKING_COLLECTION_PERMITS.clone(),
+                                            &task_cancellation,
+                                        )
+                                        .await
+                                        else {
+                                            return;
+                                        };
+                                        Some(permit)
+                                    };
+                                    crate::core::power_debug::increment(
+                                        crate::core::power_debug::Counter::CardCollect,
+                                    );
+                                    let result =
+                                        if async_collection {
+                                            node.collect_async(
+                                                &ctx,
+                                                collection_budget,
+                                                collection_requested_at,
+                                            )
+                                            .await
+                                        } else {
+                                            tokio::task::spawn_blocking(move || {
+                                                node.collect(
+                                                    &ctx,
+                                                    collection_budget,
+                                                    collection_requested_at,
+                                                )
+                                            })
+                                            .await
+                                            .unwrap_or_else(|error| {
+                                                MetricResult::error(format!(
+                                                    "metric task panicked: {}",
+                                                    error
+                                                ))
+                                            })
+                                        };
+                                    drop(collection_permit);
+                                    result
+                                }
+                                Err(result) => result,
+                            };
+                            (result, false)
+                        };
+                        drop(_source_gate);
                         if task_shutdown.load(Ordering::Acquire) {
                             return;
                         }
@@ -2376,25 +2333,30 @@ impl MonitorWindow {
                                 .as_ref()
                                 .map(|schedule| schedule.next_delay_seconds)
                                 .unwrap_or(meta.interval_secs);
-                            publish_metric(
+                            let update = MetricUpdate {
+                                completion_id: next_metric_completion_id(),
+                                card_id,
+                                page_id: meta.page_id.clone(),
+                                source_key,
+                                source_revision,
+                                revision_key,
+                                config_epoch: epoch,
+                                task_generation,
+                                invalidation_generation,
+                                collection_health: CollectionHealth::cache_hit(),
+                                max_output_bytes: collection_budget,
+                                result,
+                                interval_secs: interval,
+                                next_delay: None,
+                                next_deadline: schedule_deadline,
+                            };
+                            let _ = publish_metric_completion(
                                 &inbox,
-                                MetricUpdate {
-                                    card_id,
-                                    page_id: meta.page_id.clone(),
-                                    source_key,
-                                    source_revision,
-                                    revision_key,
-                                    config_epoch: epoch,
-                                    task_generation,
-                                    invalidation_generation,
-                                    collection_health: CollectionHealth::cache_hit(),
-                                    max_output_bytes: collection_budget,
-                                    result,
-                                    interval_secs: interval,
-                                    next_delay: None,
-                                    next_deadline: schedule_deadline,
-                                },
-                            );
+                                &completion_tx,
+                                update,
+                                &task_cancellation,
+                            )
+                            .await;
                             return;
                         }
                         let collection_health = metric_result_collection_health(&result);
@@ -2402,43 +2364,77 @@ impl MonitorWindow {
                         if cache_allowed
                             && (cacheable_source || schedule_state.is_some() || cache_ttl.is_some())
                         {
-                            let cache_key = format!("cache:{cache_source_key}");
+                            let cache_key = cache::diagnostic_key(&cache_source_key);
                             let period = schedule_state
                                 .as_ref()
-                                .and_then(|state| state.period.as_deref());
+                                .and_then(|state| state.period.as_deref())
+                                .map(str::to_owned);
                             if collection_health.is_healthy()
                                 && cache::result_within_output_budget(&result, collection_budget)
                             {
-                                match cache::store_if_current(
-                                    &cache_source_key,
-                                    period,
-                                    &result,
-                                    cache_token,
-                                ) {
-                                    Ok(true) => crate::core::error_limiter::recovered(&cache_key),
-                                    Ok(false) => {
+                                let Some(_cache_permit) =
+                                    acquire_permit(CACHE_IO_PERMITS.clone(), &task_cancellation)
+                                        .await
+                                else {
+                                    return;
+                                };
+                                let store_key = cache_source_key.clone();
+                                let store_result = result.clone();
+                                let store_period = period.clone();
+                                let store = tokio::task::spawn_blocking(move || {
+                                    cache::store_if_current(
+                                        &store_key,
+                                        store_period.as_deref(),
+                                        &store_result,
+                                        cache_token,
+                                    )
+                                })
+                                .await;
+                                match store {
+                                    Ok(Ok(true)) => {
+                                        crate::core::error_limiter::recovered(&cache_key)
+                                    }
+                                    Ok(Ok(false)) => {
                                         // A source edge won the race with this
                                         // worker. Keep the cache dirty so the
                                         // follow-up cannot replay this result.
                                     }
-                                    Err(error) => crate::core::error_limiter::warn(
+                                    Ok(Err(error)) => crate::core::error_limiter::warn(
                                         cache_key.clone(),
                                         format!("failed to persist source cache: {error}"),
                                     ),
+                                    Err(error) => crate::core::error_limiter::warn(
+                                        cache_key.clone(),
+                                        format!("source cache worker failed: {error}"),
+                                    ),
                                 }
-                            } else if let Some(last_good) =
-                                cache::load_last_good_with_max_age_and_budget(
-                                    &cache_source_key,
-                                    Some(cache::DEFAULT_LAST_GOOD_MAX_STALENESS_SECONDS),
-                                    period,
-                                    collection_budget,
-                                )
-                            {
-                                // Preserve the last-good visible value after a
-                                // transient command/HTTP/file failure. The
-                                // stale state remains explicit in the model,
-                                // while collection_health keeps backoff.
-                                result = last_good;
+                            } else {
+                                let Some(_cache_permit) =
+                                    acquire_permit(CACHE_IO_PERMITS.clone(), &task_cancellation)
+                                        .await
+                                else {
+                                    return;
+                                };
+                                let fallback_key = cache_source_key.clone();
+                                let fallback_period = period.clone();
+                                let fallback = tokio::task::spawn_blocking(move || {
+                                    cache::load_last_good_with_max_age_and_budget(
+                                        &fallback_key,
+                                        Some(cache::DEFAULT_LAST_GOOD_MAX_STALENESS_SECONDS),
+                                        fallback_period.as_deref(),
+                                        collection_budget,
+                                    )
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Some(last_good) = fallback {
+                                    // Preserve the last-good visible value after
+                                    // a transient command/HTTP/file failure. The
+                                    // stale state remains explicit in the model,
+                                    // while collection_health keeps backoff.
+                                    result = last_good;
+                                }
                             }
                         }
 
@@ -2449,38 +2445,43 @@ impl MonitorWindow {
                             meta.interval_secs
                         };
 
-                        publish_metric(
-                            &inbox,
-                            MetricUpdate {
-                                card_id,
-                                page_id,
-                                source_key,
-                                source_revision,
-                                revision_key,
-                                config_epoch: epoch,
-                                task_generation,
-                                invalidation_generation,
-                                collection_health,
-                                max_output_bytes: collection_budget,
-                                next_delay: if needs_initial_follow_up
-                                    && result.state == MetricState::Loading
-                                {
-                                    Some(Duration::from_millis(250))
-                                } else {
-                                    None
-                                },
-                                result,
-                                interval_secs: interval,
-                                next_deadline: schedule_deadline,
+                        let update = MetricUpdate {
+                            completion_id: next_metric_completion_id(),
+                            card_id,
+                            page_id,
+                            source_key,
+                            source_revision,
+                            revision_key,
+                            config_epoch: epoch,
+                            task_generation,
+                            invalidation_generation,
+                            collection_health,
+                            max_output_bytes: collection_budget,
+                            next_delay: if needs_initial_follow_up
+                                && result.state == MetricState::Loading
+                            {
+                                Some(Duration::from_millis(250))
+                            } else {
+                                None
                             },
-                        );
+                            result,
+                            interval_secs: interval,
+                            next_deadline: schedule_deadline,
+                        };
+                        let _ = publish_metric_completion(
+                            &inbox,
+                            &completion_tx,
+                            update,
+                            &task_cancellation,
+                        )
+                        .await;
                     });
                 }
             }
         });
     }
 
-    fn start_metric_receiver(&self, wake_rx: async_channel::Receiver<()>) {
+    fn start_metric_receiver(&self, completion_rx: async_channel::Receiver<MetricCompletion>) {
         let pages = self.pages.clone();
         let previous_results = self.previous_results.clone();
         let scheduler = self.scheduler.clone();
@@ -2492,47 +2493,55 @@ impl MonitorWindow {
         let inbox = self.metric_inbox.clone();
 
         glib::MainContext::default().spawn_local(async move {
-            while wake_rx.recv().await.is_ok() {
-                let updates = inbox.take_batch(MAX_UI_UPDATES_PER_TURN);
-                if updates.is_empty() {
-                    continue;
+            while let Ok(first) = completion_rx.recv().await {
+                let mut completions = Vec::with_capacity(MAX_UI_UPDATES_PER_TURN);
+                completions.push(first);
+                while completions.len() < MAX_UI_UPDATES_PER_TURN {
+                    match completion_rx.try_recv() {
+                        Ok(completion) => completions.push(completion),
+                        Err(async_channel::TryRecvError::Empty)
+                        | Err(async_channel::TryRecvError::Closed) => break,
+                    }
                 }
-                let batch_size = updates.len();
+                let batch_size = completions.len();
                 let batch_started = Instant::now();
-                for update in updates {
+                for completion in completions {
                     // A reload may replace a running task with a new
                     // generation under the same card id. Its old worker must
                     // not complete or reschedule the replacement task.
-                    if scheduler.borrow().generation(&update.card_id)
-                        != Some(update.task_generation)
+                    if scheduler.borrow().generation(&completion.card_id)
+                        != Some(completion.task_generation)
                     {
+                        if inbox
+                            .latest(&completion.card_id)
+                            .is_some_and(|update| update.completion_id == completion.completion_id)
+                        {
+                            inbox.remove(&completion.card_id);
+                        }
                         continue;
                     }
-                    let meta = match card_metas.borrow().get(&update.card_id) {
-                        Some(m) => CardMeta {
-                            page_id: m.page_id.clone(),
-                            interval_secs: m.interval_secs,
-                            source_key: m.source_key.clone(),
-                            source_node_key: m.source_node_key.clone(),
-                            config_epoch: m.config_epoch,
-                            sampling_consumer_key: m.sampling_consumer_key,
-                        },
-                        None => continue,
+                    let (meta_source_key, meta_config_epoch) = {
+                        let metas = card_metas.borrow();
+                        let Some(meta) = metas.get(&completion.card_id) else {
+                            inbox.remove(&completion.card_id);
+                            continue;
+                        };
+                        (meta.source_key.clone(), meta.config_epoch)
                     };
-                    let current_revision = update
+                    let current_revision = completion
                         .revision_key
                         .as_deref()
                         .map(|key| refresh.borrow().revision(&SourceKey::new(key.to_owned())));
-                    if update.config_epoch != meta.config_epoch
-                        || update.source_key != meta.source_key
-                        || update.max_output_bytes
+                    if completion.config_epoch != meta_config_epoch
+                        || completion.source_key != meta_source_key
+                        || completion.max_output_bytes
                             != max_output_budget.load(Ordering::Acquire).max(1)
                         || !cache::matches_invalidation_generation(
-                            &update.source_key,
-                            update.invalidation_generation,
+                            &completion.source_key,
+                            completion.invalidation_generation,
                         )
                         || current_revision
-                            .is_some_and(|revision| update.source_revision < revision)
+                            .is_some_and(|revision| completion.source_revision < revision)
                     {
                         // A stale worker still has to complete its scheduler
                         // slot; pending source revisions then produce one
@@ -2540,12 +2549,50 @@ impl MonitorWindow {
                         scheduler
                             .borrow_mut()
                             .mark_done_after_revision_with_deadline(
-                                &update.card_id,
-                                update.interval_secs,
-                                update.collection_health.is_healthy(),
+                                &completion.card_id,
+                                completion.interval_secs,
+                                completion.collection_health.is_healthy(),
                                 None,
-                                update.next_deadline,
-                                update.source_revision,
+                                completion.next_deadline,
+                                completion.source_revision,
+                            );
+                        let _ = scheduler_wake.try_send(());
+                        if inbox
+                            .latest(&completion.card_id)
+                            .is_some_and(|update| update.completion_id == completion.completion_id)
+                        {
+                            inbox.remove(&completion.card_id);
+                        }
+                        continue;
+                    }
+
+                    // A newer completion may already have replaced this
+                    // card's presentation value. Finalize this completion
+                    // regardless, but project only the newest matching value.
+                    let Some(update) = inbox.latest(&completion.card_id) else {
+                        scheduler
+                            .borrow_mut()
+                            .mark_done_after_revision_with_deadline(
+                                &completion.card_id,
+                                completion.interval_secs,
+                                completion.collection_health.is_healthy(),
+                                completion.next_delay,
+                                completion.next_deadline,
+                                completion.source_revision,
+                            );
+                        let _ = scheduler_wake.try_send(());
+                        continue;
+                    };
+                    if update.completion_id != completion.completion_id {
+                        scheduler
+                            .borrow_mut()
+                            .mark_done_after_revision_with_deadline(
+                                &completion.card_id,
+                                completion.interval_secs,
+                                completion.collection_health.is_healthy(),
+                                completion.next_delay,
+                                completion.next_deadline,
+                                completion.source_revision,
                             );
                         let _ = scheduler_wake.try_send(());
                         continue;
@@ -2555,7 +2602,7 @@ impl MonitorWindow {
                         let cfg = config.borrow();
                         effective_card_config(
                             cfg.config(),
-                            &update.card_id,
+                            &completion.card_id,
                             cfg.uses_default_card_registry(),
                         )
                     };
@@ -2563,7 +2610,7 @@ impl MonitorWindow {
 
                     let should_skip = {
                         let prev = previous_results.borrow();
-                        if let Some(last) = prev.get(&update.card_id) {
+                        if let Some(last) = prev.get(&completion.card_id) {
                             results_equivalent(last, &update.result, display.as_ref())
                         } else {
                             false
@@ -2571,7 +2618,7 @@ impl MonitorWindow {
                     };
 
                     if let Some(page) = pages.borrow_mut().get_mut(&update.page_id) {
-                        if let Some(card) = page.get_metric_card(&update.card_id) {
+                        if let Some(card) = page.get_metric_card(&completion.card_id) {
                             card.set_refresh_pending(false);
                         }
                     }
@@ -2589,27 +2636,28 @@ impl MonitorWindow {
                         let apply_elapsed = apply_started.elapsed();
                         if apply_elapsed >= Duration::from_millis(100) {
                             tracing::warn!(
-                                card = %update.card_id,
+                                card = %completion.card_id,
                                 elapsed_ms = apply_elapsed.as_millis() as u64,
                                 "metric GTK projection exceeded budget"
                             );
                         }
                         previous_results
                             .borrow_mut()
-                            .insert(update.card_id.clone(), update.result.clone());
+                            .insert(completion.card_id.clone(), update.result.clone());
                     }
 
                     scheduler
                         .borrow_mut()
                         .mark_done_after_revision_with_deadline(
-                            &update.card_id,
-                            update.interval_secs,
-                            update.collection_health.is_healthy(),
-                            update.next_delay,
-                            update.next_deadline,
-                            update.source_revision,
+                            &completion.card_id,
+                            completion.interval_secs,
+                            completion.collection_health.is_healthy(),
+                            completion.next_delay,
+                            completion.next_deadline,
+                            completion.source_revision,
                         );
                     let _ = scheduler_wake.try_send(());
+                    inbox.remove(&completion.card_id);
                 }
                 let batch_elapsed = batch_started.elapsed();
                 if batch_elapsed >= Duration::from_millis(100) {
@@ -2620,18 +2668,13 @@ impl MonitorWindow {
                         "metric GTK update batch exceeded budget"
                     );
                 }
-                if inbox.has_pending() {
-                    inbox.wake();
-                    // Bound the amount of GTK work performed in one main-loop
-                    // turn so a burst of completions cannot starve input or
-                    // frame-clock processing.
-                    glib::timeout_future(Duration::from_millis(1)).await;
-                }
+                // The completion channel is the wakeup source. Waiting for
+                // the next completion naturally yields to GTK input/frame
+                // processing after each bounded batch.
             }
         });
     }
-
-    fn start_action_receiver(&self, wake_rx: async_channel::Receiver<()>) {
+    fn start_action_receiver(&self, completion_rx: async_channel::Receiver<ActionUpdate>) {
         let pages = self.pages.clone();
         let runtime = self.runtime.clone();
         let config = self.config.clone();
@@ -2640,25 +2683,27 @@ impl MonitorWindow {
         let scheduler_wake = self.scheduler_wake.clone();
         let refresh = self.refresh.clone();
         let source_nodes = self.source_nodes.clone();
-        let inbox = self.action_inbox.clone();
-        let completed = Rc::new(RefCell::new(InvocationDedup {
-            seen: std::collections::HashSet::new(),
-            order: std::collections::VecDeque::new(),
-        }));
 
         glib::MainContext::default().spawn_local(async move {
-            while wake_rx.recv().await.is_ok() {
-                let updates = inbox.take_batch(MAX_UI_UPDATES_PER_TURN);
-                if updates.is_empty() {
-                    continue;
+            while let Ok(first) = completion_rx.recv().await {
+                let mut updates = Vec::with_capacity(MAX_UI_UPDATES_PER_TURN);
+                updates.push(first);
+                while updates.len() < MAX_UI_UPDATES_PER_TURN {
+                    match completion_rx.try_recv() {
+                        Ok(update) => updates.push(update),
+                        Err(async_channel::TryRecvError::Empty)
+                        | Err(async_channel::TryRecvError::Closed) => break,
+                    }
                 }
                 let batch_size = updates.len();
                 let batch_started = Instant::now();
                 for update in updates {
-                    if !completed.borrow_mut().insert(update.invocation_id) {
-                        continue;
-                    }
-
+                    tracing::debug!(
+                        action = %update.action_id,
+                        invocation = update.invocation_id,
+                        success = update.result.success,
+                        "action invocation completed"
+                    );
                     // Action completion is a generic relationship lookup: any
                     // enabled card linked through click_action is invalidated,
                     // whether visible, hidden, or on another page. Failure is
@@ -2714,16 +2759,24 @@ impl MonitorWindow {
                             }
                         }
                     }
-                    for (_page_id, page) in pages.borrow_mut().iter_mut() {
+                    // An action definition can be rendered on more than one
+                    // page. The action itself is single-flight, but every
+                    // visible control must leave its busy state when the one
+                    // invocation completes. Show one dialog only; otherwise a
+                    // shared action would produce duplicate modal windows.
+                    let mut dialog_shown = false;
+                    for page in pages.borrow_mut().values_mut() {
                         if let Some(card) = page.get_action_card(&update.action_id) {
                             card.set_running(false);
-                            show_action_result_dialog(
-                                &card.card,
-                                &update.action_id,
-                                &update.result,
-                                runtime.clone(),
-                            );
-                            break;
+                            if !dialog_shown {
+                                show_action_result_dialog(
+                                    &card.card,
+                                    &update.action_id,
+                                    &update.result,
+                                    runtime.clone(),
+                                );
+                                dialog_shown = true;
+                            }
                         }
                     }
                 }
@@ -2732,13 +2785,9 @@ impl MonitorWindow {
                     tracing::warn!(
                         batch = batch_size,
                         elapsed_ms = batch_elapsed.as_millis() as u64,
-                        pending = inbox.len(),
+                        pending = completion_rx.len(),
                         "action GTK update batch exceeded budget"
                     );
-                }
-                if inbox.has_pending() {
-                    inbox.wake();
-                    glib::timeout_future(Duration::from_millis(1)).await;
                 }
             }
         });
@@ -2756,8 +2805,10 @@ impl Drop for MonitorWindow {
         // the same explicit boundary because RuntimeManager is also retained
         // by those consumers.
         self.metric_inbox.close();
-        self.action_inbox.close();
+        self.metric_completion_tx.close();
+        self.action_completion_tx.close();
         self.scheduler_wake.close();
+        self.cancellation.cancel();
         self.shutdown.store(true, Ordering::Release);
         self.runtime.shutdown();
 
@@ -2800,10 +2851,17 @@ fn effective_cards(config: &AppConfig, use_default_cards: bool) -> Vec<CardConfi
     // layer over the shipped registry, and removing an override reveals the
     // shipped card again rather than deleting its runtime metadata.
     let mut cards = default_builtin_cards();
-    for configured in config.cards.iter().filter(|card| card.enabled) {
-        if let Some(existing) = cards.iter_mut().find(|card| card.id == configured.id) {
-            *existing = configured.clone();
-        } else {
+    for configured in &config.cards {
+        if let Some(index) = cards.iter().position(|card| card.id == configured.id) {
+            if configured.enabled {
+                cards[index] = configured.clone();
+            } else {
+                // A disabled module entry is an explicit opt-out of a
+                // shipped default card. Filtering disabled entries before the
+                // merge would silently resurrect the default on every reload.
+                cards.remove(index);
+            }
+        } else if configured.enabled {
             cards.push(configured.clone());
         }
     }
@@ -2926,6 +2984,421 @@ fn bind_card_refresh_sources(coordinator: &mut RefreshCoordinator, card: &CardCo
     if card.source.as_ref().and_then(SourceConfig::builtin_metric) == Some("cpu_temperature") {
         coordinator.bind("signal:thermal", card.id.clone());
     }
+}
+
+impl PageBuildContext {
+    fn refresh_bindings(&self) -> RefreshBindingContext {
+        RefreshBindingContext {
+            file_monitors: self.file_monitors.clone(),
+            file_fallback: self.file_fallback.clone(),
+            refresh: self.refresh.clone(),
+            scheduler: self.scheduler.clone(),
+            scheduler_wake: self.scheduler_wake.clone(),
+            card_metas: self.card_metas.clone(),
+            source_nodes: self.source_nodes.clone(),
+        }
+    }
+
+    fn populate_page(
+        &self,
+        page: &mut Page,
+        page_id: &str,
+        all_cards: &[CardConfig],
+        all_actions: &[crate::core::config::ActionConfig],
+    ) {
+        let mut page_cards: Vec<&CardConfig> = all_cards
+            .iter()
+            .filter(|card| card.page == page_id)
+            .collect();
+        page_cards.sort_by_key(|card| card.order);
+
+        let mut page_actions: Vec<&crate::core::config::ActionConfig> = all_actions
+            .iter()
+            .filter(|action| action.page == page_id && action.visible)
+            .collect();
+        page_actions.sort_by_key(|action| action.id.as_str());
+
+        for card_cfg in &page_cards {
+            if card_cfg.kind.is_some() {
+                let (presentation, presentation_rx) =
+                    crate::plugins::CardPresentationHandle::channel();
+                let plugin_context = crate::plugins::PluginContext {
+                    handle: self.handle.clone(),
+                    presentation: Some(presentation.clone()),
+                    runtime: self.runtime.clone(),
+                    cancellation: self.cancellation.clone(),
+                };
+                match crate::plugins::build_card(&plugin_context, card_cfg) {
+                    Ok(Some(widget)) => {
+                        page.add_plugin_card(
+                            &card_cfg.id,
+                            &widget,
+                            card_cfg.display.as_ref(),
+                            presentation,
+                        );
+                        let pages = Rc::downgrade(&self.pages);
+                        let page_id = page_id.to_string();
+                        let card_id = card_cfg.id.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            while let Ok(request) = presentation_rx.recv().await {
+                                let Some(pages) = pages.upgrade() else {
+                                    break;
+                                };
+                                let mut pages = pages.borrow_mut();
+                                if let Some(page) = pages.get_mut(&page_id) {
+                                    page.set_plugin_card_presentation(&card_id, request);
+                                }
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(card = %card_cfg.id, %error, "plugin card skipped");
+                    }
+                }
+                continue;
+            }
+
+            let model = CardModel {
+                id: card_cfg.id.clone(),
+                title: card_cfg.title.clone(),
+                subtitle: card_cfg.description.clone(),
+                icon: card_cfg.icon.clone(),
+                renderer: card_cfg.renderer,
+                state: CardState::Loading,
+                value: CardValue::Text("加载中...".into()),
+                tooltip: None,
+                cached: false,
+                columns_after: card_cfg
+                    .display
+                    .as_ref()
+                    .and_then(|display| display.columns_after),
+                columns: card_cfg
+                    .display
+                    .as_ref()
+                    .and_then(|display| display.columns),
+            };
+            page.add_metric_card(&model, card_cfg.display.as_ref());
+            if let Some(metric_card) = page.get_metric_card(&card_cfg.id) {
+                let scheduler = self.scheduler.clone();
+                let wake = self.scheduler_wake.clone();
+                let card_id = card_cfg.id.clone();
+                let refresh_runtime = self.runtime.clone();
+                metric_card.refresh_btn.connect_clicked(move |button| {
+                    refresh_runtime.report_user_activity(UserActivity::ManualRefresh);
+                    if scheduler.borrow_mut().request_now(&card_id) {
+                        button.set_sensitive(false);
+                        button.set_tooltip_text(Some("正在刷新"));
+                        let _ = wake.try_send(());
+                    }
+                });
+
+                bind_metric_action(
+                    metric_card,
+                    &card_cfg.id,
+                    ActionContext {
+                        config: self.config.clone(),
+                        completion_tx: self.action_completion_tx.clone(),
+                        handle: self.handle.clone(),
+                        runtime: self.runtime.clone(),
+                        shutdown: self.shutdown.clone(),
+                        cancellation: self.cancellation.clone(),
+                    },
+                );
+            }
+
+            let source_key = source_key_for(card_cfg.source.as_ref());
+            let sampling_consumer_key = next_sampling_consumer_key();
+            let source_node_key = source_node_key(&source_key, card_cfg, sampling_consumer_key);
+            self.card_metas.borrow_mut().insert(
+                card_cfg.id.clone(),
+                CardMeta {
+                    page_id: page_id.to_string(),
+                    interval_secs: card_cfg.refresh_interval,
+                    source_key,
+                    source_node_key,
+                    config_epoch: self.config_epoch.get(),
+                    sampling_consumer_key,
+                },
+            );
+
+            self.scheduler.borrow_mut().register_with_policy(
+                &card_cfg.id,
+                card_cfg.refresh_interval,
+                page_id,
+                task_policy(card_cfg),
+            );
+        }
+
+        for action_cfg in &page_actions {
+            let icon = action_cfg.icon.as_deref().unwrap_or("system-run-symbolic");
+            let action_id = action_cfg.id.clone();
+            let action_inbox = self.action_completion_tx.clone();
+            let handle = self.handle.clone();
+            let shutdown = self.shutdown.clone();
+            let cancellation = self.cancellation.clone();
+            let config = self.config.clone();
+            let resolve_config = config.clone();
+            let dialog_runtime = self.runtime.clone();
+            let response_runtime = self.runtime.clone();
+            let dialog_lease = Rc::new(RefCell::new(None));
+            let open_lease = dialog_lease.clone();
+            let close_lease = dialog_lease.clone();
+
+            let callbacks = crate::ui::action_card::ActionCardCallbacks::new(
+                move |id| {
+                    current_action_config(&resolve_config, id).map(|action| {
+                        let (title, detail) = action_confirmation_text(&action);
+                        (action.confirm, title, detail)
+                    })
+                },
+                move |id| {
+                    let Some(cfg) = current_action_config(&config, id) else {
+                        tracing::warn!(action = %id, "action was removed by config reload");
+                        return false;
+                    };
+                    execute_action_async(
+                        cfg,
+                        action_inbox.clone(),
+                        handle.clone(),
+                        config.clone(),
+                        shutdown.clone(),
+                        cancellation.clone(),
+                        None,
+                    )
+                },
+                move || {
+                    open_lease.replace(Some(
+                        dialog_runtime.begin_interaction(Duration::from_secs(300)),
+                    ));
+                },
+                move || {
+                    close_lease.borrow_mut().take();
+                    response_runtime.report_user_activity(UserActivity::Dialog);
+                },
+            );
+            page.add_action_card(
+                &action_id,
+                &action_cfg.name,
+                action_cfg.description.as_deref().unwrap_or(""),
+                icon,
+                callbacks,
+            );
+        }
+
+        if page_id == "settings" {
+            MonitorWindow::add_settings_content_with_context(self, page);
+        }
+    }
+}
+
+/// Rebuild the complete page graph at one lifecycle boundary. This is used
+/// for structural configuration changes (pages/cards/actions/UI), so a reload
+/// cannot leave a GTK widget tree, scheduler registration, and metadata map
+/// describing different configurations. Old workers may still complete; the
+/// monotonic scheduler generation and per-card epoch make those completions
+/// harmlessly stale.
+fn rebuild_pages(context: &PageBuildContext) {
+    let (mut pages_list, mut cards, actions, ui, preferred, use_default_pages) = {
+        let config = context.config.borrow();
+        let app = config.config();
+        (
+            effective_pages(app, config.uses_default_page_registry()),
+            effective_cards(app, config.uses_default_card_registry()),
+            app.actions.clone(),
+            app.ui.clone(),
+            app.ui.default_page.clone(),
+            config.uses_default_page_registry(),
+        )
+    };
+    pages_list.sort_by_key(|page| page.order);
+    cards.sort_by_key(|card| card.order);
+    let previous_page = context
+        .view_stack
+        .visible_child_name()
+        .map(|name| name.to_string());
+
+    context.card_style_registry.borrow_mut().begin_batch();
+    context.card_style_registry.borrow_mut().clear();
+    while let Some(child) = context.view_stack.first_child() {
+        context.view_stack.remove(&child);
+    }
+    context.pages.borrow_mut().clear();
+    context.card_metas.borrow_mut().clear();
+    context.previous_results.borrow_mut().clear();
+    context.scheduler.borrow_mut().clear();
+    if let Ok(mut nodes) = context.source_nodes.lock() {
+        nodes.clear();
+    }
+    context.refresh.borrow_mut().clear();
+
+    for card in &cards {
+        bind_card_refresh_sources(&mut context.refresh.borrow_mut(), card);
+    }
+    let refresh_bindings = context.refresh_bindings();
+    install_file_monitors(&refresh_bindings, &cards);
+
+    let plugin_context = crate::plugins::PluginContext {
+        handle: context.handle.clone(),
+        presentation: None,
+        runtime: context.runtime.clone(),
+        cancellation: context.cancellation.clone(),
+    };
+    let mut page_ids = Vec::with_capacity(pages_list.len());
+    for page_cfg in &pages_list {
+        match crate::plugins::build_page(&plugin_context, page_cfg) {
+            Ok(Some(container)) => {
+                context
+                    .view_stack
+                    .add_titled(&container, Some(&page_cfg.id), &page_cfg.title);
+                page_ids.push(page_cfg.id.clone());
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(page = %page_cfg.id, %error, "plugin page skipped");
+                continue;
+            }
+        }
+
+        let mut page = Page::new(&page_cfg.id, &ui, context.card_style_registry.clone());
+        page.set_available_height(context.view_stack.height());
+        page.set_compact_grid(context.compact_grid.get());
+        context.populate_page(&mut page, &page_cfg.id, &cards, &actions);
+        context
+            .view_stack
+            .add_titled(&page.container, Some(&page_cfg.id), &page_cfg.title);
+        context.pages.borrow_mut().insert(page_cfg.id.clone(), page);
+        page_ids.push(page_cfg.id.clone());
+    }
+
+    let selected = previous_page
+        .filter(|id| page_ids.iter().any(|candidate| candidate == id))
+        .or_else(|| page_ids.iter().find(|id| **id == preferred).cloned())
+        .or_else(|| page_ids.first().cloned());
+    if let Some(selected) = selected {
+        context.view_stack.set_visible_child_name(&selected);
+        *context.current_page_id.borrow_mut() = selected;
+    } else {
+        context.current_page_id.borrow_mut().clear();
+    }
+    context
+        .scheduler
+        .borrow_mut()
+        .set_active_page(&context.current_page_id.borrow());
+    prune_source_nodes(&context.source_nodes, &context.card_metas);
+    context.card_style_registry.borrow_mut().end_batch();
+    let _ = context.scheduler_wake.try_send(());
+    tracing::info!(
+        pages = page_ids.len(),
+        cards = cards.len(),
+        default_page_registry = use_default_pages,
+        "reconciled GTK page graph"
+    );
+}
+
+fn effective_config_snapshot(config: &ConfigManager) -> (AppConfig, AppConfig) {
+    let raw = config.config().clone();
+    let mut effective = raw.clone();
+    effective.cards = effective_cards(&raw, config.uses_default_card_registry());
+    effective.pages = effective_pages(&raw, config.uses_default_page_registry());
+    (raw, effective)
+}
+
+fn serialized_changed<T: serde::Serialize>(previous: &T, next: &T) -> bool {
+    match (serde_json::to_vec(previous), serde_json::to_vec(next)) {
+        (Ok(previous), Ok(next)) => previous != next,
+        (Err(_), _) | (_, Err(_)) => true,
+    }
+}
+
+fn page_graph_changed(previous: &AppConfig, next: &AppConfig) -> bool {
+    serialized_changed(&previous.cards, &next.cards)
+        || serialized_changed(&previous.pages, &next.pages)
+        || serialized_changed(&previous.actions, &next.actions)
+        || serialized_changed(&previous.ui, &next.ui)
+}
+
+/// Apply one successfully loaded configuration snapshot. Keeping this
+/// transition in a single function is important: the file monitor can emit a
+/// burst of Changed/Created/Renamed events, and every path must perform the
+/// same generation invalidation, scheduler update, UI reconciliation, and
+/// runtime update.
+fn apply_config_reload(
+    context: &PageBuildContext,
+    _previous: AppConfig,
+    previous_effective: AppConfig,
+) {
+    let (next, next_effective) = {
+        let config = context.config.borrow();
+        effective_config_snapshot(&config)
+    };
+    apply_output_budget_change(
+        &previous_effective,
+        &next_effective,
+        &context.max_output_budget,
+        &context.scheduler,
+        &context.scheduler_wake,
+        &context.card_metas,
+        &context.source_nodes,
+    );
+
+    let changed = changed_card_ids(&previous_effective, &next_effective);
+    for card_id in &changed {
+        context.previous_results.borrow_mut().remove(card_id);
+        invalidate_changed_source_keys(
+            &previous_effective,
+            &next_effective,
+            card_id,
+            &context.source_nodes,
+        );
+    }
+
+    if page_graph_changed(&previous_effective, &next_effective) {
+        let next_epoch = context.config_epoch.get().wrapping_add(1);
+        context.config_epoch.set(next_epoch);
+        rebuild_pages(context);
+    } else if !changed.is_empty() {
+        // Retain the lighter path for future non-visual card changes. Current
+        // card descriptors are part of the page graph, but keeping this branch
+        // makes scheduler/source reconciliation correct if that split changes.
+        let next_epoch = context.config_epoch.get().wrapping_add(1);
+        reconcile_scheduler_cards(
+            &context.scheduler,
+            &context.card_metas,
+            &context.source_nodes,
+            &previous_effective,
+            &next_effective,
+            &changed,
+            next_epoch,
+        );
+        rebind_refresh_sources(
+            &context.refresh,
+            &previous_effective,
+            &next_effective,
+            &changed,
+        );
+        let refresh_bindings = context.refresh_bindings();
+        install_file_monitors(&refresh_bindings, &next_effective.cards);
+        context.config_epoch.set(next_epoch);
+        for card_id in changed {
+            if next_effective
+                .cards
+                .iter()
+                .any(|card| card.id == card_id && card.enabled && card.schedule.is_none())
+            {
+                let _ = context
+                    .scheduler
+                    .borrow_mut()
+                    .request_config_reload(&card_id);
+            }
+        }
+        let _ = context.scheduler_wake.try_send(());
+    }
+
+    context.window.set_title(Some(&next.app.title));
+    crate::reload_log_filter(&next.app.log_level);
+    context.runtime.update_config(next.runtime);
 }
 
 fn reconcile_scheduler_cards(
@@ -3072,18 +3545,9 @@ fn source_key_for(source: Option<&SourceConfig>) -> String {
     }
 }
 
-fn install_file_monitors(
-    file_monitors: &Rc<RefCell<Vec<gio::FileMonitor>>>,
-    file_fallback: &Rc<RefCell<Option<glib::SourceId>>>,
-    cards: &[CardConfig],
-    refresh: Rc<RefCell<RefreshCoordinator>>,
-    scheduler: Rc<RefCell<Scheduler>>,
-    wake: async_channel::Sender<()>,
-    card_metas: Rc<RefCell<HashMap<String, CardMeta>>>,
-    source_nodes: Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
-) {
-    file_monitors.borrow_mut().clear();
-    if let Some(source) = file_fallback.borrow_mut().take() {
+fn install_file_monitors(context: &RefreshBindingContext, cards: &[CardConfig]) {
+    context.file_monitors.borrow_mut().clear();
+    if let Some(source) = context.file_fallback.borrow_mut().take() {
         source.remove();
     }
     let mut watched = std::collections::HashSet::new();
@@ -3107,11 +3571,11 @@ fn install_file_monitors(
         else {
             continue;
         };
-        let refresh = refresh.clone();
-        let scheduler = scheduler.clone();
-        let wake = wake.clone();
-        let card_metas = card_metas.clone();
-        let source_nodes = source_nodes.clone();
+        let refresh = context.refresh.clone();
+        let scheduler = context.scheduler.clone();
+        let wake = context.scheduler_wake.clone();
+        let card_metas = context.card_metas.clone();
+        let source_nodes = context.source_nodes.clone();
         let cards = cards
             .iter()
             .filter(|card| card.enabled)
@@ -3155,22 +3619,29 @@ fn install_file_monitors(
                 }
             }
         });
-        file_monitors.borrow_mut().push(monitor);
+        context.file_monitors.borrow_mut().push(monitor);
     }
 
     let mut source_keys = cards
         .iter()
-        .filter(|card| card.enabled)
-        .filter_map(|card| {
-            card.source
-                .as_ref()
-                .is_some_and(|source| matches!(source, SourceConfig::File(_)))
-                .then(|| source_key_for(card.source.as_ref()))
+        .filter(|card| {
+            card.enabled
+                && card
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| matches!(source, SourceConfig::File(_)))
         })
+        .map(|card| source_key_for(card.source.as_ref()))
         .collect::<Vec<_>>();
     source_keys.sort();
     source_keys.dedup();
     if !source_keys.is_empty() {
+        let refresh = context.refresh.clone();
+        let scheduler = context.scheduler.clone();
+        let wake = context.scheduler_wake.clone();
+        let card_metas = context.card_metas.clone();
+        let source_nodes = context.source_nodes.clone();
+        let file_fallback = context.file_fallback.clone();
         let source = glib::timeout_add_local(Duration::from_secs(60), move || {
             for key in &source_keys {
                 publish_source_event(
@@ -3350,28 +3821,23 @@ fn prune_source_nodes(
     cache::prune(&active_source_keys);
 }
 
-fn collect_card_metric(
+fn unconfigured_metric_result() -> MetricResult {
+    MetricResult {
+        value: CardValue::Text("等待配置...".into()),
+        subtitle: None,
+        tooltip: Some("此卡片未配置数据源".into()),
+        state: MetricState::Unavailable,
+        cached: false,
+        metadata: None,
+    }
+}
+
+fn source_node_for(
     source_key: &str,
     node_key: &str,
-    source: &Option<SourceConfig>,
-    ctx: &Arc<MetricContext>,
+    source: &SourceConfig,
     source_nodes: &Arc<Mutex<HashMap<String, Arc<SourceNode>>>>,
-    max_output: usize,
-) -> MetricResult {
-    let source = match source {
-        Some(s) => s,
-        None => {
-            return MetricResult {
-                value: CardValue::Text("等待配置...".into()),
-                subtitle: None,
-                tooltip: Some("此卡片未配置数据源".into()),
-                state: MetricState::Unavailable,
-                cached: false,
-                metadata: None,
-            }
-        }
-    };
-
+) -> Result<Arc<SourceNode>, String> {
     match source {
         SourceConfig::Builtin(metric_name) => {
             let node = {
@@ -3381,9 +3847,7 @@ fn collect_card_metric(
                 } else {
                     let metric = match create_builtin_metric(metric_name) {
                         Some(metric) => metric,
-                        None => {
-                            return MetricResult::error(format!("未知的内置指标: {metric_name}"));
-                        }
+                        None => return Err(format!("未知的内置指标: {metric_name}")),
                     };
                     let node = Arc::new(SourceNode::new(
                         SourceCollector::Builtin(metric),
@@ -3393,7 +3857,7 @@ fn collect_card_metric(
                     node
                 }
             };
-            node.collect(ctx, max_output)
+            Ok(node)
         }
 
         SourceConfig::Command(_)
@@ -3405,31 +3869,28 @@ fn collect_card_metric(
                 if let Some(node) = registry.get(node_key).cloned() {
                     node
                 } else {
-                    let source = match build_persistent_source(source) {
-                        Ok(source) => source,
-                        Err(result) => return result,
-                    };
+                    let source = build_persistent_source(source)?;
                     let node = Arc::new(SourceNode::new(
-                        SourceCollector::Persistent(source),
+                        SourceCollector::Persistent(Box::new(source)),
                         source_key.to_string(),
                     ));
                     registry.insert(node_key.to_string(), node.clone());
                     node
                 }
             };
-            node.collect(ctx, max_output)
+            Ok(node)
         }
     }
 }
 
-fn build_persistent_source(source: &SourceConfig) -> Result<PersistentSource, MetricResult> {
+fn build_persistent_source(source: &SourceConfig) -> Result<PersistentSource, String> {
     match source {
         SourceConfig::Command(command) => {
             let (program, args) = command
                 .run
                 .split_first()
                 .map(|(program, args)| (program.clone(), args.to_vec()))
-                .ok_or_else(|| MetricResult::error("command.run 至少需要一个程序名"))?;
+                .ok_or_else(|| "command.run 至少需要一个程序名".to_string())?;
             let max_out = command.max_output_bytes.max(1);
 
             Ok(PersistentSource::Command(CommandMetric::new(
@@ -3459,16 +3920,18 @@ fn build_persistent_source(source: &SourceConfig) -> Result<PersistentSource, Me
             )))
         }
         SourceConfig::Text(value) => Ok(PersistentSource::Static(MetricResult {
-            value: CardValue::Text(value.clone()),
+            // Configuration accepts a larger source budget so the file can
+            // remain useful as a human-readable document, but a static value
+            // must still obey the smaller budget once it enters the UI/cache
+            // pipeline.
+            value: CardValue::Text(bounded_text(value, MAX_UI_TEXT_BYTES)),
             subtitle: None,
             tooltip: None,
             state: MetricState::Normal,
             cached: false,
             metadata: None,
         })),
-        SourceConfig::Builtin(_) => {
-            Err(MetricResult::error("内置数据源不能作为通用持久数据源构建"))
-        }
+        SourceConfig::Builtin(_) => Err("内置数据源不能作为通用持久数据源构建".to_string()),
     }
 }
 
@@ -3633,10 +4096,10 @@ fn update_idle_clock(time: &gtk::Label, status: &gtk::Label) {
     let slot = ((now.timestamp() / 300).rem_euclid(5)) as i32;
     let horizontal = [0, 8, -8, 4, -4][slot as usize];
     let vertical = [0, -6, 6, 3, -3][slot as usize];
-    time.set_margin_start(horizontal.max(0) as i32);
-    time.set_margin_end((-horizontal).max(0) as i32);
-    time.set_margin_top(vertical.max(0) as i32);
-    status.set_margin_bottom((-vertical).max(0) as i32);
+    time.set_margin_start(horizontal.max(0));
+    time.set_margin_end((-horizontal).max(0));
+    time.set_margin_top(vertical.max(0));
+    status.set_margin_bottom((-vertical).max(0));
 }
 
 fn metric_result_collection_health(result: &MetricResult) -> CollectionHealth {
@@ -3763,41 +4226,32 @@ fn current_card_action(
 }
 
 fn execute_card_action(
-    config: &Rc<RefCell<ConfigManager>>,
+    context: &ActionContext,
     card_id: &str,
-    action_inbox: &Arc<LatestInbox<ActionUpdate>>,
-    handle: &tokio::runtime::Handle,
-    shutdown: Arc<AtomicBool>,
     result_card_id: Option<String>,
-    set_running: Option<&Rc<dyn Fn(bool)>>,
-) {
-    let Some(action_cfg) = current_card_action(config, card_id) else {
+) -> bool {
+    let Some(action_cfg) = current_card_action(&context.config, card_id) else {
         tracing::warn!(card = %card_id, "card click action is no longer configured");
-        return;
+        return false;
     };
-    if let Some(set_running) = set_running {
-        set_running(true);
-    }
     execute_action_async(
         action_cfg,
-        action_inbox.clone(),
-        handle.clone(),
-        config.clone(),
-        shutdown,
+        context.completion_tx.clone(),
+        context.handle.clone(),
+        context.config.clone(),
+        context.shutdown.clone(),
+        context.cancellation.clone(),
         result_card_id,
-    );
+    )
 }
 
 fn bind_metric_action(
     metric_card: &crate::ui::metric_card::MetricCard,
     card_id: &str,
-    config: Rc<RefCell<ConfigManager>>,
-    action_inbox: Arc<LatestInbox<ActionUpdate>>,
-    handle: tokio::runtime::Handle,
-    runtime: RuntimeHandle,
-    shutdown: Arc<AtomicBool>,
+    context: ActionContext,
 ) {
-    let has_click_action = config
+    let has_click_action = context
+        .config
         .borrow()
         .config()
         .cards
@@ -3819,11 +4273,12 @@ fn bind_metric_action(
         Rc::new(move |running| controls.set_running(running)) as Rc<dyn Fn(bool)>
     });
     if let Some(controls) = action_controls {
-        let config = config.clone();
-        let action_inbox = action_inbox.clone();
-        let handle = handle.clone();
-        let shutdown = shutdown.clone();
-        let runtime = runtime.clone();
+        let config = context.config.clone();
+        let action_inbox = context.completion_tx.clone();
+        let handle = context.handle.clone();
+        let shutdown = context.shutdown.clone();
+        let cancellation = context.cancellation.clone();
+        let runtime = context.runtime.clone();
         let card_id = card_id.to_owned();
         let set_running = set_running.clone();
         controls.button.connect_clicked(move |button| {
@@ -3833,23 +4288,32 @@ fn bind_metric_action(
                 return;
             };
             let (confirm_title, confirm_detail) = action_confirmation_text(&action);
+            let run_runtime = runtime.clone();
             let run = {
                 let config = config.clone();
                 let action_inbox = action_inbox.clone();
                 let handle = handle.clone();
                 let shutdown = shutdown.clone();
+                let cancellation = cancellation.clone();
                 let card_id = card_id.clone();
                 let set_running = set_running.clone();
                 move || {
-                    execute_card_action(
-                        &config,
+                    if execute_card_action(
+                        &ActionContext {
+                            config: config.clone(),
+                            completion_tx: action_inbox.clone(),
+                            handle: handle.clone(),
+                            runtime: run_runtime,
+                            shutdown: shutdown.clone(),
+                            cancellation: cancellation.clone(),
+                        },
                         &card_id,
-                        &action_inbox,
-                        &handle,
-                        shutdown,
                         Some(card_id.clone()),
-                        set_running.as_ref(),
-                    );
+                    ) {
+                        if let Some(set_running) = set_running.as_ref() {
+                            set_running(true);
+                        }
+                    }
                 }
             };
             if action.confirm {
@@ -3870,11 +4334,8 @@ fn bind_metric_action(
     metric_card.card.set_cursor_from_name(Some("pointer"));
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
-    let config_for_click = config.clone();
-    let action_inbox_for_click = action_inbox.clone();
-    let handle_for_click = handle.clone();
-    let shutdown_for_click = shutdown.clone();
-    let runtime_for_click = runtime.clone();
+    let context_for_click = context.clone();
+    let runtime_for_click = context.runtime.clone();
     let card_id_for_click = card_id.to_owned();
     let set_running_for_click = set_running.clone();
     click.connect_released(move |gesture, presses, x, y| {
@@ -3891,28 +4352,22 @@ fn bind_metric_action(
             return;
         }
         runtime_for_click.report_user_activity(UserActivity::Click);
-        let Some(action) = current_card_action(&config_for_click, &card_id_for_click) else {
+        let Some(action) = current_card_action(&context_for_click.config, &card_id_for_click)
+        else {
             tracing::warn!(card = %card_id_for_click, "card click action is no longer configured");
             return;
         };
         let (confirm_title, confirm_detail) = action_confirmation_text(&action);
         let run = {
-            let config = config_for_click.clone();
-            let action_inbox = action_inbox_for_click.clone();
-            let handle = handle_for_click.clone();
-            let shutdown = shutdown_for_click.clone();
+            let context = context_for_click.clone();
             let card_id = card_id_for_click.clone();
             let set_running = set_running_for_click.clone();
             move || {
-                execute_card_action(
-                    &config,
-                    &card_id,
-                    &action_inbox,
-                    &handle,
-                    shutdown,
-                    Some(card_id.clone()),
-                    set_running.as_ref(),
-                );
+                if execute_card_action(&context, &card_id, Some(card_id.clone())) {
+                    if let Some(set_running) = set_running.as_ref() {
+                        set_running(true);
+                    }
+                }
             }
         };
         if action.confirm {
@@ -3932,15 +4387,23 @@ fn bind_metric_action(
 
 fn execute_action_async(
     action_cfg: crate::core::config::ActionConfig,
-    inbox: Arc<LatestInbox<ActionUpdate>>,
+    completion_tx: async_channel::Sender<ActionUpdate>,
     handle: tokio::runtime::Handle,
     config: Rc<RefCell<ConfigManager>>,
     shutdown: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     result_card_id: Option<String>,
-) {
+) -> bool {
     static NEXT_ACTION_INVOCATION: AtomicU64 = AtomicU64::new(1);
     let invocation_id = NEXT_ACTION_INVOCATION.fetch_add(1, Ordering::Relaxed);
     let action_id = action_cfg.id.clone();
+    let Some(action_lease) = acquire_action(&action_id) else {
+        tracing::info!(action = %action_id, invocation = invocation_id, "action invocation coalesced while another run is active");
+        return false;
+    };
+    // Claim the single-flight lease before the UI enters the busy state. A
+    // second surface invoking the same action is rejected synchronously and
+    // must not clear the first surface's spinner through a synthetic error.
     let command_parts = action_cfg.command.clone().unwrap_or_default();
     let timeout = action_cfg.timeout;
     // Read the global cap at invocation time so an app-only hot reload also
@@ -3960,31 +4423,30 @@ fn execute_action_async(
             exit_code: -1,
             message: "未配置命令".to_string(),
         };
-        publish_action(
-            &inbox,
-            ActionUpdate {
-                action_id,
-                invocation_id,
-                result_card_id,
-                result,
-            },
-        );
-        return;
+        let update = ActionUpdate {
+            action_id,
+            invocation_id,
+            result_card_id,
+            result,
+        };
+        std::mem::drop(handle.spawn(publish_action(completion_tx, update, cancellation)));
+        return true;
     }
 
     let program = command_parts[0].clone();
     let args: Vec<String> = command_parts.iter().skip(1).cloned().collect();
 
     handle.spawn(async move {
+        let _action_lease = action_lease;
         if shutdown.load(Ordering::Acquire) {
             return;
         }
-        let output = crate::execution::subprocess::run_command_with_shutdown(
+        let output = crate::execution::subprocess::run_command_with_cancellation(
             &program,
             &args,
             timeout,
             max_output,
-            shutdown.clone(),
+            cancellation.clone(),
         )
         .await;
 
@@ -4013,16 +4475,19 @@ fn execute_action_async(
             },
         };
 
-        publish_action(
-            &inbox,
+        let _ = publish_action(
+            completion_tx,
             ActionUpdate {
                 action_id,
                 invocation_id,
                 result_card_id,
                 result,
             },
-        );
+            cancellation,
+        )
+        .await;
     });
+    true
 }
 
 fn action_confirmation_text(action: &crate::core::config::ActionConfig) -> (String, String) {
@@ -4097,30 +4562,29 @@ fn show_action_result_dialog(
         None => return,
     };
 
+    let output = if result.stdout.is_empty() {
+        "(无输出)".to_owned()
+    } else {
+        bounded_text(&result.stdout, MAX_UI_TEXT_BYTES)
+    };
+    let stderr = if result.stderr.is_empty() {
+        "(无)".to_owned()
+    } else {
+        bounded_tail(&result.stderr, MAX_UI_ERROR_BYTES)
+    };
     let detail = if result.success {
-        format!(
-            "输出:\n{}",
-            if result.stdout.is_empty() {
-                "(无输出)"
-            } else {
-                &result.stdout
-            }
-        )
+        format!("输出:\n{}", output)
     } else {
         format!(
             "{}\n\nstderr:\n{}",
-            result.message,
-            if result.stderr.is_empty() {
-                "(无)"
-            } else {
-                &result.stderr
-            }
+            bounded_text(&result.message, MAX_UI_ERROR_BYTES),
+            stderr
         )
     };
 
     let labels: &[&str] = &["确定"];
     let dialog = gtk::AlertDialog::builder()
-        .message(&format!("操作结果: {}", action_id))
+        .message(format!("操作结果: {}", action_id))
         .detail(&detail)
         .buttons(labels)
         .build();
@@ -4150,6 +4614,7 @@ fn do_reload_config(config: &Rc<RefCell<ConfigManager>>) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -4194,6 +4659,52 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox.take_batch(24), vec![2]);
         assert!(!inbox.has_pending());
+    }
+
+    #[test]
+    fn latest_inbox_bounds_unique_stale_presentations() {
+        let (wake_tx, _wake_rx) = async_channel::bounded(1);
+        let inbox = LatestInbox::new(wake_tx);
+        for index in 0..MAX_PENDING_METRIC_PRESENTATIONS + 16 {
+            inbox.publish(format!("old-card-{index}"), index);
+        }
+        assert_eq!(inbox.len(), MAX_PENDING_METRIC_PRESENTATIONS);
+    }
+
+    #[tokio::test]
+    async fn action_completion_lane_preserves_all_invocations_under_backpressure() {
+        let (tx, rx) = async_channel::bounded(8);
+        let cancellation = CancellationToken::new();
+        let producer_tx = tx.clone();
+        let producer_cancellation = cancellation.clone();
+        let producer = tokio::spawn(async move {
+            for invocation_id in 0..2_000_u64 {
+                assert!(
+                    publish_action(
+                        producer_tx.clone(),
+                        ActionUpdate {
+                            action_id: "pressure-test".into(),
+                            invocation_id,
+                            result_card_id: None,
+                            result: ActionResult {
+                                success: true,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: 0,
+                                message: "ok".into(),
+                            },
+                        },
+                        producer_cancellation.clone(),
+                    )
+                    .await
+                );
+            }
+        });
+
+        for expected in 0..2_000_u64 {
+            assert_eq!(rx.recv().await.unwrap().invocation_id, expected);
+        }
+        producer.await.unwrap();
     }
 
     #[test]
@@ -4265,7 +4776,7 @@ mod tests {
         second_headers.insert("X-Token".into(), "secret".into());
         second_headers.insert("Accept".into(), "application/json".into());
         let source = |headers| {
-            SourceConfig::Http(crate::core::config::HttpSourceConfig {
+            SourceConfig::Http(Box::new(crate::core::config::HttpSourceConfig {
                 url: "https://example.invalid/status".into(),
                 method: Some("GET".into()),
                 headers: Some(headers),
@@ -4273,7 +4784,7 @@ mod tests {
                 timeout_seconds: 5,
                 max_output_bytes: 1024,
                 parser: None,
-            })
+            }))
         };
         assert_eq!(
             source_key_for(Some(&source(first_headers))),
@@ -4350,9 +4861,40 @@ mod tests {
     }
 
     #[test]
+    fn disabled_override_removes_a_shipped_default_card() {
+        let mut config = AppConfig::default();
+        config.cards.push(CardConfig {
+            id: "cpu".into(),
+            title: "CPU 使用率".into(),
+            page: "monitor".into(),
+            order: 10,
+            renderer: crate::model::card_model::RendererKind::Progress,
+            refresh_interval: 5,
+            enabled: false,
+            icon: None,
+            description: None,
+            source: Some(SourceConfig::Builtin("cpu".into())),
+            display: None,
+            cache_ttl_seconds: None,
+            schedule: None,
+            click_action: None,
+            kind: None,
+            plugin: None,
+            runtime: crate::core::config::CardRuntimeConfig::default(),
+        });
+        assert!(effective_card_config(&config, "cpu", true).is_none());
+        assert_eq!(
+            effective_cards(&config, true).len(),
+            default_builtin_cards().len() - 1
+        );
+    }
+
+    #[test]
     fn stateful_source_nodes_include_sampling_policy_without_card_identity() {
-        let mut first = AppConfig::default();
-        first.cards = default_builtin_cards();
+        let first = AppConfig {
+            cards: default_builtin_cards(),
+            ..AppConfig::default()
+        };
         let cpu = first.cards.iter().find(|card| card.id == "cpu").unwrap();
         let mut slow = cpu.clone();
         slow.refresh_interval = 60;
@@ -4377,8 +4919,10 @@ mod tests {
         let mut override_cpu = default_cpu.clone();
         override_cpu.title = "Override".into();
 
-        let mut previous_raw = AppConfig::default();
-        previous_raw.cards = vec![override_cpu.clone()];
+        let previous_raw = AppConfig {
+            cards: vec![override_cpu.clone()],
+            ..AppConfig::default()
+        };
         let next_raw = AppConfig::default();
         let mut previous = previous_raw.clone();
         previous.cards = effective_cards(&previous_raw, true);
@@ -4574,8 +5118,10 @@ fn save_compact_grid_preference(compact: bool) -> std::io::Result<()> {
             "compact-grid preference has no parent",
         )
     })?;
-    std::fs::create_dir_all(parent)?;
+    crate::core::config::ensure_private_directory(parent)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temporary, if compact { "compact\n" } else { "normal\n" })?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(temporary, path)
 }

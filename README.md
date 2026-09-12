@@ -64,7 +64,12 @@ all profiles. Auto-classified command/HTTP work is `expensive`, uses a generic
 known-cheap source as `normal` or `live` to opt out. Explicit per-card
 `inactive_behavior`/`idle_behavior` remains an intentional override.
 `screen_inhibit = "never" | "while-active" | "while-mapped"` is independent
-from refresh and asks only to inhibit idle blanking, not system suspend.
+from refresh and asks only to inhibit idle blanking. `suspend_inhibit = "never" |
+"while-active" | "while-mapped"` is a separate, opt-in system suspend inhibitor;
+it defaults to `never` because it can increase energy use. Both inhibitors are
+released when the window is unmapped or the application exits. The desktop
+session may reject or override inhibition, so this is a request rather than an
+absolute guarantee.
 `idle_view = "none" | "dim" | "minimal"` affects PulseDeck only and never
 changes system brightness. Quiet hours are local-clock driven, use `[start,end)`,
 and equal hours disable the window; manual/source requests remain allowed.
@@ -175,7 +180,7 @@ The top-level sections are:
 - `schema_version`: required configuration interface version; currently `4`.
 - `[app]`: title, logging, output limits, and config reload.
 - `[runtime]`: compatibility diagnostics (`profile`, `external_boost`), mapped/idle
-  behavior, screen inhibition, idle view, quiet hours, observation lease,
+  behavior, screen/suspend inhibition, idle view, quiet hours, observation lease,
   power/thermal sampling, battery hysteresis, and Agent notification policy.
 - `[ui]`: default page plus normal-grid columns and card dimensions; the live
   normal/compact toolbar choice is stored separately as UI state.

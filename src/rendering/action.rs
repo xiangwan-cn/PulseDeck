@@ -1,14 +1,19 @@
 use gtk::prelude::*;
 use gtk::{Align, Button, Label};
 
+use crate::core::text::{bounded_text, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::{CardModel, CardValue};
 
 pub fn apply_action(widgets: &ActionWidgets, model: &CardModel) {
     let status = match &model.value {
-        CardValue::Text(value) if !value.trim().is_empty() => Some(value.as_str()),
+        CardValue::Text(value) if !value.trim().is_empty() => {
+            Some(bounded_text(value, MAX_UI_TEXT_BYTES))
+        }
         _ => None,
     };
-    widgets.status.set_label(status.unwrap_or_default());
+    widgets
+        .status
+        .set_label(status.as_deref().unwrap_or_default());
     widgets.status.set_visible(status.is_some());
 }
 

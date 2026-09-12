@@ -5,7 +5,7 @@
 
 use crate::core::config::{CardConfig, PageConfig};
 use crate::core::error::AppError;
-use std::sync::{atomic::AtomicBool, Arc};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "pet-card")]
 pub mod pet_card;
@@ -23,7 +23,11 @@ pub struct PluginContext {
         allow(dead_code)
     )]
     pub runtime: crate::core::runtime::RuntimeHandle,
-    pub shutdown: Arc<AtomicBool>,
+    #[cfg_attr(
+        not(any(feature = "pet-card", feature = "scrcpy-forge")),
+        allow(dead_code)
+    )]
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +72,7 @@ impl CardPresentationHandle {
         }
     }
 
+    #[cfg(feature = "pet-card")]
     pub fn close(&self) {
         self.sender.close();
     }
@@ -108,9 +113,10 @@ pub fn validate_config(config: &crate::core::config::AppConfig) -> Result<(), Ap
         match kind {
             #[cfg(feature = "scrcpy-forge")]
             "scrcpy-forge" => {
-                let _: scrcpy_forge::PageConfig = options.try_into().map_err(|error| {
+                let parsed: scrcpy_forge::PageConfig = options.try_into().map_err(|error| {
                     AppError::Plugin(format!("invalid scrcpy-forge config: {error}"))
                 })?;
+                parsed.validate().map_err(AppError::Plugin)?;
             }
             _ => {
                 let _ = options;
@@ -131,9 +137,10 @@ pub fn validate_config(config: &crate::core::config::AppConfig) -> Result<(), Ap
         match kind {
             #[cfg(feature = "pet-card")]
             "pet-card" => {
-                let _: pet_card::config::PetConfig = options.try_into().map_err(|error| {
+                let parsed: pet_card::config::PetConfig = options.try_into().map_err(|error| {
                     AppError::Plugin(format!("invalid pet-card config: {error}"))
                 })?;
+                parsed.validate().map_err(AppError::Plugin)?;
             }
             _ => {
                 let _ = options;
@@ -147,19 +154,25 @@ pub fn validate_config(config: &crate::core::config::AppConfig) -> Result<(), Ap
 }
 
 fn page_plugins() -> Vec<Box<dyn PagePlugin>> {
-    #[allow(unused_mut)]
-    let mut plugins: Vec<Box<dyn PagePlugin>> = Vec::new();
     #[cfg(feature = "scrcpy-forge")]
-    plugins.push(Box::new(scrcpy_forge::Plugin));
-    plugins
+    {
+        vec![Box::new(scrcpy_forge::Plugin)]
+    }
+    #[cfg(not(feature = "scrcpy-forge"))]
+    {
+        Vec::new()
+    }
 }
 
 fn card_plugins() -> Vec<Box<dyn CardPlugin>> {
-    #[allow(unused_mut)]
-    let mut plugins: Vec<Box<dyn CardPlugin>> = Vec::new();
     #[cfg(feature = "pet-card")]
-    plugins.push(Box::new(pet_card::Plugin));
-    plugins
+    {
+        vec![Box::new(pet_card::Plugin)]
+    }
+    #[cfg(not(feature = "pet-card"))]
+    {
+        Vec::new()
+    }
 }
 
 pub fn build_page(

@@ -30,7 +30,7 @@ impl CardPlugin for Plugin {
             context.presentation.clone(),
             context.runtime.clone(),
             context.handle.clone(),
-            context.shutdown.clone(),
+            context.cancellation.clone(),
         )?
         .upcast())
     }

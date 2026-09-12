@@ -9,6 +9,7 @@
   "runtime": {
     "inactive_grace_seconds": 15,
     "screen_inhibit": "while-active",
+    "suspend_inhibit": "never",
     "idle_timeout_seconds": 60,
     "idle_stability_seconds": 10,
     "idle_view": "none",

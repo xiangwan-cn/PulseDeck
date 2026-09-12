@@ -1,0 +1,5 @@
+# The packaged ARM64 musl image supplies GTK/libadwaita as shared libraries.
+# Without this target override Cargo asks the linker for static GTK dependencies
+# and fails even though pkg-config can resolve the runtime libraries.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

@@ -1,4 +1,4 @@
-use super::config::{IdleViewMode, RuntimeConfig, ScreenInhibitMode};
+use super::config::{IdleViewMode, RuntimeConfig, ScreenInhibitMode, SuspendInhibitMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerVerdict {
@@ -57,6 +57,7 @@ pub enum WorkLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualPolicy {
     Full,
+    #[cfg(feature = "pet-card")]
     Capped(u32),
     Frozen,
     Stopped,
@@ -90,6 +91,7 @@ pub struct RuntimeSnapshot {
     pub work_level: WorkLevel,
     pub visual_policy: VisualPolicy,
     pub inhibit_screen: bool,
+    pub inhibit_suspend: bool,
     pub idle_view: IdleViewDecision,
     pub periodic_refresh_paused: bool,
     pub reasons: Vec<String>,
@@ -110,6 +112,7 @@ impl Default for RuntimeSnapshot {
             work_level: WorkLevel::Full,
             visual_policy: VisualPolicy::Full,
             inhibit_screen: true,
+            inhibit_suspend: false,
             idle_view: IdleViewDecision::None,
             periodic_refresh_paused: false,
             reasons: vec!["application-start".into()],
@@ -229,6 +232,11 @@ pub fn evaluate(facts: &RuntimeFacts, config: &RuntimeConfig) -> RuntimeSnapshot
         ScreenInhibitMode::WhileActive => visibility == Visibility::MappedActive,
         ScreenInhibitMode::WhileMapped => visibility != Visibility::Unmapped,
     };
+    let inhibit_suspend = match config.suspend_inhibit {
+        SuspendInhibitMode::Never => false,
+        SuspendInhibitMode::WhileActive => visibility == Visibility::MappedActive,
+        SuspendInhibitMode::WhileMapped => visibility != Visibility::Unmapped,
+    };
 
     // Idle presentation is intentionally independent from freshness/work.
     let idle_view = if activity != Activity::Idle || visibility == Visibility::Unmapped {
@@ -264,6 +272,7 @@ pub fn evaluate(facts: &RuntimeFacts, config: &RuntimeConfig) -> RuntimeSnapshot
         work_level,
         visual_policy,
         inhibit_screen,
+        inhibit_suspend,
         idle_view,
         periodic_refresh_paused,
         reasons,
@@ -384,8 +393,10 @@ mod tests {
 
     #[test]
     fn external_power_never_overrides_safety_stage() {
-        let mut config = RuntimeConfig::default();
-        config.external_boost = true;
+        let config = RuntimeConfig {
+            external_boost: true,
+            ..RuntimeConfig::default()
+        };
         let mut input = facts();
         input.power = PowerVerdict::External;
         input.battery_stage = BatteryStage::Low;
@@ -407,5 +418,25 @@ mod tests {
         assert!(evaluate(&input, &config).inhibit_screen);
         config.screen_inhibit = ScreenInhibitMode::WhileActive;
         assert!(!evaluate(&input, &config).inhibit_screen);
+    }
+
+    #[test]
+    fn suspend_inhibit_modes_are_independent_from_screen_inhibit() {
+        let mut config = RuntimeConfig {
+            screen_inhibit: ScreenInhibitMode::Never,
+            suspend_inhibit: SuspendInhibitMode::WhileActive,
+            ..RuntimeConfig::default()
+        };
+        let mut input = facts();
+        assert!(!evaluate(&input, &config).inhibit_screen);
+        assert!(evaluate(&input, &config).inhibit_suspend);
+
+        input.active = false;
+        assert!(!evaluate(&input, &config).inhibit_suspend);
+        config.suspend_inhibit = SuspendInhibitMode::WhileMapped;
+        assert!(evaluate(&input, &config).inhibit_suspend);
+
+        input.mapped = false;
+        assert!(!evaluate(&input, &config).inhibit_suspend);
     }
 }

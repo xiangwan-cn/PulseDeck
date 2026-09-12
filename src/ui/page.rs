@@ -4,9 +4,8 @@ use gtk::{Align, FlowBox, ScrolledWindow};
 use crate::core::config::{DisplayConfig, UiSection};
 use crate::model::card_model::CardModel;
 use crate::plugins::{CardPresentation, CardPresentationHandle};
-use crate::ui::action_card::ActionCard;
-use crate::ui::metric_card::CardLayout;
-use crate::ui::metric_card::MetricCard;
+use crate::ui::action_card::{ActionCard, ActionCardCallbacks};
+use crate::ui::metric_card::{CardLayout, CardStyleRegistry, MetricCard};
 
 const GRID_ROWS: i32 = 3;
 const FLOW_VERTICAL_MARGIN: i32 = 8;
@@ -33,6 +32,7 @@ pub struct Page {
     fullscreen_area: gtk::Box,
     fullscreen_content: gtk::Box,
     fullscreen_request: std::rc::Rc<std::cell::RefCell<Option<CardPresentationHandle>>>,
+    card_style_registry: std::rc::Rc<std::cell::RefCell<CardStyleRegistry>>,
 }
 
 struct PluginCardEntry {
@@ -47,7 +47,11 @@ struct PluginCardEntry {
 }
 
 impl Page {
-    pub fn new(page_id: &str, ui: &UiSection) -> Self {
+    pub fn new(
+        page_id: &str,
+        ui: &UiSection,
+        card_style_registry: std::rc::Rc<std::cell::RefCell<CardStyleRegistry>>,
+    ) -> Self {
         let settings_page = page_id == "settings";
         let flow_box = gtk::Box::new(gtk::Orientation::Vertical, FLOW_ROW_SPACING);
         flow_box.set_margin_top(4);
@@ -121,6 +125,7 @@ impl Page {
 
         let close = gtk::Button::from_icon_name("view-restore-symbolic");
         close.set_tooltip_text(Some("退出全屏"));
+        close.update_property(&[gtk::accessible::Property::Label("退出全屏")]);
         close.set_halign(Align::End);
         close.add_css_class("circular");
         close.add_css_class("card-fullscreen-close");
@@ -178,6 +183,7 @@ impl Page {
             fullscreen_area,
             fullscreen_content,
             fullscreen_request,
+            card_style_registry,
         }
     }
 
@@ -211,7 +217,7 @@ impl Page {
                 .and_then(|d| d.fixed_size)
                 .unwrap_or(self.card_layout.fixed),
         };
-        let mut card = MetricCard::new(model, layout, display);
+        let mut card = MetricCard::new(model, layout, display, self.card_style_registry.clone());
         card.set_compact(self.compact_grid);
         self.metric_flow.append(&card.card);
         self.metric_flow.set_visible(true);
@@ -490,56 +496,9 @@ impl Page {
         name: &str,
         description: &str,
         icon_name: &str,
-        confirm: bool,
-        confirm_title: &str,
-        confirm_detail: &str,
-        on_click: impl Fn(&str) + 'static,
-        on_dialog_open: impl Fn() + 'static,
-        on_dialog_response: impl Fn() + 'static,
+        callbacks: ActionCardCallbacks,
     ) {
-        let card = ActionCard::new(
-            action_id,
-            name,
-            description,
-            icon_name,
-            confirm,
-            confirm_title,
-            confirm_detail,
-            on_click,
-            on_dialog_open,
-            on_dialog_response,
-        );
-        card.card.set_size_request(-1, self.fitted_card_height());
-        if self.compact_grid {
-            card.card.add_css_class("compact-card");
-        }
-        self.action_flow.append(&card.card);
-        self.action_flow.set_visible(true);
-        self.action_cards.insert(action_id.to_string(), card);
-        self.has_actions = true;
-    }
-
-    pub fn add_action_card_with_resolver(
-        &mut self,
-        action_id: &str,
-        name: &str,
-        description: &str,
-        icon_name: &str,
-        resolve: impl Fn(&str) -> Option<(bool, String, String)> + 'static,
-        on_click: impl Fn(&str) + 'static,
-        on_dialog_open: impl Fn() + 'static,
-        on_dialog_response: impl Fn() + 'static,
-    ) {
-        let card = ActionCard::new_with_resolver(
-            action_id,
-            name,
-            description,
-            icon_name,
-            resolve,
-            on_click,
-            on_dialog_open,
-            on_dialog_response,
-        );
+        let card = ActionCard::new(action_id, name, description, icon_name, callbacks);
         card.card.set_size_request(-1, self.fitted_card_height());
         if self.compact_grid {
             card.card.add_css_class("compact-card");

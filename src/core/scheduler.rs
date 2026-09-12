@@ -7,6 +7,10 @@ use crate::core::runtime::WorkLevel;
 
 const DEFAULT_EXPENSIVE_INTERVAL_FLOOR_SECS: u64 = 30 * 60;
 
+fn deadline_after(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
+}
+
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
     pub next_run: Instant,
@@ -284,7 +288,7 @@ impl Scheduler {
                 {
                     if let Some(cursor) = resume_cursor.as_mut() {
                         next = (*cursor).max(now);
-                        *cursor = next + Duration::from_millis(500);
+                        *cursor = deadline_after(next, Duration::from_millis(500));
                     }
                 }
                 runtime.next_run = next;
@@ -310,13 +314,13 @@ impl Scheduler {
                     continue;
                 };
                 let anchor = runtime.last_success.or(runtime.last_started).unwrap_or(now);
-                (anchor + Duration::from_secs(interval)).max(now)
+                deadline_after(anchor, Duration::from_secs(interval)).max(now)
             };
             let mut next = next;
             if next <= now && runtime.workload == Workload::Expensive {
                 if let Some(cursor) = resume_cursor.as_mut() {
                     next = (*cursor).max(now);
-                    *cursor = next + Duration::from_millis(500);
+                    *cursor = deadline_after(next, Duration::from_millis(500));
                 }
             }
             runtime.next_run = next;
@@ -332,6 +336,17 @@ impl Scheduler {
     pub fn unregister(&mut self, card_id: &str) {
         self.runtimes.remove(card_id);
         self.compact_heap_if_needed();
+    }
+
+    /// Remove every live task before a GTK page tree is rebuilt. Keep the
+    /// monotonic generation seed: workers from the previous page generation
+    /// may still finish later, and their completion must not be mistaken for
+    /// a newly registered task with the same card id.
+    pub fn clear(&mut self) {
+        self.heap.clear();
+        self.runtimes.clear();
+        self.resume_cursor = None;
+        self.reload_cursor = None;
     }
 
     /// Registration and policy changes invalidate heap entries by generation.
@@ -502,15 +517,6 @@ impl Scheduler {
         )
     }
 
-    pub fn request_event(&mut self, card_id: &str, revision: SourceRevision) -> bool {
-        self.request_event_at(
-            card_id,
-            revision,
-            RefreshReason::Source(crate::core::refresh::SourceKey::new("event")),
-            Instant::now(),
-        )
-    }
-
     pub fn request_with_reason(
         &mut self,
         card_id: &str,
@@ -550,7 +556,7 @@ impl Scheduler {
             && !existing.run_once
         {
             let slot = self.reload_cursor.unwrap_or(now).max(now);
-            self.reload_cursor = Some(slot + Duration::from_millis(500));
+            self.reload_cursor = Some(deadline_after(slot, Duration::from_millis(500)));
             slot
         } else {
             now
@@ -680,7 +686,7 @@ impl Scheduler {
             WorkLevel::Minimal => Duration::from_secs(3),
             WorkLevel::Suspended => Duration::ZERO,
         };
-        let cutoff = now + coalescing;
+        let cutoff = deadline_after(now, coalescing);
         let mut ready = Vec::new();
         let mut deferred = Vec::new();
         while let Some(Reverse(task)) = self.heap.peek() {
@@ -776,6 +782,7 @@ impl Scheduler {
         self.mark_done_after_at(card_id, interval_secs, success, next_delay, Instant::now());
     }
 
+    #[cfg(test)]
     pub fn mark_done_after_revision(
         &mut self,
         card_id: &str,
@@ -910,7 +917,10 @@ impl Scheduler {
                     .min(policy_interval.saturating_mul(64).max(120))
             };
             rt.next_run = next_deadline.unwrap_or_else(|| {
-                now + next_delay.unwrap_or_else(|| Duration::from_secs(backoff))
+                deadline_after(
+                    now,
+                    next_delay.unwrap_or_else(|| Duration::from_secs(backoff)),
+                )
             });
             rt.generation = rt.generation.wrapping_add(1);
             if self.work_level != WorkLevel::Suspended && !self.periodic_refresh_paused {

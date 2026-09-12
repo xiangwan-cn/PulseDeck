@@ -143,8 +143,7 @@ impl ProcFsSource {
 }
 
 fn parse_kb_value(s: &str) -> u64 {
-    s.trim()
-        .split_whitespace()
+    s.split_whitespace()
         .next()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

@@ -1,10 +1,11 @@
 use crate::core::config::{ParserConfig, ParserKind};
+use crate::core::text::{bounded_text, MAX_UI_ERROR_BYTES, MAX_UI_TEXT_BYTES};
 use crate::model::card_model::CardValue;
 use crate::model::metric_result::{MetricResult, MetricState};
 
 use super::traits::MetricContext;
-use std::sync::{atomic::Ordering, Arc};
 
+#[derive(Clone)]
 pub struct HttpMetric {
     url: String,
     method: String,
@@ -43,23 +44,28 @@ impl HttpMetric {
         }
     }
 
-    pub fn collect(&mut self, ctx: &MetricContext, global_max_output: usize) -> MetricResult {
+    /// Collect without entering Tokio's blocking pool. HTTP I/O is already
+    /// asynchronous; wrapping it in `spawn_blocking + block_on` would consume
+    /// one of the very small local blocking slots while the socket waits.
+    pub async fn collect_async(
+        &self,
+        ctx: &MetricContext,
+        global_max_output: usize,
+    ) -> MetricResult {
         let max_output = self.max_output_bytes.min(global_max_output).max(1);
-        let shutdown = ctx.shutdown.clone();
-        let result = ctx.runtime.block_on(async {
-            tokio::select! {
-                result = http_fetch(
-                    &ctx.http_client,
-                    &self.url,
-                    &self.method,
-                    &self.headers,
-                    self.body.as_deref(),
-                    self.timeout_secs,
-                    max_output,
-                ) => result,
-                _ = wait_for_shutdown(shutdown) => Err("HTTP 请求因应用关闭而取消".to_string()),
-            }
-        });
+        let cancellation = ctx.cancellation.clone();
+        let result = tokio::select! {
+            result = http_fetch(
+                &ctx.http_client,
+                &self.url,
+                &self.method,
+                &self.headers,
+                self.body.as_deref(),
+                self.timeout_secs,
+                max_output,
+            ) => result,
+            _ = cancellation.cancelled() => Err("HTTP 请求因应用关闭而取消".to_string()),
+        };
 
         match result {
             Ok(body) => {
@@ -67,7 +73,7 @@ impl HttpMetric {
                     parse_response(&body, parser, self.compiled_regex.as_ref())
                 } else {
                     MetricResult {
-                        value: CardValue::Text(body.trim().to_string()),
+                        value: CardValue::Text(bounded_text(body.trim(), MAX_UI_TEXT_BYTES)),
                         subtitle: None,
                         tooltip: None,
                         state: MetricState::Normal,
@@ -79,7 +85,10 @@ impl HttpMetric {
             Err(e) => MetricResult {
                 value: CardValue::Text("错误".into()),
                 subtitle: None,
-                tooltip: Some(format!("HTTP 请求失败: {}", e)),
+                tooltip: Some(bounded_text(
+                    &format!("HTTP 请求失败: {e}"),
+                    MAX_UI_ERROR_BYTES,
+                )),
                 state: MetricState::Error,
                 cached: false,
                 metadata: None,
@@ -119,7 +128,7 @@ async fn http_fetch(
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
-        .map_err(|e| format!("请求失败: {}", e))?;
+        .map_err(|error| format!("请求失败 ({})", reqwest_error_kind(&error)))?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -133,7 +142,7 @@ async fn http_fetch(
     }
 
     let bytes = response_bytes_limited(resp, max_output_bytes).await?;
-    String::from_utf8(bytes).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
+    String::from_utf8(bytes).map_err(|_| "响应不是有效 UTF-8".to_string())
 }
 
 async fn response_bytes_limited(
@@ -149,7 +158,7 @@ async fn response_bytes_limited(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("读取响应失败: {error}"))?
+        .map_err(|error| format!("读取响应失败 ({})", reqwest_error_kind(&error)))?
     {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(format!("响应超过 {} 字节限制", limit));
@@ -157,12 +166,6 @@ async fn response_bytes_limited(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
-}
-
-async fn wait_for_shutdown(shutdown: Arc<std::sync::atomic::AtomicBool>) {
-    while !shutdown.load(Ordering::Acquire) {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
 }
 
 fn parse_response(
@@ -178,7 +181,10 @@ fn parse_response(
                     return MetricResult {
                         value: CardValue::Text("解析错误".into()),
                         subtitle: None,
-                        tooltip: Some(format!("JSON 解析失败: {}", e)),
+                        tooltip: Some(bounded_text(
+                            &format!("JSON 解析失败: {e}"),
+                            MAX_UI_ERROR_BYTES,
+                        )),
                         state: MetricState::Error,
                         cached: false,
                         metadata: None,
@@ -200,10 +206,20 @@ fn parse_response(
 
             if parser.as_percentage.unwrap_or(false) {
                 if let Ok(n) = text.parse::<f64>() {
+                    if !n.is_finite() {
+                        return MetricResult {
+                            value: CardValue::Text("解析错误".into()),
+                            subtitle: None,
+                            tooltip: Some("百分比不是有限数值".into()),
+                            state: MetricState::Error,
+                            cached: false,
+                            metadata: None,
+                        };
+                    }
                     return MetricResult {
                         value: CardValue::Percentage(n.clamp(0.0, 100.0)),
                         subtitle: None,
-                        tooltip: Some(text.clone()),
+                        tooltip: Some(bounded_text(&text, MAX_UI_TEXT_BYTES)),
                         state: MetricState::Normal,
                         cached: false,
                         metadata: None,
@@ -212,7 +228,7 @@ fn parse_response(
             }
 
             MetricResult {
-                value: CardValue::Text(text),
+                value: CardValue::Text(bounded_text(&text, MAX_UI_TEXT_BYTES)),
                 subtitle: None,
                 tooltip: None,
                 state: MetricState::Normal,
@@ -225,7 +241,7 @@ fn parse_response(
                 Some(p) => p,
                 None => {
                     return MetricResult {
-                        value: CardValue::Text(body.to_string()),
+                        value: CardValue::Text(bounded_text(body, MAX_UI_TEXT_BYTES)),
                         subtitle: None,
                         tooltip: None,
                         state: MetricState::Normal,
@@ -242,7 +258,10 @@ fn parse_response(
                     return MetricResult {
                         value: CardValue::Text("解析错误".into()),
                         subtitle: None,
-                        tooltip: Some(format!("正则表达式错误: {}", error)),
+                        tooltip: Some(bounded_text(
+                            &format!("正则表达式错误: {error}"),
+                            MAX_UI_ERROR_BYTES,
+                        )),
                         state: MetricState::Error,
                         cached: false,
                         metadata: None,
@@ -255,7 +274,10 @@ fn parse_response(
                             return MetricResult {
                                 value: CardValue::Text("解析错误".into()),
                                 subtitle: None,
-                                tooltip: Some(format!("正则表达式错误: {}", error)),
+                                tooltip: Some(bounded_text(
+                                    &format!("正则表达式错误: {error}"),
+                                    MAX_UI_ERROR_BYTES,
+                                )),
                                 state: MetricState::Error,
                                 cached: false,
                                 metadata: None,
@@ -269,7 +291,7 @@ fn parse_response(
             if let Some(caps) = re.captures(body) {
                 let capture_idx = parser.capture.unwrap_or(1);
                 if let Some(m) = caps.get(capture_idx) {
-                    let text = m.as_str().to_string();
+                    let text = bounded_text(m.as_str(), MAX_UI_TEXT_BYTES);
                     return MetricResult {
                         value: CardValue::Text(text),
                         subtitle: None,
@@ -298,7 +320,7 @@ fn parse_response(
             let num = body.trim().parse::<f64>().map(|n| n * multiplier / divisor);
 
             match num {
-                Ok(n) => MetricResult {
+                Ok(n) if n.is_finite() => MetricResult {
                     value: CardValue::Number {
                         value: n,
                         unit: parser.suffix.clone(),
@@ -310,10 +332,16 @@ fn parse_response(
                     cached: false,
                     metadata: None,
                 },
-                Err(_) => MetricResult {
+                _ => MetricResult {
                     value: CardValue::Text("解析错误".into()),
                     subtitle: None,
-                    tooltip: Some(format!("无法将 '{}' 解析为数字", body.trim())),
+                    tooltip: Some(bounded_text(
+                        &format!(
+                            "无法将 '{}' 解析为数字",
+                            bounded_text(body.trim(), MAX_UI_ERROR_BYTES)
+                        ),
+                        MAX_UI_ERROR_BYTES,
+                    )),
                     state: MetricState::Error,
                     cached: false,
                     metadata: None,
@@ -321,10 +349,10 @@ fn parse_response(
             }
         }
         ParserKind::FirstLine => {
-            let line = body.lines().next().unwrap_or("").to_string();
+            let line = body.lines().next().unwrap_or("");
             let suffix = parser.suffix.as_deref().unwrap_or("");
             MetricResult {
-                value: CardValue::Text(format!("{}{}", line, suffix)),
+                value: CardValue::Text(bounded_text(&format!("{line}{suffix}"), MAX_UI_TEXT_BYTES)),
                 subtitle: None,
                 tooltip: None,
                 state: MetricState::Normal,
@@ -332,6 +360,18 @@ fn parse_response(
                 metadata: None,
             }
         }
+    }
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "request"
     }
 }
 
