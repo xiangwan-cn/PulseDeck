@@ -46,7 +46,12 @@ impl PowerMetric {
         let now_secs = self.anchor.elapsed().as_secs_f64();
         let status = snapshot.status;
 
-        let power = snapshot.power_now.unwrap_or(0.0);
+        let Some(power) = snapshot.power_now else {
+            self.samples.clear();
+            self.prev_status = Some(status);
+            self.last_anchor_secs = now_secs;
+            return MetricResult::unavailable("电池功率数据不可用");
+        };
 
         if !power.is_finite() || power.abs() > 500.0 {
             return existing_average_result(&self.samples, status);
@@ -242,17 +247,24 @@ fn estimate_remaining(snapshot: &BatterySnapshot, avg_power: f64) -> String {
         }
     }
 
-    if avg_power > 0.01 {
-        let pct = snapshot.capacity.clamp(1.0, 100.0);
-        let wh = snapshot.energy_now.max(1.0);
-        let total_hours = (wh / avg_power) / (pct / 100.0);
-        let remaining_hours = total_hours * (pct / 100.0);
-        if remaining_hours > 0.0 && remaining_hours < 48.0 {
-            return format_duration((remaining_hours * 3600.0) as u64);
+    // Charge-only batteries expose Ah and V instead of Wh.
+    // Present this as an approximation: terminal voltage varies during discharge.
+    if avg_power.is_finite() && avg_power > 0.01 {
+        if let (Some(charge), Some(voltage)) = (snapshot.charge_now, snapshot.voltage_now) {
+            let remaining_hours = charge * voltage / avg_power;
+            if charge.is_finite()
+                && voltage.is_finite()
+                && charge > 0.0
+                && voltage > 0.0
+                && remaining_hours > 0.0
+                && remaining_hours < 48.0
+            {
+                return format!("约{}", format_duration((remaining_hours * 3600.0) as u64));
+            }
         }
     }
 
-    "计算中...".to_string()
+    "不可用".to_string()
 }
 
 fn format_duration(seconds: u64) -> String {

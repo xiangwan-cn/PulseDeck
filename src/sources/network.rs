@@ -185,7 +185,7 @@ fn iface_ipv4(name: &str) -> Option<Ipv4Addr> {
     for (dst, src) in ifr.ifr_name.iter_mut().zip(bytes) {
         *dst = *src as libc::c_char;
     }
-    let ok = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR.try_into().unwrap(), &mut ifr) } == 0;
+    let ok = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR as _, &mut ifr) } == 0;
     unsafe { libc::close(fd) };
     if !ok {
         return None;

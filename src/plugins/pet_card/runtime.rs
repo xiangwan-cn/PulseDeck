@@ -117,14 +117,26 @@ pub fn build(
     picture.set_vexpand(true);
     picture.set_can_shrink(true);
     picture.set_content_fit(gtk::ContentFit::Contain);
-    root.append(&picture);
+
+    // The sprite must fit the card's allocation without contributing its
+    // intrinsic size or height-for-width request to the dashboard grid.
+    let image_area = gtk::Overlay::new();
+    image_area.set_hexpand(true);
+    image_area.set_vexpand(true);
+    image_area.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+    image_area.add_overlay(&picture);
+    image_area.set_measure_overlay(&picture, false);
+    image_area.set_clip_overlay(&picture, true);
+    root.append(&image_area);
 
     let fallback = gtk::Label::new(Some("💤"));
     fallback.set_hexpand(true);
     fallback.set_vexpand(true);
     fallback.set_justify(gtk::Justification::Center);
     fallback.set_css_classes(&["title-1"]);
-    root.append(&fallback);
+    image_area.add_overlay(&fallback);
+    image_area.set_measure_overlay(&fallback, false);
+    image_area.set_clip_overlay(&fallback, true);
 
     let status = gtk::Label::new(Some("Codex 未运行"));
     status.set_halign(gtk::Align::Center);
@@ -370,13 +382,17 @@ impl Runtime {
             source.remove();
         }
         let weak = Rc::downgrade(self);
-        let source =
-            glib::timeout_add_local_once(Duration::from_secs(delay_seconds.max(1)), move || {
-                if let Some(runtime) = weak.upgrade() {
-                    runtime.set_state("ready", None, false);
-                    runtime.transition_source.borrow_mut().take();
-                }
-            });
+        let transition = move || {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.set_state("ready", None, false);
+                runtime.transition_source.borrow_mut().take();
+            }
+        };
+        let source = if delay_seconds == 0 {
+            glib::idle_add_local_once(transition)
+        } else {
+            glib::timeout_add_local_once(Duration::from_secs(delay_seconds), transition)
+        };
         self.transition_source.replace(Some(source));
     }
 

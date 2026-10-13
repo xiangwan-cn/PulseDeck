@@ -264,13 +264,8 @@ fn read_attr_i64(path: &Path, name: &str) -> Option<i64> {
 }
 
 fn read_time_to_empty_now(path: &Path) -> Option<f64> {
-    if let Some(secs) = read_attr_u64(path, "time_to_empty_now") {
-        return Some(secs as f64);
-    }
-    if let Some(secs) = read_attr_u64(path, "time_to_full_now") {
-        return Some(secs as f64);
-    }
-    None
+    // Time to full is a charging estimate, never a fallback for discharge time.
+    read_attr_u64(path, "time_to_empty_now").map(|secs| secs as f64)
 }
 
 #[cfg(test)]

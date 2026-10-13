@@ -36,6 +36,9 @@ pub async fn run_command_with_cancellation(
     let mut child = command
         .spawn()
         .map_err(|error| format!("启动失败: {error}"))?;
+    // wait() clears Child::id() when the parent exits. Descendants may still
+    // own the pipes, so retain the process-group id for timeout/cancellation.
+    let process_group_id = child.id();
 
     let stdout = child.stdout.take().ok_or("无法读取标准输出")?;
     let stderr = child.stderr.take().ok_or("无法读取标准错误")?;
@@ -55,15 +58,15 @@ pub async fn run_command_with_cancellation(
     let (stdout, stderr, status) = match wait {
         CommandWait::Completed(Ok(result)) => result,
         CommandWait::Completed(Err(error)) => {
-            terminate_child(&mut child).await;
+            terminate_child(&mut child, process_group_id).await;
             return Err(format!("命令执行失败: {error}"));
         }
         CommandWait::TimedOut => {
-            terminate_child(&mut child).await;
+            terminate_child(&mut child, process_group_id).await;
             return Err("命令执行超时".into());
         }
         CommandWait::Cancelled => {
-            terminate_child(&mut child).await;
+            terminate_child(&mut child, process_group_id).await;
             return Err("命令因应用关闭而取消".into());
         }
     };
@@ -81,10 +84,10 @@ enum CommandWait<T> {
     Cancelled,
 }
 
-async fn terminate_child(child: &mut tokio::process::Child) {
+async fn terminate_child(child: &mut tokio::process::Child, _process_group_id: Option<u32>) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
+        if let Some(pid) = _process_group_id {
             // Commands such as `sh -c`, npx, or Python commonly create
             // descendants. Killing only the direct child leaves those
             // descendants holding pipes and CPU after a timeout.
@@ -157,6 +160,52 @@ mod tests {
             clean_output("中文\u{1b}[31m红色\u{1b}[0m".as_bytes().to_vec()),
             "中文红色"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_kills_descendants_after_parent_exit() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "pulsedeck-descendant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let result = run_command_with_cancellation(
+            "sh",
+            &[
+                "-c".into(),
+                "sleep 30 & printf '%s' \"$!\" > \"$1\"; exit 0".into(),
+                "pulsedeck-test".into(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            1,
+            1024,
+            CancellationToken::new(),
+        )
+        .await;
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let _ = std::fs::remove_file(pid_file);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Orphaned zombies may await reaping by the container's init; they
+        // have already stopped and hold no pipes or CPU.
+        let running = std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+            status
+                .lines()
+                .any(|line| line.starts_with("State:") && !line.contains('Z'))
+        });
+        if running {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(result.is_err());
+        assert!(!running, "descendant survived the command timeout");
     }
 
     #[cfg(unix)]

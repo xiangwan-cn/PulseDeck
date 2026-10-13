@@ -192,7 +192,7 @@ impl Page {
         flow.set_homogeneous(true);
         flow.set_min_children_per_line(columns);
         flow.set_max_children_per_line(columns);
-        flow.set_row_spacing(6);
+        flow.set_row_spacing(FLOW_ROW_SPACING as u32);
         flow.set_column_spacing(6);
         flow.set_selection_mode(gtk::SelectionMode::None);
         flow.set_margin_start(4);
@@ -219,7 +219,14 @@ impl Page {
         };
         let mut card = MetricCard::new(model, layout, display, self.card_style_registry.clone());
         card.set_compact(self.compact_grid);
+        if !self.settings_page {
+            card.card.set_size_request(
+                card.card.width_request(),
+                card_content_height(&card.card, self.fitted_card_height()).max(minimum_height),
+            );
+        }
         self.metric_flow.append(&card.card);
+        clear_flow_child_margins(&card.card);
         self.metric_flow.set_visible(true);
         self.metric_min_heights
             .insert(model.id.clone(), minimum_height);
@@ -245,11 +252,14 @@ impl Page {
         let fixed = display
             .and_then(|value| value.fixed_size)
             .unwrap_or(self.card_layout.fixed);
-        widget.set_size_request(width.unwrap_or(-1), height);
         if self.compact_grid {
             widget.add_css_class("compact-card");
         }
+        let requested_height =
+            card_request_height(widget, height, self.settings_page).max(minimum_height);
+        widget.set_size_request(width.unwrap_or(-1), requested_height);
         self.metric_flow.append(widget);
+        clear_flow_child_margins(widget);
         self.metric_flow.set_visible(true);
         let flow_position = self.metric_flow.child_at_index(0).map_or(0, |_| {
             self.metric_flow
@@ -295,10 +305,18 @@ impl Page {
 
         match presentation {
             CardPresentation::Normal => {
+                entry.widget.set_valign(Align::Fill);
+                entry.widget.set_margin_top(0);
+                entry.widget.set_margin_bottom(0);
+                entry.widget.set_margin_start(0);
+                entry.widget.set_margin_end(0);
                 if entry.fixed {
+                    let height =
+                        card_request_height(&entry.widget, entry.normal_height, self.settings_page)
+                            .max(entry.minimum_height);
                     entry
                         .widget
-                        .set_size_request(entry.normal_width.unwrap_or(-1), entry.normal_height);
+                        .set_size_request(entry.normal_width.unwrap_or(-1), height);
                 } else {
                     entry
                         .widget
@@ -307,6 +325,7 @@ impl Page {
                 entry.widget.set_hexpand(false);
                 entry.widget.set_vexpand(false);
                 self.metric_flow.insert(&entry.widget, entry.flow_position);
+                clear_flow_child_margins(&entry.widget);
                 self.featured_area.set_visible(false);
                 self.fullscreen_area.set_visible(false);
                 self.fullscreen_request.borrow_mut().take();
@@ -317,50 +336,77 @@ impl Page {
                 } else {
                     3
                 };
+                let span_columns = 2;
                 let columns = if self.compact_grid {
                     6
                 } else {
                     self.normal_columns
                 }
-                .max(3);
-                let side_columns = columns - 2;
-                self.featured_side.set_min_children_per_line(side_columns);
-                self.featured_side.set_max_children_per_line(side_columns);
-                self.featured_area.remove(&self.featured_side);
-                self.featured_area
-                    .attach(&self.featured_side, 2, 0, side_columns as i32, rows);
-                let companions = flow_widgets(&self.metric_flow)
-                    .into_iter()
-                    .take((rows as u32 * side_columns) as usize)
-                    .map(|(widget, position)| {
-                        let original_position = if position >= entry.flow_position {
-                            position + 1
-                        } else {
-                            position
-                        };
-                        (widget, original_position)
-                    })
-                    .collect::<Vec<_>>();
+                .max(span_columns);
+                let side_columns = columns.saturating_sub(span_columns);
+                if self.featured_side.parent().is_some() {
+                    self.featured_area.remove(&self.featured_side);
+                }
+                let companions = if side_columns > 0 {
+                    self.featured_side.set_min_children_per_line(side_columns);
+                    self.featured_side.set_max_children_per_line(side_columns);
+                    self.featured_side.set_visible(true);
+                    self.featured_area.attach(
+                        &self.featured_side,
+                        span_columns as i32,
+                        0,
+                        side_columns as i32,
+                        rows,
+                    );
+                    flow_widgets(&self.metric_flow)
+                } else {
+                    self.featured_side.set_visible(false);
+                    Vec::new()
+                }
+                .into_iter()
+                .take((rows as u32 * side_columns) as usize)
+                .map(|(widget, position)| {
+                    let original_position = if position >= entry.flow_position {
+                        position + 1
+                    } else {
+                        position
+                    };
+                    (widget, original_position)
+                })
+                .collect::<Vec<_>>();
                 for (widget, position) in companions {
                     detach_widget(&widget);
                     self.featured_side.append(&widget);
+                    clear_flow_child_margins(&widget);
                     self.featured_companions.push((widget, position));
                 }
-                entry.widget.set_size_request(
-                    -1,
-                    entry.normal_height.saturating_mul(rows) + 6 * (rows - 1),
+                let height = featured_card_request_height(
+                    &entry,
+                    &self.featured_side,
+                    rows,
+                    self.settings_page,
                 );
+                entry.widget.set_size_request(-1, height);
                 entry.widget.set_hexpand(true);
                 entry.widget.set_vexpand(false);
-                self.featured_area.attach(&entry.widget, 0, 0, 2, rows);
+                apply_featured_card_insets(&entry.widget, &self.featured_side);
+                entry.widget.set_valign(Align::Fill);
+                entry.widget.set_halign(Align::Fill);
+                self.featured_area
+                    .attach(&entry.widget, 0, 0, span_columns as i32, rows);
                 self.featured_area.set_visible(true);
                 self.fullscreen_area.set_visible(false);
                 self.fullscreen_request.borrow_mut().take();
             }
             CardPresentation::Fullscreen => {
+                entry.widget.set_margin_top(0);
+                entry.widget.set_margin_bottom(0);
+                entry.widget.set_margin_start(0);
+                entry.widget.set_margin_end(0);
                 entry.widget.set_size_request(-1, -1);
                 entry.widget.set_hexpand(true);
                 entry.widget.set_vexpand(true);
+                entry.widget.set_valign(Align::Fill);
                 self.fullscreen_content.append(&entry.widget);
                 self.fullscreen_request.replace(Some(entry.request.clone()));
                 self.fullscreen_area.set_visible(true);
@@ -429,6 +475,7 @@ impl Page {
         for (widget, position) in companions {
             detach_widget(&widget);
             self.metric_flow.insert(&widget, position);
+            clear_flow_child_margins(&widget);
         }
         self.featured_area.set_visible(false);
         self.sync_flow_visibility();
@@ -460,7 +507,12 @@ impl Page {
     fn apply_card_heights(&mut self) {
         let fitted = self.fitted_card_height();
         for (id, card) in &self.metric_cards {
-            let height = fitted.max(
+            let content_height = if self.settings_page {
+                fitted
+            } else {
+                card_content_height(&card.card, fitted)
+            };
+            let height = content_height.max(
                 self.metric_min_heights
                     .get(id)
                     .copied()
@@ -470,20 +522,35 @@ impl Page {
                 .set_size_request(card.card.width_request(), height);
         }
         for card in self.action_cards.values() {
-            card.card.set_size_request(-1, fitted);
+            let height = if self.settings_page {
+                fitted
+            } else {
+                card_content_height(&card.card, fitted)
+            };
+            card.card.set_size_request(-1, height);
         }
         for entry in self.plugin_cards.values_mut() {
             entry.normal_height = fitted.max(entry.minimum_height);
+            if matches!(
+                entry.presentation,
+                CardPresentation::Quad | CardPresentation::Expanded
+            ) {
+                apply_featured_card_insets(&entry.widget, &self.featured_side);
+            }
+            let normal_height =
+                card_request_height(&entry.widget, entry.normal_height, self.settings_page)
+                    .max(entry.minimum_height);
             match entry.presentation {
                 CardPresentation::Normal => entry
                     .widget
-                    .set_size_request(entry.normal_width.unwrap_or(-1), entry.normal_height),
-                CardPresentation::Quad => entry
-                    .widget
-                    .set_size_request(-1, entry.normal_height.saturating_mul(2) + FLOW_ROW_SPACING),
+                    .set_size_request(entry.normal_width.unwrap_or(-1), normal_height),
+                CardPresentation::Quad => entry.widget.set_size_request(
+                    -1,
+                    featured_card_request_height(entry, &self.featured_side, 2, self.settings_page),
+                ),
                 CardPresentation::Expanded => entry.widget.set_size_request(
                     -1,
-                    entry.normal_height.saturating_mul(3) + FLOW_ROW_SPACING * 2,
+                    featured_card_request_height(entry, &self.featured_side, 3, self.settings_page),
                 ),
                 CardPresentation::Fullscreen => {}
             }
@@ -504,6 +571,7 @@ impl Page {
             card.card.add_css_class("compact-card");
         }
         self.action_flow.append(&card.card);
+        clear_flow_child_margins(&card.card);
         self.action_flow.set_visible(true);
         self.action_cards.insert(action_id.to_string(), card);
         self.has_actions = true;
@@ -511,6 +579,7 @@ impl Page {
 
     pub fn flow_insert(&self, widget: &impl IsA<gtk::Widget>) {
         self.metric_flow.append(widget);
+        clear_flow_child_margins(widget);
         self.metric_flow.set_visible(true);
     }
 
@@ -534,11 +603,89 @@ fn adaptive_card_height(available_height: i32, minimum_height: i32) -> i32 {
     (usable / GRID_ROWS).max(minimum_height.max(1))
 }
 
+// GTK adds CSS padding and borders to a widget's minimum content request.
+// The grid's fitted height is an outer allocation budget, so requesting that
+// whole height as content makes each of the three rows overflow its budget.
+// Resolve the actual style instead of hardcoding normal/compact padding.
+// GTK 4.10 deprecated style contexts without an equivalent box-inset getter.
+// Keep the compatibility API scoped to these measurements.
+#[allow(deprecated)]
+fn card_content_height(widget: &impl IsA<gtk::Widget>, outer_height: i32) -> i32 {
+    let context = widget.style_context();
+    let padding = context.padding();
+    let border = context.border();
+    let inset = i32::from(padding.top())
+        + i32::from(padding.bottom())
+        + i32::from(border.top())
+        + i32::from(border.bottom());
+    outer_height.saturating_sub(inset).max(1)
+}
+
+fn card_request_height(
+    widget: &impl IsA<gtk::Widget>,
+    outer_height: i32,
+    settings_page: bool,
+) -> i32 {
+    if settings_page {
+        outer_height
+    } else {
+        card_content_height(widget, outer_height)
+    }
+}
+
+fn featured_card_request_height(
+    entry: &PluginCardEntry,
+    flow: &FlowBox,
+    rows: i32,
+    settings_page: bool,
+) -> i32 {
+    let cell_height = card_request_height(&entry.widget, entry.normal_height, settings_page)
+        .max(entry.minimum_height);
+    let insets = featured_card_insets(flow);
+    let row_spacing = flow.row_spacing() as i32 + insets[0] + insets[2];
+    let outer_height = cell_height
+        .saturating_mul(rows)
+        .saturating_add(row_spacing.saturating_mul(rows.saturating_sub(1)));
+    card_request_height(&entry.widget, outer_height, settings_page)
+}
+
+#[allow(deprecated)]
+fn featured_card_insets(flow: &FlowBox) -> [i32; 4] {
+    flow.child_at_index(0).map_or([0; 4], |child| {
+        let context = child.style_context();
+        let padding = context.padding();
+        let border = context.border();
+        [
+            i32::from(padding.top()) + i32::from(border.top()),
+            i32::from(padding.right()) + i32::from(border.right()),
+            i32::from(padding.bottom()) + i32::from(border.bottom()),
+            i32::from(padding.left()) + i32::from(border.left()),
+        ]
+    })
+}
+
+fn apply_featured_card_insets(widget: &gtk::Widget, flow: &FlowBox) {
+    let [top, right, bottom, left] = featured_card_insets(flow);
+    widget.set_margin_top(top);
+    widget.set_margin_end(right);
+    widget.set_margin_bottom(bottom);
+    widget.set_margin_start(left);
+}
+
 fn flow_position(widget: &gtk::Widget) -> Option<i32> {
     widget
         .parent()
         .and_downcast::<gtk::FlowBoxChild>()
         .map(|child| child.index())
+}
+
+fn clear_flow_child_margins(widget: &impl IsA<gtk::Widget>) {
+    if let Some(child) = widget.parent().and_downcast::<gtk::FlowBoxChild>() {
+        child.set_margin_top(0);
+        child.set_margin_bottom(0);
+        child.set_margin_start(0);
+        child.set_margin_end(0);
+    }
 }
 
 fn flow_widgets(flow: &FlowBox) -> Vec<(gtk::Widget, i32)> {
@@ -578,13 +725,16 @@ fn detach_widget(widget: &gtk::Widget) {
 
 #[cfg(test)]
 mod tests {
-    use super::adaptive_card_height;
+    use super::{adaptive_card_height, FLOW_ROW_SPACING, FLOW_VERTICAL_MARGIN};
 
     #[test]
     fn adaptive_height_fills_three_visible_rows() {
         let height = adaptive_card_height(668, 133);
         assert_eq!(height, 216);
-        assert_eq!(height * 3 + 8 + 6 * 2, 668);
+        assert_eq!(
+            height * 3 + FLOW_VERTICAL_MARGIN + FLOW_ROW_SPACING * 2,
+            668
+        );
     }
 
     #[test]

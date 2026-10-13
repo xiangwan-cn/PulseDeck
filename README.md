@@ -16,6 +16,10 @@ _Default build with no optional Cargo features in dark mode: normal layout
 
 - Native CPU, memory, battery, power, network, uptime, filesystem, process,
   load, swap, temperature, and network-throughput metrics.
+- Charge-only batteries estimate remaining runtime from charge and voltage,
+  explicitly mark the approximation, and report unavailable when telemetry is missing.
+- CPU temperature cards and thermal policy share CPU thermal-zone/hwmon sources;
+  unrelated Wi-Fi, GPU, and storage sensors are not used as CPU fallbacks.
 - Built-in, file, command, HTTP, and static-value card sources.
 - Value, progress, status, text, list, composite, and action renderers.
 - Ordered visual-state rules for standard cards, with numeric/text/source-state

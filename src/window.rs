@@ -57,7 +57,6 @@ const APP_CSS: &str = r#"
 .tab-bar-area { padding: 5px 6px; }
 .tab-bar-area tab { border-radius: 10px; min-height: 32px; font-size: 13px; }
 .compact-grid-button { min-width: 32px; min-height: 32px; padding: 0; }
-.pulsedeck-flow > flowboxchild { padding: 0; }
 .pulsedeck-card { padding: 10px 8px 8px; border-radius: 14px; border: 1px solid alpha(currentColor, 0.12); background: alpha(currentColor, 0.035); box-shadow: 0 2px 8px alpha(black, 0.08); }
 .metric-card { }
 .accent-blue   { border-left: 2px solid #3584e4; }
@@ -2745,6 +2744,7 @@ impl MonitorWindow {
                     }
                     let _ = scheduler_wake.try_send(());
 
+                    let mut dialog_shown = false;
                     if let Some(card_id) = update.result_card_id.as_deref() {
                         for page in pages.borrow_mut().values_mut() {
                             if let Some(card) = page.get_metric_card(card_id) {
@@ -2755,6 +2755,7 @@ impl MonitorWindow {
                                     &update.result,
                                     runtime.clone(),
                                 );
+                                dialog_shown = true;
                                 break;
                             }
                         }
@@ -2764,7 +2765,6 @@ impl MonitorWindow {
                     // visible control must leave its busy state when the one
                     // invocation completes. Show one dialog only; otherwise a
                     // shared action would produce duplicate modal windows.
-                    let mut dialog_shown = false;
                     for page in pages.borrow_mut().values_mut() {
                         if let Some(card) = page.get_action_card(&update.action_id) {
                             card.set_running(false);

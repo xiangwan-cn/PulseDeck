@@ -55,22 +55,20 @@ export default function pulsedeckPet(pi: ExtensionAPI) {
     options: { newTask?: boolean; heartbeat?: boolean } = {},
   ) => {
     const now = Date.now()
-    if (options.newTask) taskID = randomUUID()
+    const nextTaskID = options.newTask ? randomUUID() : taskID
 
     const importantEdge = importantStates.has(state) && state !== current
-    if (importantEdge) eventID += 1
+    const nextEventID = eventID + (importantEdge ? 1 : 0)
     if (state === current && !options.newTask && !options.heartbeat) return
-    if (state === current && options.heartbeat && now - lastWrite < 60_000) return
+    if (state === current && !options.newTask && options.heartbeat && now - lastWrite < 60_000) return
 
-    current = state
-    lastWrite = now
     const directory = dirname(target)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const temporary = join(directory, `.pi-pet.${process.pid}.${randomUUID()}.tmp`)
     const body = `${JSON.stringify({
       version: 2,
-      task_id: taskID,
-      event_id: String(eventID),
+      task_id: nextTaskID,
+      event_id: String(nextEventID),
       state,
       timestamp_ms: now,
     })}\n`
@@ -83,6 +81,10 @@ export default function pulsedeckPet(pi: ExtensionAPI) {
         await file.close()
       }
       await rename(temporary, target)
+      taskID = nextTaskID
+      eventID = nextEventID
+      current = state
+      lastWrite = now
     } finally {
       await unlink(temporary).catch(() => {})
     }

@@ -45,14 +45,14 @@ the GTK bell.
 
 ## Codex integration
 
-The installable Codex plugin is under `integrations/pulsedeck-pet`. Its Bash
-hook writes only a fixed state, protocol version and timestamp. A POSIX shell
-read loop drains the event JSON from stdin without parsing it, so prompt text,
-commands, tool arguments, tool output and session ids are neither retained nor
-passed through an extra helper process. Corrupt or partial heartbeat metadata
-is reset instead of surfacing as a hook command error.
-Draining prevents Codex from seeing a broken pipe after the short-lived hook
-publishes its state.
+The installable Codex plugin is under `integrations/pulsedeck-pet`. Its shell
+hook writes only a fixed state, protocol version, timestamp and locally generated
+task/event identifiers. It reads only
+the `tool_name` field from `PreToolUse` to mark file edits as `coding`; prompts,
+commands, tool arguments, output and session ids are never retained or written.
+Other event JSON is drained from stdin so Codex does not see a broken pipe.
+Corrupt or partial heartbeat metadata is reset instead of surfacing as a hook
+command error.
 
 Codex must trust the plugin hooks before they run. Inspect them with `/hooks`
 after installing or enabling the plugin.
@@ -66,7 +66,9 @@ codex plugin add pulsedeck-pet@<marketplace>
 
 Then start a new Codex thread so the hook set is loaded. The plugin manifest is
 `integrations/pulsedeck-pet/.codex-plugin/plugin.json`; the hook and its
-privacy-minimized Bash writer remain inside the same integration directory.
+privacy-minimized shell writer remain inside the same integration directory.
+An interrupted turn publishes `aborted`, and ending the Codex session publishes
+`offline` so the card does not remain on `done` until its stale-state timeout.
 
 The default state file is:
 
@@ -163,6 +165,12 @@ cards fill the other four. Both layouts derive three row heights from the
 currently visible page, so the enlarged PetCard and its companion cards fill
 the same 3×3 or 6×3 viewport. Changing the toolbar grid mode immediately
 reflows an enlarged PetCard.
+
+The visible width is two normal card widths plus one column gap. Four-cell
+height is two card heights plus one row gap; six-cell height is three card
+heights plus two row gaps. Artwork is an unmeasured, clipped overlay inside
+PetCard, so its original image dimensions cannot enlarge the grid. Companion
+FlowBox padding and borders are included when aligning the visible edges.
 
 Use the restore button or `Escape` to leave fullscreen. Presentation preference
 is persisted outside `config.toml`. Offline fallback does not overwrite that

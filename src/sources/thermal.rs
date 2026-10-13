@@ -42,23 +42,93 @@ pub fn readings(root: &Path) -> Vec<ThermalReading> {
 
 /// Return the hottest CPU/SoC/package sensor for safety policy evaluation.
 pub fn hottest_relevant(root: &Path) -> Option<f64> {
+    select_cpu_temperature_with_hwmon(root, &root.with_file_name("hwmon"))
+        .map(|reading| reading.celsius)
+}
+
+/// Return the hottest relevant sensor, never an unrelated Wi-Fi/GPU sensor.
+pub fn select_cpu_temperature(root: &Path) -> Option<ThermalReading> {
     readings(root)
         .into_iter()
         .filter(|reading| is_relevant(&reading.kind))
-        .map(|reading| reading.celsius)
-        .max_by(f64::total_cmp)
+        .max_by(|left, right| left.celsius.total_cmp(&right.celsius))
 }
 
-/// Return the same deterministic sensor selection for the CPU-temperature
-/// card: hottest relevant sensor first, then the first available sensor.
-pub fn select_cpu_temperature(root: &Path) -> Option<ThermalReading> {
-    let readings = readings(root);
-    readings
-        .iter()
-        .filter(|reading| is_relevant(&reading.kind))
+/// Include CPU hwmon sensors on AMD/Intel machines whose thermal zones only
+/// contain peripheral temperatures. Both the card and safety policy use this.
+pub fn select_cpu_temperature_with_hwmon(
+    thermal_root: &Path,
+    hwmon_root: &Path,
+) -> Option<ThermalReading> {
+    select_cpu_temperature(thermal_root)
+        .into_iter()
+        .chain(cpu_hwmon_readings(hwmon_root))
         .max_by(|left, right| left.celsius.total_cmp(&right.celsius))
-        .cloned()
-        .or_else(|| readings.first().cloned())
+}
+
+fn cpu_hwmon_readings(root: &Path) -> Vec<ThermalReading> {
+    let Ok(devices) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for device in devices.flatten() {
+        let path = device.path();
+        let Ok(name) = fs::read_to_string(path.join("name")) else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        // A known CPU driver is required. In particular, amdgpu, nvme and
+        // iwlwifi temperatures must not be relabelled as CPU temperatures.
+        if !matches!(
+            name.as_str(),
+            "k10temp" | "k8temp" | "coretemp" | "zenpower" | "cpu_thermal"
+        ) {
+            continue;
+        }
+        let Ok(attributes) = fs::read_dir(&path) else {
+            continue;
+        };
+        let mut device_readings = Vec::new();
+        for attribute in attributes.flatten() {
+            let filename = attribute.file_name();
+            let filename = filename.to_string_lossy();
+            let Some(index) = filename
+                .strip_prefix("temp")
+                .and_then(|s| s.strip_suffix("_input"))
+            else {
+                continue;
+            };
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let label = fs::read_to_string(path.join(format!("temp{index}_label")))
+                .unwrap_or_else(|_| format!("temp{index}"));
+            let Ok(raw) = fs::read_to_string(attribute.path()) else {
+                continue;
+            };
+            let Ok(raw) = raw.trim().parse::<f64>() else {
+                continue;
+            };
+            // hwmon temp*_input is always millidegrees Celsius.
+            let celsius = raw / 1000.0;
+            if celsius.is_finite() && (-40.0..=150.0).contains(&celsius) {
+                device_readings.push(ThermalReading {
+                    kind: format!("{name} {}", label.trim()),
+                    celsius,
+                });
+            }
+        }
+        // Tctl may include an offset on AMD CPUs; prefer physical die/core
+        // readings when present, while retaining Tctl on Tctl-only devices.
+        let has_die_reading = device_readings.iter().any(|reading| {
+            let label = reading.kind.to_ascii_lowercase();
+            label.ends_with("tdie") || label.contains("tccd")
+        });
+        result.extend(device_readings.into_iter().filter(|reading| {
+            !has_die_reading || !reading.kind.to_ascii_lowercase().ends_with("tctl")
+        }));
+    }
+    result
 }
 
 fn is_relevant(kind: &str) -> bool {

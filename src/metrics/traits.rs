@@ -15,6 +15,7 @@ pub struct MetricContext {
     pub network: Mutex<NetworkSource>,
     pub procfs: Mutex<ProcFsSource>,
     pub thermal_root: PathBuf,
+    pub hwmon_root: PathBuf,
 }
 
 impl MetricContext {
@@ -31,6 +32,7 @@ impl MetricContext {
             battery: Arc::new(Mutex::new(BatterySource::new(battery_root))),
             network: Mutex::new(NetworkSource::new()),
             procfs: Mutex::new(ProcFsSource::new(procfs_root)),
+            hwmon_root: thermal_root.with_file_name("hwmon"),
             thermal_root,
         }
     }

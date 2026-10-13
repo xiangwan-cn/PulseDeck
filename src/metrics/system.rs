@@ -90,7 +90,10 @@ fn process_count(ctx: &MetricContext) -> MetricResult {
 }
 
 fn cpu_temperature(ctx: &MetricContext) -> MetricResult {
-    match crate::sources::thermal::select_cpu_temperature(&ctx.thermal_root) {
+    match crate::sources::thermal::select_cpu_temperature_with_hwmon(
+        &ctx.thermal_root,
+        &ctx.hwmon_root,
+    ) {
         Some(reading) => normal(
             CardValue::Number {
                 value: reading.celsius,
